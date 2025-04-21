@@ -85,6 +85,7 @@ impl Program {
         let mut connector = E621WebConnector::new(&request_sender);
         connector.should_enter_safe_mode();
         connector.configure_size_limits();
+        connector.configure_batch_size();
 
         // Parses tag file.
         trace!("Parsing tag file...");

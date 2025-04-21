@@ -21,8 +21,37 @@ pub(crate) mod io;
 pub(crate) mod sender;
 pub(crate) mod tui;
 
+/// Helper struct to hold collection information for downloading
+#[derive(Debug)]
+struct CollectionInfo {
+    /// Collection name
+    name: String,
+    /// Collection category
+    category: String,
+    /// Short name for display
+    short_name: String,
+    /// Posts in the collection
+    posts: Vec<grabber::GrabbedPost>,
+}
+
+impl CollectionInfo {
+    /// Creates a new CollectionInfo from a PostCollection
+    fn from_collection(collection: &grabber::PostCollection) -> Self {
+        CollectionInfo {
+            name: collection.name().to_string(),
+            category: collection.category().to_string(),
+            short_name: collection.shorten("...").to_string(),
+            posts: collection.posts().clone(),
+        }
+    }
+    
+    /// Returns the number of new posts (not previously downloaded)
+    fn new_files_count(&self) -> usize {
+        self.posts.iter().filter(|post| post.is_new()).count()
+    }
+}
+
 /// A web connector that manages how the API is called (through the [RequestSender]), how posts are grabbed
-/// (through [Grabber]), and how the posts are downloaded.
 pub(crate) struct E621WebConnector {
     /// The sender used for all API calls.
     request_sender: RequestSender,
@@ -36,6 +65,12 @@ pub(crate) struct E621WebConnector {
     file_size_cap: u64,
     /// Total overall download size cap in KB (default 100GB).
     total_size_cap: u64,
+    /// Number of collections to download simultaneously (default 2).
+    batch_size: usize,
+    /// Current batch number being processed
+    current_batch: usize,
+    /// Total number of batches
+    total_batches: usize,
 }
 impl E621WebConnector {
     /// Creates instance of `Self` for grabbing and downloading posts.
@@ -51,6 +86,9 @@ impl E621WebConnector {
             blacklist: Rc::new(RefCell::new(Blacklist::new(request_sender.clone()))),
             file_size_cap: default_file_cap,
             total_size_cap: default_total_cap,
+            batch_size: 2, // Default to 2 collections at a time
+            current_batch: 0,
+            total_batches: 0,
         }
     }
 
@@ -81,6 +119,50 @@ impl E621WebConnector {
         self.total_size_cap = total_size_gb * 1024 * 1024;
         
         info!("File size limits set: {}GB per file, {}GB total", file_size_gb, total_size_gb);
+    }
+
+    /// Asks the user to configure the batch size for downloads.
+    pub(crate) fn configure_batch_size(&mut self) {
+        let batch_size_prompt = format!("Number of collections to download simultaneously (default: {})", self.batch_size);
+        let batch_size: usize = Input::new()
+            .with_prompt(&batch_size_prompt)
+            .default(self.batch_size)
+            .interact()
+            .unwrap_or(self.batch_size);
+            
+        self.batch_size = batch_size.max(1); // Ensure at least 1
+        
+        
+        info!("Batch size set to {}", self.batch_size);
+    }
+
+    /// Initializes the progress bar for downloading process.
+    ///
+    /// # Arguments
+    ///
+    /// * `len`: The total bytes to download.
+    fn initialize_progress_bar(&mut self, len: u64) {
+        // Create a progress bar template that clearly separates the message from the progress indicator
+        let template = format!(
+            "{{prefix:20}} {{msg:40}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{bytes}}/{{total_bytes}} {{binary_bytes_per_sec}} ETA: {{eta}}"
+        );
+        
+        self.progress_bar = ProgressBarBuilder::new(len)
+            .style(
+                ProgressStyleBuilder::default()
+                    .template(&template)
+                    .progress_chars("=>-")
+                    .build())
+            .draw_target(ProgressDrawTarget::stderr())
+            .reset()
+            .steady_tick(Duration::from_secs(1))
+            .build();
+            
+        // Set initial batch information
+        if self.total_batches > 0 {
+            self.progress_bar.set_prefix("Processing batch".to_string());
+            self.update_batch_info();
+        }
     }
 
     /// Gets input and enters safe depending on user choice.
@@ -151,139 +233,6 @@ impl E621WebConnector {
             .collect()
     }
 
-    /// Processes `PostSet` and downloads all posts from it.
-    /// Processes `PostSet` and downloads all posts from it.
-    fn download_collection(&mut self) {
-        // Get directory manager
-        let dir_manager = match Config::get().directory_manager() {
-            Ok(manager) => manager,
-            Err(err) => {
-                error!("Failed to get directory manager from configuration: {}", err);
-                self.progress_bar.set_message("Error: Failed to initialize directory manager!");
-                self.progress_bar.finish_with_message("Download failed: Configuration error");
-                return;
-            }
-        };
-        let mut dir_manager = dir_manager.clone();  // Clone to get a mutable version
-        for collection in self.grabber.posts().iter() {
-            let collection_name = collection.name();
-            let collection_category = collection.category();
-            let collection_posts = collection.posts();
-            let collection_count = collection_posts.len();
-            let short_collection_name = collection.shorten("...");
-
-            // Count new files that will be downloaded
-            let new_files = collection_posts.iter().filter(|post| post.is_new()).count();
-            if new_files > 0 {
-                info!(
-                    "Found {} new files to download in {}",
-                    new_files,
-                    console::style(format!("\"{}\"", collection_name)).color256(39).italic()
-                );
-            }
-
-            trace!("Printing Collection Info:");
-            trace!("Collection Name:            \"{collection_name}\"");
-            trace!("Collection Category:        \"{collection_category}\"");
-            trace!("Collection Post Length:     \"{collection_count}\"");
-
-            for post in collection_posts {
-                if !post.is_new() {
-                    self.progress_bar.set_message("Duplicate found: skipping... ");
-                    self.progress_bar.inc(post.file_size() as u64);
-                    continue;
-                }
-
-                self.progress_bar
-                    .set_message(format!("Downloading: {short_collection_name} "));
-
-                // Get the save directory from the post
-                let save_dir = match post.save_directory() {
-                    Some(dir) => dir,
-                    None => {
-                        error!("Post does not have a save directory assigned: {}", post.name());
-                        self.progress_bar.set_message(format!("Error saving {}: No directory assigned", post.name()));
-                        self.progress_bar.inc(post.file_size() as u64);
-                        continue;
-                    }
-                };
-                let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
-
-                // Create the directory if it doesn't exist
-                if let Err(err) = create_dir_all(&save_dir) {
-                    let path_str = save_dir.to_string_lossy();
-                    error!("Could not create directory for images: {}", err);
-                    error!("Path: {}", path_str);
-                    self.progress_bar.set_message(format!("Error: Could not create directory {}", path_str));
-                    self.progress_bar.inc(post.file_size() as u64);
-                    continue;
-                }
-                // Download and save the file
-                let bytes = self
-                    .request_sender
-                    .download_image(post.url(), post.file_size());
-                
-                // Get file path as string
-                let file_path_str = match file_path.to_str() {
-                    Some(path) => path,
-                    None => {
-                        error!("Invalid file path for post: {}", post.name());
-                        self.progress_bar.set_message(format!("Error: Invalid file path for {}", post.name()));
-                        self.progress_bar.inc(post.file_size() as u64);
-                        continue;
-                    }
-                };
-                
-                // Save the image
-                match write(file_path_str, &bytes) {
-                    Ok(_) => {
-                        trace!("Saved {file_path_str}...");
-                        // Mark the file as downloaded in our tracking system
-                        dir_manager.mark_file_downloaded(post.name());
-                        self.progress_bar.set_message(format!("Downloaded: {}", post.name()));
-                    }
-                    Err(err) => {
-                        error!("Failed to save image {}: {}", file_path_str, err);
-                        self.progress_bar.set_message(format!("Error: Could not save {}", post.name()));
-                    }
-                }
-
-                self.progress_bar.inc(post.file_size() as u64);
-            }
-
-            trace!("Collection {collection_name} is finished downloading...");
-        }
-    }
-
-    /// Initializes the progress bar for downloading process.
-    ///
-    /// # Arguments
-    ///
-    /// * `len`: The total bytes to download.
-    fn initialize_progress_bar(&mut self, len: u64) {
-        self.progress_bar = ProgressBarBuilder::new(len)
-            .style(
-                ProgressStyleBuilder::default()
-                    .template("{msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {binary_bytes_per_sec} {eta}")
-                    .progress_chars("=>-")
-                    .build())
-            .draw_target(ProgressDrawTarget::stderr())
-            .reset()
-            .steady_tick(Duration::from_secs(1))
-            .build();
-    }
-
-    /// Downloads tuple of general posts and single posts.
-    pub(crate) fn download_posts(&mut self) {
-        // Initializes the progress bar for downloading.
-        let length = self.get_total_file_size();
-        trace!("Total file size for all images grabbed is {length}KB");
-        self.initialize_progress_bar(length);
-        self.download_collection();
-        self.progress_bar.finish_and_clear();
-    }
-
-    /// Gets the total size (in KB) of every post image to be downloaded.
     /// Formats file size in KB to a human-readable string with appropriate units
     fn format_file_size(&self, size_kb: u64) -> String {
         if size_kb >= 1024 * 1024 {
@@ -298,6 +247,186 @@ impl E621WebConnector {
         }
     }
 
+    /// Updates the batch information display in the progress bar
+    fn update_batch_info(&self) {
+        let batch_info = format!("Batch {}/{}", self.current_batch, self.total_batches);
+        let current_msg = format!("Processing {}", batch_info);
+        self.progress_bar.set_message(current_msg);
+    }
+    
+    /// Downloads tuple of general posts and single posts.
+    pub(crate) fn download_posts(&mut self) {
+        // Calculate the total file size first
+        let length = self.get_total_file_size();
+        trace!("Total file size for all images grabbed is {length}KB");
+        
+        // Extract all the necessary information from collections to avoid borrowing self
+        // Convert to CollectionInfo to avoid borrow checker issues
+        let collection_infos: Vec<CollectionInfo> = self.grabber.posts()
+            .iter()
+            .map(CollectionInfo::from_collection)
+            .collect();
+        
+        let total_collections = collection_infos.len();
+        
+        if total_collections == 0 {
+            info!("No collections to download.");
+            return;
+        }
+        
+        // Calculate batch information
+        self.total_batches = (total_collections + self.batch_size - 1) / self.batch_size;
+        info!("Processing {} collections in {} batches of up to {} collections each", 
+              total_collections, self.total_batches, self.batch_size);
+        
+        // Pre-initialize progress bar (now safe since we're not borrowing self.grabber anymore)
+        self.initialize_progress_bar(length);
+        
+        // Process in batches
+        for batch_idx in 0..self.total_batches {
+            self.current_batch = batch_idx + 1;
+            self.update_batch_info();
+            
+            let start_idx = batch_idx * self.batch_size;
+            let end_idx = (start_idx + self.batch_size).min(total_collections);
+            
+            // Create batch description for display
+            let batch_desc = if end_idx - start_idx > 1 {
+                let collection_names: Vec<String> = collection_infos[start_idx..end_idx]
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                format!("Batch {}/{}: {}", self.current_batch, self.total_batches, 
+                        collection_names.join(", "))
+            } else if end_idx > start_idx {
+                format!("Batch {}/{}: {}", self.current_batch, self.total_batches, 
+                        collection_infos[start_idx].name)
+            } else {
+                format!("Batch {}/{}", self.current_batch, self.total_batches)
+            };
+            
+            info!("Processing {}", batch_desc);
+            self.progress_bar.set_message(format!("Processing batch {}...", self.current_batch));
+            
+            // Process this batch of collections
+            for idx in start_idx..end_idx {
+                let collection_info = &collection_infos[idx];
+                self.download_single_collection(collection_info);
+            }
+        }
+        
+        self.progress_bar.finish_with_message("All downloads completed");
+    }
+
+    /// Downloads a single collection
+    fn download_single_collection(&mut self, collection_info: &CollectionInfo) {
+        // Get directory manager
+        let dir_manager = match Config::get().directory_manager() {
+            Ok(manager) => manager,
+            Err(err) => {
+                error!("Failed to get directory manager from configuration: {}", err);
+                self.progress_bar.set_message("Error: Failed to initialize directory manager!");
+                self.progress_bar.finish_with_message("Download failed: Configuration error");
+                return;
+            }
+        };
+        let mut dir_manager = dir_manager.clone();  // Clone to get a mutable version
+        
+        // Count new files that will be downloaded
+        let new_files = collection_info.new_files_count();
+        if new_files == 0 {
+            // No new files to download in this collection
+            return;
+        }
+        
+        // No need for redundant check - we already checked new_files count above
+
+        info!(
+            "Found {} new files to download in {}",
+            new_files,
+            console::style(format!("\"{}\"", collection_info.name)).color256(39).italic()
+        );
+        
+        // Set progress bar prefix to current collection
+        let prefix = format!("{}:", collection_info.short_name);
+        self.progress_bar.set_prefix(prefix);
+        
+        trace!("Printing Collection Info:");
+        trace!("Collection Name:            \"{}\"", collection_info.name);
+        trace!("Collection Category:        \"{}\"", collection_info.category);
+        trace!("Collection Post Length:     \"{}\"", collection_info.posts.len());
+
+        for post in &collection_info.posts {
+            if !post.is_new() {
+                self.progress_bar.set_message("Duplicate: skipping".to_string());
+                self.progress_bar.inc(post.file_size() as u64);
+                continue;
+            }
+
+            let message = format!("Downloading: {}", post.name());
+            self.progress_bar.set_message(message);
+            // Get the save directory from the post
+            let save_dir = match post.save_directory() {
+                Some(dir) => dir,
+                None => {
+                    error!("Post does not have a save directory assigned: {}", post.name());
+                    let message = format!("Error: No directory for {}", post.name());
+                    self.progress_bar.set_message(message);
+                    self.progress_bar.inc(post.file_size() as u64);
+                    continue;
+                }
+            };
+            let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
+
+            // Create the directory if it doesn't exist
+            if let Err(err) = create_dir_all(&save_dir) {
+                let path_str = save_dir.to_string_lossy();
+                error!("Could not create directory for images: {}", err);
+                error!("Path: {}", path_str);
+                self.progress_bar.set_message("Error: Bad directory path".to_string());
+                self.progress_bar.inc(post.file_size() as u64);
+                continue;
+            }
+            
+            // Download and save the file
+            let bytes = self
+                .request_sender
+                .download_image(post.url(), post.file_size());
+            
+            // Get file path as string
+            let file_path_str = match file_path.to_str() {
+                Some(path) => path,
+                None => {
+                    error!("Invalid file path for post: {}", post.name());
+                    let message = format!("Error: Invalid path for {}", post.name());
+                    self.progress_bar.set_message(message);
+                    self.progress_bar.inc(post.file_size() as u64);
+                    continue;
+                }
+            };
+            
+            // Save the image
+            match write(file_path_str, &bytes) {
+                Ok(_) => {
+                    trace!("Saved {file_path_str}...");
+                    // Mark the file as downloaded in our tracking system
+                    dir_manager.mark_file_downloaded(post.name());
+                    let message = format!("Saved: {}", post.name());
+                    self.progress_bar.set_message(message);
+                }
+                Err(err) => {
+                    error!("Failed to save image {}: {}", file_path_str, err);
+                    let message = format!("Error: Save failed for {}", post.name());
+                    self.progress_bar.set_message(message);
+                }
+            }
+
+            self.progress_bar.inc(post.file_size() as u64);
+        }
+
+        trace!("Collection {} is finished downloading...", collection_info.name);
+    }
+
     /// Gets the total size (in KB) of every post image to be downloaded.
     /// Includes validation to prevent unreasonable file sizes.
     fn get_total_file_size(&self) -> u64 {
@@ -305,7 +434,10 @@ impl E621WebConnector {
         let mut post_count: usize = 0;
         let mut capped_files: usize = 0;
         
-        for collection in self.grabber.posts().iter() {
+        // Get collections once to avoid multiple borrows
+        let collections = self.grabber.posts();
+        
+        for collection in collections.iter() {
             for post in collection.posts() {
                 // Skip posts that aren't new to avoid counting duplicates
                 if !post.is_new() {

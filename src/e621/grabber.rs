@@ -16,7 +16,8 @@ pub(crate) trait NewVec<T> {
     fn new_vec(value: T) -> Vec<Self> where Self: Sized;
 }
 
-#[derive(Debug)]
+/// A grabbed post that contains all information needed to download a post.
+#[derive(Clone, Debug)]
 pub(crate) struct GrabbedPost {
     url: String,
     name: String,
@@ -36,7 +37,7 @@ impl GrabbedPost {
     }
 
     pub(crate) fn file_size(&self) -> i64 {
-        self.file_size
+        self.file_size // Now directly returns i64
     }
 
     pub(crate) fn save_directory(&self) -> Option<&PathBuf> {
@@ -104,7 +105,7 @@ impl From<(&PostEntry, &str, u16)> for GrabbedPost {
         GrabbedPost {
             url: post.file.url.clone().unwrap(),
             name: format!("{} Page_{:05}.{}", name, current_page, post.file.ext),
-            file_size: post.file.size,
+            file_size: post.file.size, // post.file.size is already i64
             save_directory: None,
             artist: None,
             is_new: true,
@@ -118,7 +119,7 @@ impl From<(PostEntry, &str)> for GrabbedPost {
             "md5" => GrabbedPost {
                 url: post.file.url.clone().unwrap(),
                 name: format!("{}.{}", post.file.md5, post.file.ext),
-                file_size: post.file.size,
+                file_size: post.file.size, // post.file.size is already i64
                 save_directory: None,
                 artist: None,
                 is_new: true,
@@ -126,7 +127,7 @@ impl From<(PostEntry, &str)> for GrabbedPost {
             "id" => GrabbedPost {
                 url: post.file.url.clone().unwrap(),
                 name: format!("{}.{}", post.id, post.file.ext),
-                file_size: post.file.size,
+                file_size: post.file.size, // post.file.size is already i64
                 save_directory: None,
                 artist: None,
                 is_new: true,
@@ -136,7 +137,7 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                 GrabbedPost {
                     url: String::new(),
                     name: String::new(),
-                    file_size: 0,
+                    file_size: 0, // 0 as i64
                     save_directory: None,
                     artist: None,
                     is_new: false,
