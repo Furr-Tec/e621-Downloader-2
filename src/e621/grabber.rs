@@ -25,6 +25,9 @@ pub(crate) struct GrabbedPost {
     save_directory: Option<PathBuf>,
     artist: Option<String>,
     is_new: bool,
+    /// SHA-512 hash of the file contents, used for verification
+    /// This is populated after the file is downloaded
+    sha512_hash: Option<String>,
 }
 
 impl GrabbedPost {
@@ -62,6 +65,21 @@ impl GrabbedPost {
 
     pub(crate) fn set_is_new(&mut self, is_new: bool) {
         self.is_new = is_new;
+    }
+
+    /// Gets the SHA-512 hash of the file if available
+    pub(crate) fn sha512_hash(&self) -> Option<&str> {
+        self.sha512_hash.as_deref()
+    }
+
+    /// Sets the SHA-512 hash of the file
+    pub(crate) fn set_sha512_hash(&mut self, hash: String) {
+        self.sha512_hash = Some(hash);
+    }
+
+    /// Checks if the post has a SHA-512 hash
+    pub(crate) fn has_hash(&self) -> bool {
+        self.sha512_hash.is_some()
     }
 }
 
@@ -109,6 +127,7 @@ impl From<(&PostEntry, &str, u16)> for GrabbedPost {
             save_directory: None,
             artist: None,
             is_new: true,
+            sha512_hash: None,
         }
     }
 }
@@ -123,6 +142,7 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                 save_directory: None,
                 artist: None,
                 is_new: true,
+                sha512_hash: None,
             },
             "id" => GrabbedPost {
                 url: post.file.url.clone().unwrap(),
@@ -131,6 +151,7 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                 save_directory: None,
                 artist: None,
                 is_new: true,
+                sha512_hash: None,
             },
             _ => {
                 emergency_exit("Incorrect naming convention!");
@@ -141,6 +162,7 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                     save_directory: None,
                     artist: None,
                     is_new: false,
+                    sha512_hash: None,
                 }
             }
         }
