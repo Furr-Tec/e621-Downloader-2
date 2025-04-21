@@ -51,11 +51,11 @@ impl DirectoryManager {
         
         // Scan all three directories in parallel 
         let scan_result = rayon::join(
-            || DirectoryManager::scan_directory_static(&artists, false),
+            || DirectoryManager::scan_directory_static(&artists, true),
             || {
                 rayon::join(
-                    || DirectoryManager::scan_directory_static(&tags, false),
-                    || DirectoryManager::scan_directory_static(&pools, false)
+                    || DirectoryManager::scan_directory_static(&tags, true),
+                    || DirectoryManager::scan_directory_static(&pools, true)
                 )
             }
         );
@@ -226,38 +226,68 @@ impl DirectoryManager {
             .with_context(|| format!("Failed to create artist subdirectory at {:?}", artist_subdir))?;
         Ok(artist_subdir)
     }
+    
+    /// Checks if a file exists by hash first, falling back to filename if hash is not available
+    pub(crate) fn file_exists_by_hash(&self, hash: &str) -> bool {
+        self.downloaded_files.iter().any(|(_, stored_hash)| {
+            stored_hash.as_ref().map_or(false, |h| h == hash)
+        })
+    }
+    
     /// Checks if a file exists in any of the organized directories
     pub(crate) fn file_exists(&self, file_name: &str) -> bool {
         self.downloaded_files.iter().any(|(name, _)| name == file_name)
     }
     
     /// Verifies if a file with the given name and hash exists
-    /// If strict verification is disabled, falls back to filename-only check
+    /// If strict verification is enabled, looks for hash match
+    /// Otherwise falls back to filename-only check
     pub(crate) fn verify_file(&self, file_name: &str, hash: Option<&str>) -> bool {
-        // If we don't have a hash or strict verification is disabled, just check the filename
-        if hash.is_none() || !self.use_strict_verification {
-            return self.file_exists(file_name);
+        if let Some(h) = hash {
+            if self.use_strict_verification {
+                // In strict mode, the hash MUST match if provided
+                return self.downloaded_files.iter().any(|(name, stored_hash)| {
+                    (name == file_name) && stored_hash.as_ref().map_or(false, |sh| sh == h)
+                });
+            } else {
+                // Try hash match first, then fall back to filename
+                if self.file_exists_by_hash(h) {
+                    return true;
+                }
+            }
         }
         
-        let hash = hash.unwrap();
-        
-        // Check for exact filename and hash match
-        self.downloaded_files.iter().any(|(name, stored_hash)| {
-            name == file_name && stored_hash.as_ref().map_or(false, |h| h == hash)
-        })
+        // Fall back to filename check when hash is not available or not found
+        self.file_exists(file_name)
     }
 
     /// Adds a file to the tracking set after successful download
+    /// Note: This method is deprecated and should only be used when hash calculation fails
     pub(crate) fn mark_file_downloaded(&mut self, file_name: &str) {
+        warn!("Adding file '{}' without hash - hash verification will not be possible", file_name);
         self.downloaded_files.insert((file_name.to_string(), None));
     }
     
     /// Adds a file with its SHA-512 hash to the tracking set
+    /// This is the preferred method for tracking downloaded files
     pub(crate) fn mark_file_downloaded_with_hash(&mut self, file_name: &str, hash: String) {
+        trace!("Adding file '{}' with SHA-512 hash", file_name);
         self.downloaded_files.insert((file_name.to_string(), Some(hash)));
     }
     
-    /// Calculate hash for an existing file by its path
+    /// Checks if a file exists by name or hash
+    /// This is the preferred method for checking duplicates as it uses hash first when available
+    pub(crate) fn is_duplicate(&self, file_name: &str, hash: Option<&str>) -> bool {
+        // Check by hash first if available (most reliable)
+        if let Some(h) = hash {
+            if self.file_exists_by_hash(h) {
+                return true;
+            }
+        }
+        
+        // Fall back to filename check
+        self.file_exists(file_name)
+    }
     pub(crate) fn calculate_hash_for_file(&self, file_path: &Path) -> Result<String> {
         DirectoryManager::calculate_sha512(file_path)
     }

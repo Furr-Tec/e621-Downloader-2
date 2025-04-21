@@ -93,7 +93,8 @@ impl NewVec<Vec<PostEntry>> for GrabbedPost {
                     post.set_artist(artist_tag.clone());
                 }
                 // Check if this file has been downloaded before
-                post.set_is_new(!dir_manager.file_exists(&post.name));
+                // Use hash-based duplicate detection when available
+                post.set_is_new(!dir_manager.is_duplicate(&post.name, post.sha512_hash()));
                 post
             })
             .collect()
@@ -111,7 +112,8 @@ impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
                     post.set_artist(artist_tag.clone());
                 }
                 // Check if this file has been downloaded before
-                post.set_is_new(!dir_manager.file_exists(&post.name));
+                // Use hash-based duplicate detection when available
+                post.set_is_new(!dir_manager.is_duplicate(&post.name, post.sha512_hash()));
                 post
             })
             .collect()
@@ -154,16 +156,8 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                 sha512_hash: None,
             },
             _ => {
+                // This will terminate the program, so no need for unreachable code after it
                 emergency_exit("Incorrect naming convention!");
-                GrabbedPost {
-                    url: String::new(),
-                    name: String::new(),
-                    file_size: 0, // 0 as i64
-                    save_directory: None,
-                    artist: None,
-                    is_new: false,
-                    sha512_hash: None,
-                }
             }
         }
     }

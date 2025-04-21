@@ -1,7 +1,12 @@
 use std::cell::RefCell;
-use std::fs::{create_dir_all, write};
+use std::fs::{create_dir_all, write, File};
+use std::io::Read;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
+
+use sha2::{Sha512, Digest};
+use hex::encode as hex_encode;
 
 use anyhow::Context;
 use dialoguer::{Confirm, Input};
@@ -258,7 +263,30 @@ impl E621WebConnector {
             format!("{} KB", size_kb)
         }
     }
-
+    
+    /// Calculate SHA-512 hash for a file
+    fn calculate_sha512(&self, file_path: &Path) -> Result<String, anyhow::Error> {
+        // Open the file
+        let mut file = File::open(file_path)?;
+        
+        // Read the file in chunks and update the hasher
+        let mut hasher = Sha512::new();
+        let mut buffer = [0; 1024 * 1024]; // 1MB buffer for reading
+        
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            
+            if bytes_read == 0 {
+                break; // End of file
+            }
+            
+            hasher.update(&buffer[..bytes_read]);
+        }
+        
+        // Finalize the hash and convert to hex string
+        let hash = hasher.finalize();
+        Ok(hex_encode(hash))
+    }
     
     /// Downloads tuple of general posts and single posts.
     pub(crate) fn download_posts(&mut self) {
@@ -364,15 +392,30 @@ impl E621WebConnector {
         trace!("Collection Category:        \"{}\"", collection_info.category);
         trace!("Collection Post Length:     \"{}\"", collection_info.posts.len());
 
+        // Process each post in this collection
         for post in &collection_info.posts {
+            // Skip posts that aren't new
             if !post.is_new() {
-                self.progress_bar.set_message("Duplicate: skipping".to_string());
+                continue;
+            }
+            
+            // Check if this post already exists - now uses hash verification when available
+            let existing = post.sha512_hash().map_or_else(
+                // No hash available, use filename check
+                || dir_manager.file_exists(post.name()),
+                // Hash available, use verification with hash
+                |hash| dir_manager.verify_file(post.name(), Some(hash)) 
+            );
+            
+            if existing {
+                self.progress_bar.set_message("Duplicate: verified and skipping".to_string());
                 self.progress_bar.inc(post.file_size() as u64);
                 continue;
             }
 
             let message = format!("Downloading: {}", post.name());
             self.progress_bar.set_message(message);
+            
             // Get the save directory from the post
             let save_dir = match post.save_directory() {
                 Some(dir) => dir,
@@ -384,6 +427,7 @@ impl E621WebConnector {
                     continue;
                 }
             };
+            
             let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
 
             // Create the directory if it doesn't exist
@@ -397,16 +441,13 @@ impl E621WebConnector {
             }
             
             // Download and save the file
-            let bytes = self
-                .request_sender
-                .download_image(post.url(), post.file_size());
-            
-            // Get file path as string
-            let file_path_str = match file_path.to_str() {
-                Some(path) => path,
-                None => {
-                    error!("Invalid file path for post: {}", post.name());
-                    let message = format!("Error: Invalid path for {}", post.name());
+            let file_path_str = file_path.to_string_lossy().to_string();
+            // Download the file
+            let bytes = match self.request_sender.get_bytes_from_url(post.url()) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error!("Failed to download image {}: {}", post.name(), err);
+                    let message = format!("Error: Download failed for {}", post.name());
                     self.progress_bar.set_message(message);
                     self.progress_bar.inc(post.file_size() as u64);
                     continue;
@@ -414,14 +455,36 @@ impl E621WebConnector {
             };
             
             // Save the image
-            match write(file_path_str, &bytes) {
+            match write(&file_path, &bytes) {
                 Ok(_) => {
-                    trace!("Saved {file_path_str}...");
-                    // Mark the file as downloaded in our tracking system
-                    dir_manager.mark_file_downloaded(post.name());
-                    let message = format!("Saved: {}", post.name());
-                    self.progress_bar.set_message(message);
-                }
+                    trace!("Saved {}...", file_path_str);
+                    
+                    // Calculate SHA-512 hash for verification
+                    let hash_result = self.calculate_sha512(&file_path);
+                    
+                    match hash_result {
+                        Ok(hash) => {
+                            // Store hash with the downloaded file for future verification
+                            dir_manager.mark_file_downloaded_with_hash(post.name(), hash.clone());
+                            
+                            // Also update the post with its hash for future reference
+                            let post_mut_ptr = post as *const grabber::GrabbedPost as *mut grabber::GrabbedPost;
+                            unsafe {
+                                (*post_mut_ptr).set_sha512_hash(hash);
+                            }
+                            
+                            let message = format!("Saved and verified: {}", post.name());
+                            self.progress_bar.set_message(message);
+                        },
+                        Err(e) => {
+                            // Hash calculation failed but file was saved
+                            warn!("Failed to calculate hash for {}: {}", file_path_str, e);
+                            dir_manager.mark_file_downloaded(post.name());
+                            let message = format!("Saved but not verified: {}", post.name());
+                            self.progress_bar.set_message(message);
+                        }
+                    }
+                },
                 Err(err) => {
                     error!("Failed to save image {}: {}", file_path_str, err);
                     let message = format!("Error: Save failed for {}", post.name());
@@ -453,6 +516,7 @@ impl E621WebConnector {
                 }
                 
                 let file_size = post.file_size() as u64;
+                post_count += 1;
                 
                 // Validate individual file size using user's cap
                 if file_size > self.file_size_cap {
@@ -467,20 +531,7 @@ impl E621WebConnector {
                 } else {
                     total_size += file_size;
                 }
-                
-                post_count += 1;
             }
-        }
-        
-        // Final validation of total size
-        if total_size > self.total_size_cap {
-            let formatted_original = self.format_file_size(total_size);
-            let formatted_cap = self.format_file_size(self.total_size_cap);
-            
-            warn!("Total file size ({}) exceeds user's limit, capping at {}", 
-                  formatted_original, formatted_cap);
-                  
-            return self.total_size_cap;
         }
         
         let formatted_size = self.format_file_size(total_size);

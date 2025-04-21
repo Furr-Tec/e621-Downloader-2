@@ -290,6 +290,33 @@ impl RequestSender {
         image_bytes
     }
 
+    /// Downloads bytes from a URL, handling errors properly
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: The URL to download bytes from
+    ///
+    /// returns: Result<Vec<u8>, anyhow::Error>
+    pub(crate) fn get_bytes_from_url(&self, url: &str) -> Result<Vec<u8>> {
+        trace!("Downloading bytes from URL: {}", url);
+        
+        // Send the request and check response
+        let mut response = match self.client.get(url).send() {
+            Ok(response) => response,
+            Err(ref error) => {
+                error!("Failed to download from URL {}: {}", url, error);
+                return Err(anyhow::anyhow!("Failed to download from URL: {}", error));
+            }
+        };
+        
+        // Read bytes from response
+        let mut bytes = Vec::new();
+        response.copy_to(&mut bytes)
+            .with_context(|| format!("Failed to read bytes from response for URL: {}", url))?;
+            
+        Ok(bytes)
+    }
+
     /// Appends base url with id/name before ending with `.json`.
     ///
     /// # Arguments
@@ -337,11 +364,11 @@ impl RequestSender {
             "single" => value
                 .get("post")
                 .unwrap_or_else(|| {
+                    // This will terminate the program, so no code after it will be reached
                     emergency_exit(&format!(
                         "Post was not found! Post ID ({}) is invalid or post was deleted.",
                         id
                     ));
-                    unreachable!()
                 })
                 .to_owned(),
             _ => value,

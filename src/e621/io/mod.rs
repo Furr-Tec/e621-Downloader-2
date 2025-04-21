@@ -68,8 +68,8 @@ impl Config {
             Some(manager) => Ok(manager),
             None => {
                 error!("Directory manager not initialized!");
+                // This will terminate the program, so no code after it will be reached
                 emergency_exit("Configuration error: Directory manager not initialized");
-                unreachable!()
             }
         }
     }
