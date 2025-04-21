@@ -1,19 +1,3 @@
-/*
- * Copyright (c) 2022 McSib
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 use std::cell::RefCell;
 use std::fs::{create_dir_all, write};
 use std::path::PathBuf;
@@ -52,7 +36,6 @@ pub(crate) struct E621WebConnector {
     /// The user's blacklist.
     blacklist: Rc<RefCell<Blacklist>>,
 }
-
 impl E621WebConnector {
     /// Creates instance of `Self` for grabbing and downloading posts.
     pub(crate) fn new(request_sender: &RequestSender) -> Self {
@@ -138,7 +121,7 @@ impl E621WebConnector {
         dir_name
             .chars()
             .map(|e| match e {
-                '?' | ':' | '*' | '<' | '>' | '\"' | '|' => '_',
+                '?' | ':' | '*' | '<' | '>' | '"' | '|' => '_',
                 _ => e,
             })
             .collect()
@@ -146,6 +129,10 @@ impl E621WebConnector {
 
     /// Processes `PostSet` and downloads all posts from it.
     fn download_collection(&mut self) {
+        // Get directory manager
+        let dir_manager = Config::get().directory_manager().unwrap();
+        let mut dir_manager = dir_manager.clone();  // Clone to get a mutable version
+
         for collection in self.grabber.posts().iter() {
             let collection_name = collection.name();
             let collection_category = collection.category();
@@ -153,70 +140,24 @@ impl E621WebConnector {
             let collection_count = collection_posts.len();
             let short_collection_name = collection.shorten("...");
 
-            #[cfg(unix)]
-            let static_path: PathBuf = [
-                &self.download_directory,
-                collection.category(),
-                &self.remove_invalid_chars(collection_name),
-            ]
-            .iter()
-            .collect();
-
-            #[cfg(windows)]
-            let mut static_path: PathBuf = [
-                &self.download_directory,
-                collection.category(),
-                &self.remove_invalid_chars(collection_name),
-            ]
-            .iter()
-            .collect();
-
-            // This is put here to attempt to shorten the length of the path if it passes window's
-            // max path length.
-            #[cfg(windows)]
-            const MAX_PATH: usize = 260; // Defined in Windows documentation.
-
-            #[cfg(windows)]
-            let start_path_len = static_path.as_os_str().len();
-
-            #[cfg(windows)]
-            if start_path_len >= MAX_PATH {
-                static_path = [
-                    &self.download_directory,
-                    collection_category,
-                    &self.remove_invalid_chars(&collection.shorten('_')),
-                ]
-                .iter()
-                .collect();
-
-                let new_len = static_path.as_os_str().len();
-                if new_len >= MAX_PATH {
-                    error!("Path is too long and crosses the {MAX_PATH} char limit.\
-                       Please relocate the program to a directory closer to the root drive directory.");
-                    trace!("Path length: {new_len}");
-                }
+            // Count new files that will be downloaded
+            let new_files = collection_posts.iter().filter(|post| post.is_new()).count();
+            if new_files > 0 {
+                info!(
+                    "Found {} new files to download in {}",
+                    new_files,
+                    console::style(format!("\"{}\"", collection_name)).color256(39).italic()
+                );
             }
 
             trace!("Printing Collection Info:");
             trace!("Collection Name:            \"{collection_name}\"");
             trace!("Collection Category:        \"{collection_category}\"");
             trace!("Collection Post Length:     \"{collection_count}\"");
-            trace!(
-                "Static file path for this collection: \"{}\"",
-                static_path.to_str().unwrap()
-            );
 
             for post in collection_posts {
-                let file_path: PathBuf = [
-                    &static_path.to_str().unwrap().to_string(),
-                    &self.remove_invalid_chars(post.name()),
-                ]
-                .iter()
-                .collect();
-
-                if file_path.exists() {
-                    self.progress_bar
-                        .set_message("Duplicate found: skipping... ");
+                if !post.is_new() {
+                    self.progress_bar.set_message("Duplicate found: skipping... ");
                     self.progress_bar.inc(post.file_size() as u64);
                     continue;
                 }
@@ -224,21 +165,31 @@ impl E621WebConnector {
                 self.progress_bar
                     .set_message(format!("Downloading: {short_collection_name} "));
 
-                let parent_path = file_path.parent().unwrap();
-                create_dir_all(parent_path)
+                // Get the save directory from the post
+                let save_dir = post.save_directory()
+                    .expect("Post should have a save directory assigned");
+                let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
+
+                // Create the directory if it doesn't exist
+                create_dir_all(save_dir)
                     .with_context(|| {
                         error!("Could not create directories for images!");
                         format!(
                             "Directory path unable to be created...\nPath: \"{}\"",
-                            parent_path.to_str().unwrap()
+                            save_dir.to_str().unwrap()
                         )
                     })
                     .unwrap();
 
+                // Download and save the file
                 let bytes = self
                     .request_sender
                     .download_image(post.url(), post.file_size());
                 self.save_image(file_path.to_str().unwrap(), &bytes);
+
+                // Mark the file as downloaded in our tracking system
+                dir_manager.mark_file_downloaded(post.name());
+
                 self.progress_bar.inc(post.file_size() as u64);
             }
 

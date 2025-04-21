@@ -1,22 +1,7 @@
-﻿/*
- * Copyright (c) 2022 McSib
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-use std::path::{Path, PathBuf};
+﻿use std::path::{Path, PathBuf};
 use std::fs;
-use anyhow::{Result, Error, Context};
+use std::collections::HashSet;
+use anyhow::{Result, Context};
 
 /// Manages the directory structure for downloaded content
 #[derive(Debug, Clone)]
@@ -29,6 +14,8 @@ pub(crate) struct DirectoryManager {
     tags_dir: PathBuf,
     /// Directory for pool content
     pools_dir: PathBuf,
+    /// Set of already downloaded files
+    downloaded_files: HashSet<String>,
 }
 
 impl DirectoryManager {
@@ -40,14 +27,28 @@ impl DirectoryManager {
         let pools = root.join("Pools");
 
         let manager = DirectoryManager {
+            root_dir: root.clone(),
+            artists_dir: artists.clone(),
+            tags_dir: tags.clone(),
+            pools_dir: pools.clone(),
+            downloaded_files: HashSet::new(),
+        };
+
+        manager.create_directory_structure()?;
+
+        // Scan directories for existing files
+        let mut files = HashSet::new();
+        DirectoryManager::scan_directory_static(&artists, &mut files)?;
+        DirectoryManager::scan_directory_static(&tags, &mut files)?;
+        DirectoryManager::scan_directory_static(&pools, &mut files)?;
+
+        Ok(DirectoryManager {
             root_dir: root,
             artists_dir: artists,
             tags_dir: tags,
             pools_dir: pools,
-        };
-
-        manager.create_directory_structure()?;
-        Ok(manager)
+            downloaded_files: files,
+        })
     }
 
     /// Creates the basic directory structure
@@ -60,6 +61,26 @@ impl DirectoryManager {
             .with_context(|| format!("Failed to create tags directory at {:?}", self.tags_dir))?;
         fs::create_dir_all(&self.pools_dir)
             .with_context(|| format!("Failed to create pools directory at {:?}", self.pools_dir))?;
+        Ok(())
+    }
+
+    /// Recursively scans a directory and adds all files to the provided set
+    fn scan_directory_static(dir: &Path, files: &mut HashSet<String>) -> Result<()> {
+        if dir.is_dir() {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    DirectoryManager::scan_directory_static(&path, files)?;
+                } else {
+                    if let Some(name) = path.file_name() {
+                        if let Some(name_str) = name.to_str() {
+                            files.insert(name_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -97,24 +118,12 @@ impl DirectoryManager {
 
     /// Checks if a file exists in any of the organized directories
     pub(crate) fn file_exists(&self, file_name: &str) -> bool {
-        self.find_file_in_dir(&self.artists_dir, file_name)
-            || self.find_file_in_dir(&self.tags_dir, file_name)
-            || self.find_file_in_dir(&self.pools_dir, file_name)
+        self.downloaded_files.contains(file_name)
     }
 
-    /// Recursively searches for a file in a directory
-    fn find_file_in_dir(&self, dir: &Path, file_name: &str) -> bool {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.file_name().unwrap_or_default().to_string_lossy() == file_name {
-                    return true;
-                } else if path.is_dir() && self.find_file_in_dir(&path, file_name) {
-                    return true;
-                }
-            }
-        }
-        false
+    /// Adds a file to the tracking set after successful download
+    pub(crate) fn mark_file_downloaded(&mut self, file_name: &str) {
+        self.downloaded_files.insert(file_name.to_string());
     }
 }
 

@@ -3,8 +3,6 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 use std::path::PathBuf;
 
-use anyhow::{Result, Error};
-
 use crate::e621::blacklist::Blacklist;
 use crate::e621::io::tag::{Group, Tag, TagSearchType, TagType};
 use crate::e621::io::{emergency_exit, Config, Login};
@@ -13,12 +11,9 @@ use crate::e621::sender::RequestSender;
 
 const POST_SEARCH_LIMIT: u8 = 5;
 
+/// A trait for implementing a conversion function for turning a type into a [Vec] of the same type
 pub(crate) trait NewVec<T> {
     fn new_vec(value: T) -> Vec<Self> where Self: Sized;
-}
-
-pub(crate) trait Shorten<T> {
-    fn shorten(&self, delimiter: T) -> String;
 }
 
 #[derive(Debug)]
@@ -28,6 +23,7 @@ pub(crate) struct GrabbedPost {
     file_size: i64,
     save_directory: Option<PathBuf>,
     artist: Option<String>,
+    is_new: bool,
 }
 
 impl GrabbedPost {
@@ -57,6 +53,96 @@ impl GrabbedPost {
 
     pub(crate) fn set_artist(&mut self, artist: String) {
         self.artist = Some(artist);
+    }
+
+    pub(crate) fn is_new(&self) -> bool {
+        self.is_new
+    }
+
+    pub(crate) fn set_is_new(&mut self, is_new: bool) {
+        self.is_new = is_new;
+    }
+}
+
+impl NewVec<Vec<PostEntry>> for GrabbedPost {
+    fn new_vec(vec: Vec<PostEntry>) -> Vec<Self> {
+        let dir_manager = Config::get().directory_manager().unwrap();
+        vec.into_iter()
+            .map(|e| {
+                let mut post = GrabbedPost::from((e.clone(), Config::get().naming_convention()));
+                if let Some(artist_tag) = e.tags.artist.first() {
+                    post.set_artist(artist_tag.clone());
+                }
+                // Check if this file has been downloaded before
+                post.set_is_new(!dir_manager.file_exists(&post.name));
+                post
+            })
+            .collect()
+    }
+}
+
+impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
+    fn new_vec((vec, pool_name): (Vec<PostEntry>, &str)) -> Vec<Self> {
+        let dir_manager = Config::get().directory_manager().unwrap();
+        vec.iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut post = GrabbedPost::from((e, pool_name, (i + 1) as u16));
+                if let Some(artist_tag) = e.tags.artist.first() {
+                    post.set_artist(artist_tag.clone());
+                }
+                // Check if this file has been downloaded before
+                post.set_is_new(!dir_manager.file_exists(&post.name));
+                post
+            })
+            .collect()
+    }
+}
+
+impl From<(&PostEntry, &str, u16)> for GrabbedPost {
+    fn from((post, name, current_page): (&PostEntry, &str, u16)) -> Self {
+        GrabbedPost {
+            url: post.file.url.clone().unwrap(),
+            name: format!("{} Page_{:05}.{}", name, current_page, post.file.ext),
+            file_size: post.file.size,
+            save_directory: None,
+            artist: None,
+            is_new: true,
+        }
+    }
+}
+
+impl From<(PostEntry, &str)> for GrabbedPost {
+    fn from((post, name_convention): (PostEntry, &str)) -> Self {
+        match name_convention {
+            "md5" => GrabbedPost {
+                url: post.file.url.clone().unwrap(),
+                name: format!("{}.{}", post.file.md5, post.file.ext),
+                file_size: post.file.size,
+                save_directory: None,
+                artist: None,
+                is_new: true,
+            },
+            "id" => GrabbedPost {
+                url: post.file.url.clone().unwrap(),
+                name: format!("{}.{}", post.id, post.file.ext),
+                file_size: post.file.size,
+                save_directory: None,
+                artist: None,
+                is_new: true,
+            },
+            _ => {
+                emergency_exit("Incorrect naming convention!");
+                GrabbedPost {
+                    url: String::new(),
+                    name: String::new(),
+                    file_size: 0,
+                    save_directory: None,
+                    artist: None,
+                    is_new: false,
+                }
+            }
+        }
     }
 }
 
@@ -90,11 +176,7 @@ impl PostCollection {
         &self.posts
     }
 
-    pub(crate) fn posts_mut(&mut self) -> &mut Vec<GrabbedPost> {
-        &mut self.posts
-    }
-
-    pub(crate) fn initialize_directories(&mut self) -> Result<()> {
+    pub(crate) fn initialize_directories(&mut self) -> anyhow::Result<()> {
         let dir_manager = Config::get().directory_manager()?;
         
         match self.category.as_str() {
@@ -126,6 +208,48 @@ impl PostCollection {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn has_new_posts(&self) -> bool {
+        self.posts.iter().any(|post| post.is_new())
+    }
+
+    pub(crate) fn new_posts_count(&self) -> usize {
+        self.posts.iter().filter(|post| post.is_new()).count()
+    }
+}
+
+impl From<(&SetEntry, Vec<GrabbedPost>)> for PostCollection {
+    fn from((set, posts): (&SetEntry, Vec<GrabbedPost>)) -> Self {
+        PostCollection::new(&set.name, "Sets", posts)
+    }
+}
+
+pub(crate) trait Shorten<T> {
+    fn shorten(&self, delimiter: T) -> String;
+}
+
+impl Shorten<&str> for PostCollection {
+    fn shorten(&self, delimiter: &str) -> String {
+        if self.name.len() >= 25 {
+            let mut short_name = self.name[0..25].to_string();
+            short_name.push_str(delimiter);
+            short_name
+        } else {
+            self.name.to_string()
+        }
+    }
+}
+
+impl Shorten<char> for PostCollection {
+    fn shorten(&self, delimiter: char) -> String {
+        if self.name.len() >= 25 {
+            let mut short_name = self.name[0..25].to_string();
+            short_name.push(delimiter);
+            short_name
+        } else {
+            self.name.to_string()
+        }
     }
 }
 
@@ -427,107 +551,5 @@ impl Grabber {
                 trace!("{} posts had to be filtered by e621/e926...", invalid_posts);
             }
         }
-    }
-}
-
-impl NewVec<Vec<PostEntry>> for GrabbedPost {
-    fn new_vec(vec: Vec<PostEntry>) -> Vec<Self> {
-        vec.into_iter()
-            .map(|e| {
-                let mut post = GrabbedPost::from((e.clone(), Config::get().naming_convention()));
-                if let Some(artist_tag) = e.tags.artist.first() {
-                    post.set_artist(artist_tag.clone());
-                }
-                post
-            })
-            .collect()
-    }
-}
-
-impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
-    fn new_vec((vec, pool_name): (Vec<PostEntry>, &str)) -> Vec<Self> {
-        vec.iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let mut post = GrabbedPost::from((e, pool_name, (i + 1) as u16));
-                if let Some(artist_tag) = e.tags.artist.first() {
-                    post.set_artist(artist_tag.clone());
-                }
-                post
-            })
-            .collect()
-    }
-}
-
-impl From<(&PostEntry, &str, u16)> for GrabbedPost {
-    fn from((post, name, current_page): (&PostEntry, &str, u16)) -> Self {
-        GrabbedPost {
-            url: post.file.url.clone().unwrap(),
-            name: format!("{} Page_{:05}.{}", name, current_page, post.file.ext),
-            file_size: post.file.size,
-            save_directory: None,
-            artist: None,
-        }
-    }
-}
-
-impl From<(PostEntry, &str)> for GrabbedPost {
-    fn from((post, name_convention): (PostEntry, &str)) -> Self {
-        match name_convention {
-            "md5" => GrabbedPost {
-                url: post.file.url.clone().unwrap(),
-                name: format!("{}.{}", post.file.md5, post.file.ext),
-                file_size: post.file.size,
-                save_directory: None,
-                artist: None,
-            },
-            "id" => GrabbedPost {
-                url: post.file.url.clone().unwrap(),
-                name: format!("{}.{}", post.id, post.file.ext),
-                file_size: post.file.size,
-                save_directory: None,
-                artist: None,
-            },
-            _ => {
-                emergency_exit("Incorrect naming convention!");
-                GrabbedPost {
-                    url: String::new(),
-                    name: String::new(),
-                    file_size: 0,
-                    save_directory: None,
-                    artist: None,
-                }
-            }
-        }
-    }
-}
-
-impl Shorten<&str> for PostCollection {
-    fn shorten(&self, delimiter: &str) -> String {
-        if self.name.len() >= 25 {
-            let mut short_name = self.name[0..25].to_string();
-            short_name.push_str(delimiter);
-            short_name
-        } else {
-            self.name.to_string()
-        }
-    }
-}
-
-impl Shorten<char> for PostCollection {
-    fn shorten(&self, delimiter: char) -> String {
-        if self.name.len() >= 25 {
-            let mut short_name = self.name[0..25].to_string();
-            short_name.push(delimiter);
-            short_name
-        } else {
-            self.name.to_string()
-        }
-    }
-}
-
-impl From<(&SetEntry, Vec<GrabbedPost>)> for PostCollection {
-    fn from((set, posts): (&SetEntry, Vec<GrabbedPost>)) -> Self {
-        PostCollection::new(&set.name, "Sets", posts)
     }
 }
