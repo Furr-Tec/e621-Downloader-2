@@ -39,8 +39,15 @@ impl GrabbedPost {
         &self.name
     }
 
+    /// Returns the file size in kilobytes
+    /// The size is stored in bytes in the struct but converted to KB when accessed
     pub(crate) fn file_size(&self) -> i64 {
-        self.file_size // Now directly returns i64
+        self.file_size / 1024 // Convert bytes to KB
+    }
+    
+    /// Returns the raw file size in bytes (as received from the API)
+    pub(crate) fn file_size_bytes(&self) -> i64 {
+        self.file_size
     }
 
     pub(crate) fn save_directory(&self) -> Option<&PathBuf> {

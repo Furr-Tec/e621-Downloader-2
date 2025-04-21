@@ -261,19 +261,28 @@ impl E621WebConnector {
     }
     
     /// Formats file size in KB to a human-readable string with appropriate units
-    fn format_file_size(&self, size_kb: u64) -> String {
-        if size_kb >= 1024 * 1024 {
+    /// Formats file size in bytes to a human-readable string with appropriate units
+    fn format_file_size(&self, size_bytes: u64) -> String {
+        const KB: f64 = 1024.0;
+        const MB: f64 = KB * 1024.0;
+        const GB: f64 = MB * 1024.0;
+        
+        let size = size_bytes as f64;
+        
+        if size >= GB {
             // Size in GB
-            format!("{:.2} GB", size_kb as f64 / (1024.0 * 1024.0))
-        } else if size_kb >= 1024 {
+            format!("{:.2} GB", size / GB)
+        } else if size >= MB {
             // Size in MB
-            format!("{:.2} MB", size_kb as f64 / 1024.0)
-        } else {
+            format!("{:.2} MB", size / MB)
+        } else if size >= KB {
             // Size in KB
-            format!("{} KB", size_kb)
+            format!("{:.2} KB", size / KB)
+        } else {
+            // Size in bytes
+            format!("{} bytes", size_bytes)
         }
     }
-    
     /// Original SHA-512 hash calculation method - kept for reference
     /// This method can cause stack overflow with large buffers on the stack
     #[allow(dead_code)]
@@ -565,15 +574,16 @@ impl E621WebConnector {
         let posts = collection_info.posts();
         
         // Detect potentially problematic collections based on size and complexity
+        // Detect potentially problematic collections based on size and complexity
         const LARGE_COLLECTION_THRESHOLD: usize = 50; // Collections with more than 50 files
-        const LARGE_FILE_SIZE_THRESHOLD: i64 = 100 * 1024; // Files larger than 100MB
+        const LARGE_FILE_SIZE_THRESHOLD: i64 = 100 * 1024 * 1024; // 100MB in bytes
 
         let is_problematic = posts.len() > LARGE_COLLECTION_THRESHOLD || 
-            posts.iter().any(|post| post.file_size() > LARGE_FILE_SIZE_THRESHOLD);
-
+            posts.iter().any(|post| post.file_size_bytes() > LARGE_FILE_SIZE_THRESHOLD);
         let batch_size = if is_problematic {
             // Calculate total size in MB for logging
-            let total_size_mb = posts.iter().map(|p| p.file_size()).sum::<i64>() / 1024;
+            let total_size_bytes: i64 = posts.iter().map(|p| p.file_size_bytes()).sum();
+            let total_size_mb = total_size_bytes / (1024 * 1024);
             
             info!("Large collection detected: '{}' with {} files ({}MB total). Using smaller batch size for memory efficiency.", 
                   collection_info.name, posts.len(), total_size_mb);
@@ -827,21 +837,23 @@ impl E621WebConnector {
                     continue;
                 }
                 
-                let file_size = post.file_size() as u64;
+                // Get file size in bytes and convert cap from KB to bytes for comparison
+                let file_size_bytes = post.file_size_bytes() as u64;
+                let file_size_cap_bytes = self.file_size_cap * 1024; // Convert KB cap to bytes
                 post_count += 1;
                 
                 // Validate individual file size using user's cap
-                if file_size > self.file_size_cap {
-                    let formatted_original = self.format_file_size(file_size);
-                    let formatted_cap = self.format_file_size(self.file_size_cap);
+                if file_size_bytes > file_size_cap_bytes {
+                    let formatted_original = self.format_file_size(file_size_bytes);
+                    let formatted_cap = self.format_file_size(file_size_cap_bytes);
                     
                     warn!("Post {} has large file size: {}, capping at {}", 
                           post.name(), formatted_original, formatted_cap);
                           
-                    total_size += self.file_size_cap;
+                    total_size += file_size_cap_bytes;
                     capped_files += 1;
                 } else {
-                    total_size += file_size;
+                    total_size += file_size_bytes;
                 }
             }
         }
