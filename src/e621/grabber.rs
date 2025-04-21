@@ -180,32 +180,71 @@ impl PostCollection {
     pub(crate) fn initialize_directories(&mut self) -> anyhow::Result<()> {
         let dir_manager = Config::get().directory_manager()?;
         
+        // Track how many posts were assigned directories
+        let mut assigned_count = 0;
+        
+        // Step 1: Set up base directory based on category
         match self.category.as_str() {
             "Pools" => {
+                trace!("Setting up pool directory for '{}'", self.name);
                 self.base_directory = Some(dir_manager.get_pool_directory(&self.name)?);
             }
             "Sets" => {
+                trace!("Setting up set directory for '{}'", self.name);
+                self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
+            }
+            "General Searches" => {
+                trace!("Setting up tag directory for general search '{}'", self.name);
+                // For general searches, create a tag directory as the base
                 self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
             }
             _ => {
+                // For single posts or other categories, handle individually
+                trace!("Processing individual posts for '{}'", self.name);
                 for post in &mut self.posts {
                     if let Some(artist) = post.artist() {
                         let artist_dir = dir_manager.get_artist_directory(artist)?;
+                        trace!("Assigned artist directory for post '{}' to artist '{}'", post.name(), artist);
                         post.set_save_directory(artist_dir);
+                        assigned_count += 1;
+                    } else {
+                        // Fallback for posts without artist
+                        let fallback_dir = dir_manager.get_tag_directory("unknown_artist")?;
+                        trace!("Assigned fallback directory for post '{}' with no artist", post.name());
+                        post.set_save_directory(fallback_dir);
+                        assigned_count += 1;
                     }
                 }
             }
         }
 
+        // Step 2: For posts in categories with base directories, organize by artist
         if let Some(base_dir) = &self.base_directory {
             for post in &mut self.posts {
                 if let Some(artist) = post.artist() {
                     let artist_subdir = dir_manager.create_artist_subdirectory(base_dir, artist)?;
+                    trace!("Assigned artist subdirectory in '{}/{}' for post '{}'", 
+                          self.category, self.name, post.name());
                     post.set_save_directory(artist_subdir);
+                    assigned_count += 1;
                 } else {
-                    post.set_save_directory(base_dir.clone());
+                    // Use 'unknown_artist' subdirectory as fallback
+                    let unknown_artist_dir = dir_manager.create_artist_subdirectory(base_dir, "unknown_artist")?;
+                    trace!("Assigned unknown_artist subdirectory for post '{}' with no artist", post.name());
+                    post.set_save_directory(unknown_artist_dir);
+                    assigned_count += 1;
                 }
             }
+        }
+
+        // Verify all posts were assigned directories
+        let total_posts = self.posts.len();
+        if assigned_count != total_posts {
+            warn!("Not all posts were assigned directories: {}/{} assigned in collection '{}'", 
+                  assigned_count, total_posts, self.name);
+        } else {
+            trace!("Successfully assigned directories to all {} posts in collection '{}'", 
+                  total_posts, self.name);
         }
 
         Ok(())
