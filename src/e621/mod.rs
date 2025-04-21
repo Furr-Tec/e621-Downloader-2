@@ -3,8 +3,8 @@ use std::fs::{create_dir_all, write};
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use dialoguer::Confirm;
+use anyhow::Context;
+use dialoguer::{Confirm, Input};
 use indicatif::{ProgressBar, ProgressDrawTarget};
 
 use crate::e621::blacklist::Blacklist;
@@ -32,16 +32,55 @@ pub(crate) struct E621WebConnector {
     grabber: Grabber,
     /// The user's blacklist.
     blacklist: Rc<RefCell<Blacklist>>,
+    /// Maximum file size cap for individual files in KB (default 20GB).
+    file_size_cap: u64,
+    /// Total overall download size cap in KB (default 100GB).
+    total_size_cap: u64,
 }
 impl E621WebConnector {
     /// Creates instance of `Self` for grabbing and downloading posts.
     pub(crate) fn new(request_sender: &RequestSender) -> Self {
+        // Default caps: 20GB per file, 100GB total
+        let default_file_cap = 20 * 1024 * 1024; // 20GB in KB
+        let default_total_cap = 100 * 1024 * 1024; // 100GB in KB
+        
         E621WebConnector {
             request_sender: request_sender.clone(),
             progress_bar: ProgressBar::hidden(),
             grabber: Grabber::new(request_sender.clone(), false),
             blacklist: Rc::new(RefCell::new(Blacklist::new(request_sender.clone()))),
+            file_size_cap: default_file_cap,
+            total_size_cap: default_total_cap,
         }
+    }
+
+    /// Asks the user for file size limits and sets them in the connector.
+    pub(crate) fn configure_size_limits(&mut self) {
+        // Default is 20GB per file
+        let default_file_size_gb = self.file_size_cap / 1024 / 1024;
+        
+        let file_size_prompt = format!("Maximum size for individual files in GB (default: {}GB)", default_file_size_gb);
+        let file_size_gb: u64 = Input::new()
+            .with_prompt(&file_size_prompt)
+            .default(default_file_size_gb)
+            .interact()
+            .unwrap_or(default_file_size_gb);
+            
+        // Default is 100GB total
+        let default_total_size_gb = self.total_size_cap / 1024 / 1024;
+        
+        let total_size_prompt = format!("Maximum total download size in GB (default: {}GB)", default_total_size_gb);
+        let total_size_gb: u64 = Input::new()
+            .with_prompt(&total_size_prompt)
+            .default(default_total_size_gb)
+            .interact()
+            .unwrap_or(default_total_size_gb);
+        
+        // Convert GB to KB and store
+        self.file_size_cap = file_size_gb * 1024 * 1024;
+        self.total_size_cap = total_size_gb * 1024 * 1024;
+        
+        info!("File size limits set: {}GB per file, {}GB total", file_size_gb, total_size_gb);
     }
 
     /// Gets input and enters safe depending on user choice.
@@ -245,13 +284,26 @@ impl E621WebConnector {
     }
 
     /// Gets the total size (in KB) of every post image to be downloaded.
+    /// Formats file size in KB to a human-readable string with appropriate units
+    fn format_file_size(&self, size_kb: u64) -> String {
+        if size_kb >= 1024 * 1024 {
+            // Size in GB
+            format!("{:.2} GB", size_kb as f64 / (1024.0 * 1024.0))
+        } else if size_kb >= 1024 {
+            // Size in MB
+            format!("{:.2} MB", size_kb as f64 / 1024.0)
+        } else {
+            // Size in KB
+            format!("{} KB", size_kb)
+        }
+    }
+
+    /// Gets the total size (in KB) of every post image to be downloaded.
     /// Includes validation to prevent unreasonable file sizes.
     fn get_total_file_size(&self) -> u64 {
-        // Reasonable maximum file size limit (50 GB in KB)
-        const MAX_REASONABLE_SIZE: u64 = 50 * 1024 * 1024;
-        
         let mut total_size: u64 = 0;
         let mut post_count: usize = 0;
+        let mut capped_files: usize = 0;
         
         for collection in self.grabber.posts().iter() {
             for post in collection.posts() {
@@ -262,11 +314,16 @@ impl E621WebConnector {
                 
                 let file_size = post.file_size() as u64;
                 
-                // Validate individual file size (max 2GB per file)
-                if file_size > 2 * 1024 * 1024 {
-                    warn!("Post {} has suspiciously large file size: {} KB, capping at 2GB", 
-                          post.name(), file_size);
-                    total_size += 2 * 1024 * 1024; // Cap at 2GB
+                // Validate individual file size using user's cap
+                if file_size > self.file_size_cap {
+                    let formatted_original = self.format_file_size(file_size);
+                    let formatted_cap = self.format_file_size(self.file_size_cap);
+                    
+                    warn!("Post {} has large file size: {}, capping at {}", 
+                          post.name(), formatted_original, formatted_cap);
+                          
+                    total_size += self.file_size_cap;
+                    capped_files += 1;
                 } else {
                     total_size += file_size;
                 }
@@ -276,13 +333,25 @@ impl E621WebConnector {
         }
         
         // Final validation of total size
-        if total_size > MAX_REASONABLE_SIZE {
-            warn!("Total file size ({} KB) exceeds reasonable limit, capping at {} KB", 
-                  total_size, MAX_REASONABLE_SIZE);
-            return MAX_REASONABLE_SIZE;
+        if total_size > self.total_size_cap {
+            let formatted_original = self.format_file_size(total_size);
+            let formatted_cap = self.format_file_size(self.total_size_cap);
+            
+            warn!("Total file size ({}) exceeds user's limit, capping at {}", 
+                  formatted_original, formatted_cap);
+                  
+            return self.total_size_cap;
         }
         
-        info!("Preparing to download {} new files totaling {} KB", post_count, total_size);
+        let formatted_size = self.format_file_size(total_size);
+        
+        if capped_files > 0 {
+            info!("Preparing to download {} new files ({} will be size-capped) totaling {}", 
+                  post_count, capped_files, formatted_size);
+        } else {
+            info!("Preparing to download {} new files totaling {}", post_count, formatted_size);
+        }
+        
         total_size
     }
 }
