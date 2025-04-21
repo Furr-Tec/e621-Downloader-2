@@ -1,10 +1,14 @@
 ﻿use std::path::{Path, PathBuf};
-use std::fs;
+use std::fs::{self, File};
 use std::io::Read;
 use std::collections::HashSet;
 use std::time::Duration;
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 use anyhow::{Result, Context, anyhow};
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+use walkdir::WalkDir;
+use memmap2::Mmap;
 use sha2::{Sha512, Digest};
 use hex::encode as hex_encode;
 use serde::{Serialize, Deserialize};
@@ -142,11 +146,93 @@ impl DirectoryManager {
         
         // If database wasn't loaded, scan directories
         if !loaded_from_db {
-            // Create and configure progress bar
-            let progress_bar = ProgressBarBuilder::new(0)
+            // Create and configure progress bar for the first phase
+            let phase1_progress = Arc::new(ProgressBarBuilder::new(0)
                 .style(
                     ProgressStyleBuilder::default()
-                        .template("{spinner:.green} Scanning: {wide_msg} | {elapsed_precise} | Found {pos} files")
+                        .template("{spinner:.green} Phase 1: {wide_msg} | {elapsed_precise} | Found {pos} files")
+                        .progress_chars("=>-")
+                        .build()
+                )
+                .draw_target(ProgressDrawTarget::stderr_with_hz(10))
+                .reset()
+                .steady_tick(Duration::from_millis(100))
+                .build());
+                
+            info!("Starting optimized two-phase directory scan...");
+            
+            // Configure thread count for I/O operations
+            let io_threads = num_cpus::get().min(8); // Limit to 8 threads for I/O operations
+            info!("Phase 1: Fast file enumeration with WalkDir using {} threads...", io_threads);
+
+            // Create optimized thread pool for I/O operations
+            let io_threads = num_cpus::get().min(8); // Limit to 8 threads for I/O operations
+            let scan_pool = ThreadPoolBuilder::new()
+                .num_threads(io_threads)
+                .thread_name(|i| format!("scan-worker-{}", i))
+                .build()?;
+
+            // First collect all files from directories in parallel using WalkDir
+            let mut all_files: Vec<PathBuf> = Vec::new();
+            let all_files_mutex = Arc::new(Mutex::new(&mut all_files));
+            let file_count = Arc::new(AtomicUsize::new(0));
+
+            // Scan all three directories in parallel using the scan pool
+            scan_pool.scope(|s| {
+                // Scan artists directory
+                let files_mutex_clone = Arc::clone(&all_files_mutex);
+                let count_clone = Arc::clone(&file_count);
+                let progress_clone = Arc::clone(&phase1_progress);
+                s.spawn(move |_| {
+                    Self::fast_scan_directory(
+                        &artists, 
+                        "Artists", 
+                        &progress_clone, 
+                        files_mutex_clone, 
+                        count_clone
+                    );
+                });
+                
+                // Scan tags directory
+                let files_mutex_clone = Arc::clone(&all_files_mutex);
+                let count_clone = Arc::clone(&file_count);
+                let progress_clone = Arc::clone(&phase1_progress);
+                s.spawn(move |_| {
+                    Self::fast_scan_directory(
+                        &tags, 
+                        "Tags", 
+                        &progress_clone, 
+                        files_mutex_clone, 
+                        count_clone
+                    );
+                });
+                
+                // Scan pools directory
+                let files_mutex_clone = Arc::clone(&all_files_mutex);
+                let count_clone = Arc::clone(&file_count);
+                let progress_clone = Arc::clone(&phase1_progress);
+                s.spawn(move |_| {
+                    Self::fast_scan_directory(
+                        &pools, 
+                        "Pools", 
+                        &progress_clone, 
+                        files_mutex_clone, 
+                        count_clone
+                    );
+                });
+            });
+
+            let total_files = file_count.load(Ordering::SeqCst);
+            phase1_progress.set_position(total_files as u64);
+            phase1_progress.finish_with_message(format!("Phase 1 complete! Found {} files", total_files));
+            // PHASE 2: Calculate hashes for all files
+            info!("Phase 2: Calculating SHA-512 hashes for {} files...", total_files);
+            
+            // Create and configure progress bar for the second phase
+            let phase2_progress = ProgressBarBuilder::new(total_files as u64)
+                .style(
+                    ProgressStyleBuilder::default()
+                        .template("{spinner:.green} Phase 2: {wide_msg} | {elapsed_precise} | {bar:40.cyan/blue} {pos}/{len} | {per_sec}")
                         .progress_chars("=>-")
                         .build()
                 )
@@ -155,59 +241,73 @@ impl DirectoryManager {
                 .steady_tick(Duration::from_millis(100))
                 .build();
                 
-            progress_bar.set_message("Initializing file scan...");
+            phase2_progress.set_message("Calculating hashes...");
             
-            // Scan directories for existing files in parallel
-            let mut files = HashSet::new();
-            
-            info!("Scanning existing files and calculating hashes...");
-            progress_bar.set_message("Counting files to process...");
-            
-            // First count total files for the progress bar (quick scan without hash calculation)
-            let total_files = rayon::join(
-                || DirectoryManager::count_files(&artists),
-                || {
-                    rayon::join(
-                        || DirectoryManager::count_files(&tags),
-                        || DirectoryManager::count_files(&pools)
-                    )
+            // Create optimized thread pool for hash calculations
+            let hash_threads = num_cpus::get().max(4); // Use at least 4 threads for hash calculations
+            let hash_pool = ThreadPoolBuilder::new()
+                .num_threads(hash_threads)
+                .thread_name(|i| format!("hash-worker-{}", i))
+                .build()?;
+                
+            // Process files in chunks to avoid excessive memory usage
+            let chunk_size = 1000.min(total_files);
+            let files_chunks: Vec<Vec<PathBuf>> = all_files
+                .chunks(chunk_size)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+                
+            let results = Arc::new(Mutex::new(HashSet::new()));
+                
+            // Process each chunk in parallel
+            hash_pool.scope(|s| {
+                for chunk in files_chunks {
+                    let results_clone = Arc::clone(&results);
+                    let progress_clone = phase2_progress.clone();
+                    
+                    s.spawn(move |_| {
+                        // Calculate hashes for each file in the chunk
+                        let chunk_results: Vec<(String, Option<String>)> = chunk.par_iter()
+                            .map(|path| {
+                                let file_name = path.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                    
+                                // Update progress
+                                progress_clone.set_message(format!("Hashing: {}", file_name));
+                                
+                                // Calculate hash
+                                let hash = match Self::optimized_calculate_hash(path) {
+                                    Ok(hash) => Some(hash),
+                                    Err(e) => {
+                                        warn!("Failed to calculate hash for {}: {}", path.display(), e);
+                                        None
+                                    }
+                                };
+                                
+                                // Increment progress
+                                progress_clone.inc(1);
+                                
+                                (file_name, hash)
+                            })
+                            .collect();
+                            
+                        // Merge chunk results into the main results set
+                        let mut results_guard = results_clone.lock().unwrap();
+                        for result in chunk_results {
+                            results_guard.insert(result);
+                        }
+                    });
                 }
-            );
+            });
+                
+            let files = Arc::try_unwrap(results)
+                .expect("Failed to unwrap Arc")
+                .into_inner()
+                .expect("Failed to unwrap Mutex");
             
-            let artist_count = total_files.0?;
-            let (tags_count, pools_count) = total_files.1;
-            let tags_count = tags_count?;
-            let pools_count = pools_count?;
-            let total_count = artist_count + tags_count + pools_count;
-            
-            // Update progress bar with total
-            progress_bar.set_length(total_count as u64);
-            progress_bar.set_position(0);
-            progress_bar.set_message("Starting deep scan with hash calculation...");
-            
-            // Now scan with hash calculation, using the progress bar
-            let scan_result = rayon::join(
-                || DirectoryManager::scan_directory_with_progress(&artists, true, &progress_bar, "Artists directory"),
-                || {
-                    rayon::join(
-                        || DirectoryManager::scan_directory_with_progress(&tags, true, &progress_bar, "Tags directory"),
-                        || DirectoryManager::scan_directory_with_progress(&pools, true, &progress_bar, "Pools directory")
-                    )
-                }
-            );
-
-            // Combine results from parallel scans
-            let artists_files = scan_result.0?;
-            let (tags_files, pools_files) = scan_result.1;
-            let tags_files = tags_files?;
-            let pools_files = pools_files?;
-
-            // Merge all file sets
-            files.extend(artists_files);
-            files.extend(tags_files);
-            files.extend(pools_files);
-            
-            progress_bar.finish_with_message(format!("Scan complete! Found {} files with {} having hashes", 
+            phase2_progress.finish_with_message(format!("Phase 2 complete! Calculated hashes for {} files, {} successful", 
                 files.len(), 
                 files.iter().filter(|(_, hash)| hash.is_some()).count()));
                 
@@ -252,7 +352,153 @@ impl DirectoryManager {
         self.use_strict_verification = enabled;
         info!("SHA-512 strict verification {}", if enabled { "enabled" } else { "disabled" });
     }
-
+    
+    /// Fast recursive directory scanning using WalkDir
+    /// This is an optimized method for quickly finding all files in a directory tree
+    fn fast_scan_directory(
+        dir: &Path, 
+        section_name: &str, 
+        progress_bar: &Arc<ProgressBar>,
+        files_mutex: Arc<Mutex<&mut Vec<PathBuf>>>,
+        file_count: Arc<AtomicUsize>
+    ) {
+        // Check if directory exists
+        if !dir.exists() {
+            debug!("Directory does not exist: {}", dir.display());
+            return;
+        }
+        
+        // Update progress to show which directory we're scanning
+        progress_bar.set_message(format!("Scanning {} directory...", section_name));
+        
+        // Set up custom buffer for WalkDir entries to batch process them
+        const BATCH_SIZE: usize = 1000;
+        let mut entry_batch = Vec::with_capacity(BATCH_SIZE);
+        
+        // Create WalkDir iterator with parallel support
+        // Use thread-safe iterator with filtering for only files
+        let walker = WalkDir::new(dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    warn!("Error accessing path in {}: {}", section_name, err);
+                    None
+                }
+            });
+            
+        // Process entries in batches for efficiency
+        for entry in walker {
+            let path = entry.path();
+            
+            // Skip directories, we only want files
+            if path.is_dir() {
+                continue;
+            }
+            
+            // Add to batch
+            entry_batch.push(path.to_path_buf());
+            
+            // When batch is full or for last item, process the batch
+            if entry_batch.len() >= BATCH_SIZE {
+                // Get file names for progress update
+                let first_file = entry_batch.first()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("[unnamed]");
+                    
+                let last_file = entry_batch.last()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("[unnamed]");
+                
+                // Update progress with batch range
+                progress_bar.set_message(format!("{} - Processing files: {} to {}", 
+                    section_name, first_file, last_file));
+                
+                // Add paths to shared vector
+                {
+                    let batch_len = entry_batch.len();
+                    let mut files = files_mutex.lock().unwrap();
+                    files.extend(entry_batch.drain(..));
+                    
+                    // Update the atomic file count and progress
+                    let new_count = file_count.fetch_add(batch_len, Ordering::SeqCst) + batch_len;
+                    progress_bar.set_position(new_count as u64);
+                }
+            }
+        }
+        
+        // Process any remaining entries
+        if !entry_batch.is_empty() {
+            let batch_len = entry_batch.len();
+            
+            // Update progress
+            progress_bar.set_message(format!("{} - Finalizing {} remaining files", 
+                section_name, batch_len));
+                
+            // Add paths to shared vector
+            {
+                let mut files = files_mutex.lock().unwrap();
+                files.extend(entry_batch);
+                
+                // Update the atomic file count and progress
+                let new_count = file_count.fetch_add(batch_len, Ordering::SeqCst) + batch_len;
+                progress_bar.set_position(new_count as u64);
+            }
+        }
+        
+        // Update progress on completion
+        let current_count = file_count.load(Ordering::SeqCst);
+        progress_bar.set_message(format!("{} complete - Found {} files", section_name, current_count));
+    }
+    
+    /// Optimized hash calculation using memory mapping for large files and larger buffers
+    fn optimized_calculate_hash(file_path: &Path) -> Result<String> {
+        const LARGE_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32MB
+        
+        let file = File::open(file_path)
+            .with_context(|| format!("Failed to open file for hashing: {}", file_path.display()))?;
+            
+        let metadata = file.metadata()
+            .with_context(|| format!("Failed to read file metadata: {}", file_path.display()))?;
+        
+        let file_size = metadata.len();
+        
+        // For large files, use memory mapping for better performance
+        if file_size > LARGE_FILE_THRESHOLD {
+            // Use memory mapping for large files
+            let mmap = unsafe { Mmap::map(&file) }
+                .with_context(|| format!("Failed to memory map file: {}", file_path.display()))?;
+            
+            let mut hasher = Sha512::new();
+            hasher.update(&mmap[..]);
+            let hash = hasher.finalize();
+            
+            Ok(hex_encode(hash))
+        } else {
+            // For smaller files, use buffered reading with a larger buffer
+            let mut hasher = Sha512::new();
+            let mut buffer = vec![0; 8 * 1024 * 1024]; // 8MB buffer for better throughput
+            let mut reader = &file;
+            
+            loop {
+                let bytes_read = reader.read(&mut buffer)
+                    .with_context(|| format!("Failed to read file during hashing: {}", file_path.display()))?;
+                
+                if bytes_read == 0 {
+                    break; // End of file
+                }
+                
+                hasher.update(&buffer[..bytes_read]);
+            }
+            
+            let hash = hasher.finalize();
+            Ok(hex_encode(hash))
+        }
+    }
+    
     /// Calculate SHA-512 hash for a file
     fn calculate_sha512(file_path: &Path) -> Result<String> {
         // Open the file
@@ -278,7 +524,6 @@ impl DirectoryManager {
         let hash = hasher.finalize();
         Ok(hex_encode(hash))
     }
-
     /// Count total files in a directory (without calculating hashes)
     fn count_files(dir: &Path) -> Result<usize> {
         let mut count = 0;
@@ -511,8 +756,6 @@ impl DirectoryManager {
     }
 
     /// Adds a file to the tracking set after successful download
-    /// Adds a file to the tracking set after successful download
-    /// Note: This method is deprecated and should only be used when hash calculation fails
     pub(crate) fn mark_file_downloaded(&mut self, file_name: &str) {
         warn!("Adding file '{}' without hash - hash verification will not be possible", file_name);
         self.downloaded_files.insert((file_name.to_string(), None));
