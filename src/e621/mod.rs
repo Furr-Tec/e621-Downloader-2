@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::fs::{create_dir_all, write};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -27,8 +26,6 @@ pub(crate) mod tui;
 pub(crate) struct E621WebConnector {
     /// The sender used for all API calls.
     request_sender: RequestSender,
-    /// The config which is modified when grabbing posts.
-    download_directory: String,
     /// Progress bar that displays the current progress in downloading posts.
     progress_bar: ProgressBar,
     /// Grabber which is responsible for grabbing posts.
@@ -41,7 +38,6 @@ impl E621WebConnector {
     pub(crate) fn new(request_sender: &RequestSender) -> Self {
         E621WebConnector {
             request_sender: request_sender.clone(),
-            download_directory: Config::get().download_directory().to_string(),
             progress_bar: ProgressBar::hidden(),
             grabber: Grabber::new(request_sender.clone(), false),
             blacklist: Rc::new(RefCell::new(Blacklist::new(request_sender.clone()))),
@@ -97,21 +93,6 @@ impl E621WebConnector {
         trace!("Grabbing posts...");
         self.grabber.grab_favorites();
         self.grabber.grab_posts_by_tags(groups);
-    }
-
-    /// Saves image to download directory.
-    /// Returns a Result indicating success or failure
-    fn save_image(&self, file_path: &str, bytes: &[u8]) -> Result<(), std::io::Error> {
-        match write(file_path, bytes) {
-            Ok(_) => {
-                trace!("Saved {file_path}...");
-                Ok(())
-            }
-            Err(err) => {
-                error!("Failed to save image: {}", err);
-                Err(err)
-            }
-        }
     }
 
     /// Removes invalid characters from directory path.
