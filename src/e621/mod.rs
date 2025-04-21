@@ -49,7 +49,7 @@ impl CollectionInfo {
             posts: Box::new(collection.posts().clone()),
         }
     }
-    
+
     /// Returns the number of new posts (not previously downloaded)
     fn new_files_count(&self) -> usize {
         self.posts.iter().filter(|post| post.is_new()).count()
@@ -58,7 +58,7 @@ impl CollectionInfo {
     fn posts(&self) -> &[grabber::GrabbedPost] {
         &self.posts
     }
-    
+
     /// Returns a mutable slice of posts
     /// Kept for API completeness
     #[allow(dead_code)]
@@ -95,7 +95,7 @@ impl E621WebConnector {
         // Default caps: 20GB per file, 100GB total
         let default_file_cap = 20 * 1024 * 1024; // 20GB in KB
         let default_total_cap = 100 * 1024 * 1024; // 100GB in KB
-        
+
         E621WebConnector {
             request_sender: request_sender.clone(),
             progress_bar: ProgressBar::hidden(),
@@ -113,28 +113,28 @@ impl E621WebConnector {
     pub(crate) fn configure_size_limits(&mut self) {
         // Default is 20GB per file
         let default_file_size_gb = self.file_size_cap / 1024 / 1024;
-        
+
         let file_size_prompt = format!("Maximum size for individual files in GB (default: {}GB)", default_file_size_gb);
         let file_size_gb: u64 = Input::new()
             .with_prompt(&file_size_prompt)
             .default(default_file_size_gb)
             .interact()
             .unwrap_or(default_file_size_gb);
-            
+
         // Default is 100GB total
         let default_total_size_gb = self.total_size_cap / 1024 / 1024;
-        
+
         let total_size_prompt = format!("Maximum total download size in GB (default: {}GB)", default_total_size_gb);
         let total_size_gb: u64 = Input::new()
             .with_prompt(&total_size_prompt)
             .default(default_total_size_gb)
             .interact()
             .unwrap_or(default_total_size_gb);
-        
+
         // Convert GB to KB and store
         self.file_size_cap = file_size_gb * 1024 * 1024;
         self.total_size_cap = total_size_gb * 1024 * 1024;
-        
+
         info!("File size limits set: {}GB per file, {}GB total", file_size_gb, total_size_gb);
     }
 
@@ -146,11 +146,11 @@ impl E621WebConnector {
             .default(self.batch_size)
             .interact()
             .unwrap_or(self.batch_size);
-            
+
         self.batch_size = batch_size.max(1); // Ensure at least 1
         info!("Batch size set to: {}", self.batch_size);
     }
-    
+
     /// Initializes the progress bar with a fresh instance for downloads.
     ///
     /// # Arguments
@@ -167,13 +167,13 @@ impl E621WebConnector {
             .template(PROGRESS_TEMPLATE)
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("=>-");
-            
+
         // Create a minimal progress bar with less frequent updates to reduce overhead
         self.progress_bar = ProgressBar::new(len);
         self.progress_bar.set_style(progress_style);
         self.progress_bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(5)); // Reduce to 5 refreshes per second
         self.progress_bar.enable_steady_tick(Duration::from_millis(200)); // Less frequent updates to reduce stack pressure
-        
+
         // Set initial batch information
         if self.total_batches > 0 {
             self.progress_bar.set_prefix("Processing"); // Shorter prefix for better alignment
@@ -259,16 +259,16 @@ impl E621WebConnector {
             })
             .collect()
     }
-    
+
     /// Formats file size in KB to a human-readable string with appropriate units
     /// Formats file size in bytes to a human-readable string with appropriate units
     fn format_file_size(&self, size_bytes: u64) -> String {
         const KB: f64 = 1024.0;
         const MB: f64 = KB * 1024.0;
         const GB: f64 = MB * 1024.0;
-        
+
         let size = size_bytes as f64;
-        
+
         if size >= GB {
             // Size in GB
             format!("{:.2} GB", size / GB)
@@ -289,72 +289,72 @@ impl E621WebConnector {
     fn calculate_sha512(&self, file_path: &Path) -> Result<String, anyhow::Error> {
         // Open the file
         let mut file = File::open(file_path)?;
-        
+
         // Read the file in chunks and update the hasher
         let mut hasher = Sha512::new();
         let mut buffer = [0; 1024 * 1024]; // 1MB buffer for reading
-        
+
         loop {
             let bytes_read = file.read(&mut buffer)?;
-            
+
             if bytes_read == 0 {
                 break; // End of file
             }
-            
+
             hasher.update(&buffer[..bytes_read]);
         }
-        
+
         // Finalize the hash and convert to hex string
         let hash = hasher.finalize();
         Ok(hex_encode(hash))
     }
-    
+
     /// Memory-efficient SHA-512 hash calculation with memory mapping for large files
     /// This avoids stack overflow by using heap allocation and memory mapping
     fn calculate_sha512_optimized(&self, file_path: &Path) -> Result<String, anyhow::Error> {
         const LARGE_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32MB
-        
+
         let file = File::open(file_path)?;
         let metadata = file.metadata()?;
         let file_size = metadata.len();
-        
+
         // For large files, use memory mapping for better performance and memory efficiency
         if file_size > LARGE_FILE_THRESHOLD {
             // Use memory mapping for large files
             let mmap = unsafe { memmap2::Mmap::map(&file)? };
-            
+
             let mut hasher = Sha512::new();
             hasher.update(&mmap[..]);
             let hash = hasher.finalize();
-            
+
             Ok(hex_encode(hash))
         } else {
             // For smaller files, use heap-allocated buffers instead of stack buffers
             let mut hasher = Sha512::new();
             let mut buffer = vec![0; 1024 * 1024]; // 1MB buffer allocated on the heap
             let mut reader = &file;
-            
+
             loop {
                 let bytes_read = reader.read(&mut buffer)?;
-                
+
                 if bytes_read == 0 {
                     break; // End of file
                 }
-                
+
                 hasher.update(&buffer[..bytes_read]);
             }
-            
+
             let hash = hasher.finalize();
             Ok(hex_encode(hash))
         }
     }
-    
+
     /// Downloads tuple of general posts and single posts.
     pub(crate) fn download_posts(&mut self) {
         // Calculate the total file size first
         let length = self.get_total_file_size();
         trace!("Total file size for all images grabbed is {length}KB");
-        
+
         // First check if we have any collections to download
         {
             let collections = self.grabber.posts();
@@ -363,29 +363,29 @@ impl E621WebConnector {
                 return;
             }
         }
-        
+
         // Initialize progress bar early
         // Determine approximate post count for memory estimation
         // We need to separate the post counting from the processing
         let (total_post_count, approx_total_posts, total_collections) = {
             let collections = self.grabber.posts();
-            
+
             // Count total posts
             let approx_total: usize = collections.iter()
                 .map(|collection| collection.posts().len())
                 .sum();
-                
+
             // Get total collection count
             let total_cols = collections.len();
-            
+
             // Memory safety check - if we have an extremely large number of posts,
             // we'll need to count the actual new files
             const MAX_POSTS_PER_BATCH: usize = 1000; // Adjust based on testing
-            
+
             let new_post_count = if approx_total > MAX_POSTS_PER_BATCH * 2 {
                 // For very large downloads, count manually
                 info!("Large download detected ({} posts). Analyzing in memory-efficient mode.", approx_total);
-                
+
                 // Count new posts for each collection
                 let mut count = 0;
                 for collection in collections {
@@ -401,22 +401,22 @@ impl E621WebConnector {
                 // For smaller collections, we'll count later
                 0
             };
-            
+
             (new_post_count, approx_total, total_cols)
         };
-        
+
         // Configure batch information
         self.total_batches = (total_collections + self.batch_size - 1) / self.batch_size;
-        
+
         // Check if we should use memory-efficient mode
         const MAX_POSTS_PER_BATCH: usize = 1000; // Keep the same threshold
-        
+
         // Process collections
         if approx_total_posts > MAX_POSTS_PER_BATCH * 2 {
             // For very large downloads, we'll process one collection at a time
             // Get the actual total post count we calculated earlier
             let post_count = total_post_count;
-            
+
             // Confirm large download with the user
             if !self.confirm_large_download(length, post_count) {
                 info!("Download cancelled by user.");
@@ -425,34 +425,34 @@ impl E621WebConnector {
 
             info!("Processing {} collections in {} batches of up to {} collections each", 
                   total_collections, self.total_batches, self.batch_size);
-                  
+
             // Process collections one at a time to minimize memory usage
             for batch_idx in 0..self.total_batches {
                 self.current_batch = batch_idx + 1;
                 self.update_batch_info();
-                
+
                 let start_idx = batch_idx * self.batch_size;
                 let end_idx = (start_idx + self.batch_size).min(total_collections);
-                
+
                 // Process each collection in this batch
                 for idx in start_idx..end_idx {
                     // Get collection info within a new scope to limit the borrow
                     let collection_info = {
                         let collection = &self.grabber.posts()[idx];
                         let name = collection.name().to_string();
-                        
+
                         info!("Processing batch {}/{}: {}", 
                              self.current_batch, self.total_batches, name);
-                        
+
                         // Create CollectionInfo for just this collection
                         CollectionInfo::from_collection(collection)
                     };
-                    
+
                     self.progress_bar.set_message(format!("Processing {}...", collection_info.short_name));
-                    
+
                     // Process this collection
                     self.download_single_collection(&collection_info);
-                    
+
                     // Force memory cleanup
                     drop(collection_info);
                 }
@@ -466,47 +466,47 @@ impl E621WebConnector {
                     .map(CollectionInfo::from_collection)
                     .collect()
             };
-            
+
             // Now that we have the collection infos, count new posts
             let new_post_count: usize = collection_infos.iter()
                 .map(|info| info.new_files_count())
                 .sum();
-                
+
             // Confirm with user if download size is large
             if !self.confirm_large_download(length, new_post_count) {
                 info!("Download cancelled by user.");
                 return;
             }
-            
+
             info!("Processing {} collections in {} batches of up to {} collections each", 
                   total_collections, self.total_batches, self.batch_size);
-            
+
             // Process in batches
             for batch_idx in 0..self.total_batches {
                 self.current_batch = batch_idx + 1;
                 self.update_batch_info();
-                
+
                 let start_idx = batch_idx * self.batch_size;
                 let end_idx = (start_idx + self.batch_size).min(collection_infos.len());
-                
+
                 // Create batch description
                 let batch_desc = if end_idx - start_idx > 1 {
                     let collection_names: Vec<String> = collection_infos[start_idx..end_idx]
                         .iter()
                         .map(|c| c.name.clone())
                         .collect();
-                    format!("Batch {}/{}: {}", self.current_batch, self.total_batches, 
+                    format!("Batch {}/{}: {}", self.current_batch, self.total_batches,
                             collection_names.join(", "))
                 } else if end_idx > start_idx {
-                    format!("Batch {}/{}: {}", self.current_batch, self.total_batches, 
+                    format!("Batch {}/{}: {}", self.current_batch, self.total_batches,
                             collection_infos[start_idx].name)
                 } else {
                     format!("Batch {}/{}", self.current_batch, self.total_batches)
                 };
-                
+
                 info!("Processing {}", batch_desc);
                 self.progress_bar.set_message(format!("Processing batch {}...", self.current_batch));
-                
+
                 // Process this batch of collections
                 for idx in start_idx..end_idx {
                     let collection_info = &collection_infos[idx];
@@ -514,11 +514,11 @@ impl E621WebConnector {
                 }
             }
         }
-        
+
         // Use clear formatting for final message
         self.progress_bar.set_prefix("Completed");
         self.progress_bar.finish_with_message("All downloads completed successfully");
-        
+
         // Wait for user to confirm they've seen completion before continuing
         info!("Download process has completed successfully.");
     }
@@ -536,20 +536,20 @@ impl E621WebConnector {
             }
         };
         let mut dir_manager = dir_manager.clone();  // Clone to get a mutable version
-        
+
         // Count new files that will be downloaded
         let new_files = collection_info.new_files_count();
         if new_files == 0 {
             // No new files to download in this collection
             return;
         }
-        
+
         info!(
             "Found {} new files to download in {}",
             new_files,
             console::style(format!("\"{}\"", collection_info.name)).color256(39).italic()
         );
-        
+
         // Configure progress bar with proper styling and length
         self.progress_bar = ProgressBar::new(new_files as u64);
         let progress_style = ProgressStyle::default_bar()
@@ -557,7 +557,7 @@ impl E621WebConnector {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-");
         self.progress_bar.set_style(progress_style);
-        
+
         // Set progress bar prefix to current collection (limited to 15 chars for consistent width)
         let short_name = if collection_info.short_name.len() > 13 {
             format!("{}…", &collection_info.short_name[..12])
@@ -572,39 +572,39 @@ impl E621WebConnector {
         // Process each post in this collection using smaller batches to prevent stack overflow
         // Process each post in this collection using very small batches to prevent stack overflow
         let posts = collection_info.posts();
-        
+
         // Detect potentially problematic collections based on size and complexity
         // Detect potentially problematic collections based on size and complexity
         const LARGE_COLLECTION_THRESHOLD: usize = 50; // Collections with more than 50 files
         const LARGE_FILE_SIZE_THRESHOLD: i64 = 100 * 1024 * 1024; // 100MB in bytes
 
-        let is_problematic = posts.len() > LARGE_COLLECTION_THRESHOLD || 
+        let is_problematic = posts.len() > LARGE_COLLECTION_THRESHOLD ||
             posts.iter().any(|post| post.file_size_bytes() > LARGE_FILE_SIZE_THRESHOLD);
         let batch_size = if is_problematic {
             // Calculate total size in MB for logging
             let total_size_bytes: i64 = posts.iter().map(|p| p.file_size_bytes()).sum();
             let total_size_mb = total_size_bytes / (1024 * 1024);
-            
+
             info!("Large collection detected: '{}' with {} files ({}MB total). Using smaller batch size for memory efficiency.", 
                   collection_info.name, posts.len(), total_size_mb);
             5  // Very small batches for large collections
         } else {
             10 // Normal batch size for smaller collections
         };
-                
+
         // Convert the post slice to a Vec of only new posts first to simplify processing 
         // Use an iterator rather than collecting to avoid extra memory allocation
         let new_posts_iter = posts.iter().filter(|post| post.is_new());
         let new_posts_count = posts.iter().filter(|post| post.is_new()).count();
-        
+
         // Create batches manually using chunks to reduce memory overhead
         let mut processed = 0;
         let mut batch_vec = Vec::with_capacity(batch_size);
-        
+
         for post in new_posts_iter {
             // Add post to the current batch
             batch_vec.push(post);
-            
+
             // When batch is full or this is the last item, process the batch
             if batch_vec.len() >= batch_size || processed + batch_vec.len() >= new_posts_count {
                 // Process each post in the batch
@@ -613,22 +613,22 @@ impl E621WebConnector {
                     // Get the hash reference, storing it first to avoid temporary value issues
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
-                    
+
                     // Update progress message with file info and count
                     let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
-                    
+
                     // Use a direct check method rather than nested function calls to reduce stack usage
                     if dir_manager.is_duplicate_iterative(filename, hash_ref) {
-                        self.progress_bar.set_message(format!("[{}/{}] Duplicate: {}", 
-                            current_position, new_files, filename));
+                        self.progress_bar.set_message(format!("[{}/{}] Duplicate: {}",
+                                                              current_position, new_files, filename));
                         self.progress_bar.inc(post.file_size() as u64);
                         continue;
                     }
 
                     // Show which file is being downloaded and progress information
-                    self.progress_bar.set_message(format!("[{}/{}] Downloading {}", 
-                        current_position, new_files, filename));
-                    
+                    self.progress_bar.set_message(format!("[{}/{}] Downloading {}",
+                                                          current_position, new_files, filename));
+
                     // Get the save directory from the post
                     let save_dir = match post.save_directory() {
                         Some(dir) => dir,
@@ -640,7 +640,7 @@ impl E621WebConnector {
                             continue;
                         }
                     };
-                    
+
                     let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
 
                     // Create the directory if it doesn't exist
@@ -652,73 +652,73 @@ impl E621WebConnector {
                         self.progress_bar.inc(post.file_size() as u64);
                         continue;
                     }
-                    
+
                     // Download and save the file
                     let file_path_str = file_path.to_string_lossy();
-                    
+
                     // Use a streaming download approach for better memory efficiency
                     let download_result = self.download_file_with_streaming(post.url(), &file_path);
-                    
+
                     match download_result {
                         Ok(_) => {
                             // File was downloaded and saved successfully
                             // Now calculate hash and update tracking info
                             trace!("Saved {}...", file_path_str);
-                            
+
                             // Calculate SHA-512 hash for verification - use optimized memory-efficient method
                             let hash_result = self.calculate_sha512_optimized(&file_path);
-                            
+
                             match hash_result {
                                 Ok(hash) => {
                                     // Store hash with the downloaded file for future verification
                                     dir_manager.mark_file_downloaded_with_hash_simple(post.name(), hash.clone());
                                     trace!("Stored hash {} for post {}", hash, post.name());
-                                    
+
                                     // Show success message with file counts
                                     let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
-                                    let message = format!("[{}/{}] Downloaded & verified: {}", 
-                                        current_position, new_files, filename);
+                                    let message = format!("[{}/{}] Downloaded & verified: {}",
+                                                          current_position, new_files, filename);
                                     self.progress_bar.set_message(message);
                                 },
                                 Err(e) => {
                                     // Hash calculation failed but file was saved
                                     warn!("Failed to calculate hash for {}: {}", file_path_str, e);
                                     dir_manager.mark_file_downloaded(post.name());
-                                    
+
                                     // Show warning message with file counts
                                     let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
-                                    let message = format!("[{}/{}] Saved but not verified: {}", 
-                                        current_position, new_files, filename);
+                                    let message = format!("[{}/{}] Saved but not verified: {}",
+                                                          current_position, new_files, filename);
                                     self.progress_bar.set_message(message);
                                 }
                             }
-                            
+
                             // Update progress bar after successful download
                             self.progress_bar.inc(post.file_size() as u64);
                         },
                         Err(err) => {
                             error!("Failed to download/save image {}: {}", file_path_str, err);
-                            
+
                             // Show error message with file counts
                             let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
                             self.progress_bar.set_message(format!("[{}/{}] Error: Download failed for {}",
-                                current_position, new_files, filename));
+                                                                  current_position, new_files, filename));
                             self.progress_bar.inc(post.file_size() as u64);
                         }
                     }
                 } // End of for post in &batch_vec
-                
+
                 // Update processed count BEFORE clearing the batch
                 processed += batch_vec.len();
-                
+
                 // Ensure we track processed counts correctly
                 if processed > new_posts_count {
                     processed = new_posts_count; // Avoid overflow
                 }
-                
+
                 // Clear the batch and force memory cleanup before next batch
                 batch_vec.clear();
-                
+
                 // Force a small pause between batches to prevent stack buildup
                 if is_problematic {
                     // For problematic collections, pause briefly between batches
@@ -726,7 +726,7 @@ impl E621WebConnector {
                 }
             }
         }
-        
+
         trace!("Collection {} is finished downloading...", collection_info.name);
     }
 
@@ -734,36 +734,35 @@ impl E621WebConnector {
     /// Shows a prompt for confirming large downloads and gives the option to adjust limits
     /// Returns true if user chooses to proceed, false if user cancels
     fn confirm_large_download(&mut self, total_size_kb: u64, post_count: usize) -> bool {
-        // Convert to GB for comparison (20GB threshold)
-        let total_size_gb = total_size_kb as f64 / (1024.0 * 1024.0); 
-        let threshold_gb = 20.0; // 20GB threshold
-        
-        if total_size_gb <= threshold_gb {
+        // Define 20GB threshold in KB (20 * 1024 * 1024 = 20GB in KB)
+        const THRESHOLD_KB: u64 = 20 * 1024 * 1024;
+
+        if total_size_kb <= THRESHOLD_KB {
             // Size is below threshold, no need for confirmation
             return true;
         }
-        
+
         // Format size for display
         let formatted_size = self.format_file_size(total_size_kb);
-        
+
         // Display warning and options
         println!("\n⚠️  WARNING: Large download detected!");
         println!("You are about to download {} files totaling {}.", post_count, formatted_size);
         println!("This exceeds the recommended size of 20GB.\n");
-        
+
         // Create selection menu for the user
         let options = &[
             "Proceed with download",
             "Adjust size limits",
             "Cancel download"
         ];
-        
+
         let selection = dialoguer::Select::new()
             .with_prompt("What would you like to do?")
             .default(0)
             .items(options)
             .interact();
-            
+
         match selection {
             Ok(0) => {
                 // User chose to proceed
@@ -774,15 +773,15 @@ impl E621WebConnector {
                 // User chose to adjust limits
                 info!("Reconfiguring size limits...");
                 self.configure_size_limits();
-                
+
                 // Check if the new limits would allow the download
                 let total_size_in_gb = total_size_kb as f64 / (1024.0 * 1024.0);
                 let new_limit_in_gb = self.total_size_cap as f64 / (1024.0 * 1024.0);
-                
+
                 if total_size_in_gb > new_limit_in_gb {
                     info!("Total download size ({:.2} GB) still exceeds configured limit ({:.2} GB)",
                           total_size_in_gb, new_limit_in_gb);
-                          
+
                     // Ask if they want to proceed anyway
                     let proceed_anyway = Confirm::new()
                         .with_prompt(format!(
@@ -792,7 +791,7 @@ impl E621WebConnector {
                         .default(false)
                         .interact()
                         .unwrap_or(false);
-                        
+
                     proceed_anyway
                 } else {
                     // New limits are sufficient
@@ -807,12 +806,12 @@ impl E621WebConnector {
             }
         }
     }
-    
+
     /// Asks the user for confirmation before exiting
     /// Returns true if the user wants to exit, false to continue
     pub(crate) fn confirm_exit(&self, message: &str) -> bool {
         let prompt = format!("{}\nDo you want to exit the program?", message);
-        
+
         Confirm::new()
             .with_prompt(prompt)
             .default(true)
@@ -826,30 +825,30 @@ impl E621WebConnector {
         let mut total_size: u64 = 0;
         let mut post_count: usize = 0;
         let mut capped_files: usize = 0;
-        
+
         // Get collections once to avoid multiple borrows
         let collections = self.grabber.posts();
-        
+
         for collection in collections.iter() {
             for post in collection.posts() {
                 // Skip posts that aren't new to avoid counting duplicates
                 if !post.is_new() {
                     continue;
                 }
-                
+
                 // Get file size in bytes and convert cap from KB to bytes for comparison
                 let file_size_bytes = post.file_size_bytes() as u64;
                 let file_size_cap_bytes = self.file_size_cap * 1024; // Convert KB cap to bytes
                 post_count += 1;
-                
+
                 // Validate individual file size using user's cap
                 if file_size_bytes > file_size_cap_bytes {
                     let formatted_original = self.format_file_size(file_size_bytes);
                     let formatted_cap = self.format_file_size(file_size_cap_bytes);
-                    
+
                     warn!("Post {} has large file size: {}, capping at {}", 
                           post.name(), formatted_original, formatted_cap);
-                          
+
                     total_size += file_size_cap_bytes;
                     capped_files += 1;
                 } else {
@@ -857,19 +856,19 @@ impl E621WebConnector {
                 }
             }
         }
-        
+
         let formatted_size = self.format_file_size(total_size);
-        
+
         if capped_files > 0 {
             info!("Preparing to download {} new files ({} will be size-capped) totaling {}", 
                   post_count, capped_files, formatted_size);
         } else {
             info!("Preparing to download {} new files totaling {}", post_count, formatted_size);
         }
-        
+
         total_size
     }
-    
+
     /// Downloads a file using a streaming approach to minimize memory usage
     /// This avoids loading the entire file into memory at once
     /// Downloads a file using a streaming approach to minimize memory usage
@@ -879,7 +878,7 @@ impl E621WebConnector {
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         // Get the bytes from the URL
         let bytes = match self.request_sender.get_bytes_from_url(url) {
             Ok(data) => data,
@@ -887,13 +886,13 @@ impl E621WebConnector {
                 return Err(anyhow::anyhow!("Failed to download from URL {}: {}", url, e));
             }
         };
-        
+
         // Write the bytes to the file directly
         let file_path_display = file_path.display();
         if let Err(e) = std::fs::write(file_path, &bytes) {
             return Err(anyhow::anyhow!("Failed to write to file {}: {}", file_path_display, e));
         }
-        
+
         Ok(())
     }
 }
