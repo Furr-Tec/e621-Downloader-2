@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use dialoguer::Confirm;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 
@@ -100,14 +100,18 @@ impl E621WebConnector {
     }
 
     /// Saves image to download directory.
-    fn save_image(&self, file_path: &str, bytes: &[u8]) {
-        write(file_path, bytes)
-            .with_context(|| {
-                error!("Failed to save image!");
-                "A downloaded image was unable to be saved..."
-            })
-            .unwrap();
-        trace!("Saved {file_path}...");
+    /// Returns a Result indicating success or failure
+    fn save_image(&self, file_path: &str, bytes: &[u8]) -> Result<(), std::io::Error> {
+        match write(file_path, bytes) {
+            Ok(_) => {
+                trace!("Saved {file_path}...");
+                Ok(())
+            }
+            Err(err) => {
+                error!("Failed to save image: {}", err);
+                Err(err)
+            }
+        }
     }
 
     /// Removes invalid characters from directory path.
@@ -128,11 +132,19 @@ impl E621WebConnector {
     }
 
     /// Processes `PostSet` and downloads all posts from it.
+    /// Processes `PostSet` and downloads all posts from it.
     fn download_collection(&mut self) {
         // Get directory manager
-        let dir_manager = Config::get().directory_manager().unwrap();
+        let dir_manager = match Config::get().directory_manager() {
+            Ok(manager) => manager,
+            Err(err) => {
+                error!("Failed to get directory manager from configuration: {}", err);
+                self.progress_bar.set_message("Error: Failed to initialize directory manager!");
+                self.progress_bar.finish_with_message("Download failed: Configuration error");
+                return;
+            }
+        };
         let mut dir_manager = dir_manager.clone();  // Clone to get a mutable version
-
         for collection in self.grabber.posts().iter() {
             let collection_name = collection.name();
             let collection_category = collection.category();
@@ -166,29 +178,55 @@ impl E621WebConnector {
                     .set_message(format!("Downloading: {short_collection_name} "));
 
                 // Get the save directory from the post
-                let save_dir = post.save_directory()
-                    .expect("Post should have a save directory assigned");
+                let save_dir = match post.save_directory() {
+                    Some(dir) => dir,
+                    None => {
+                        error!("Post does not have a save directory assigned: {}", post.name());
+                        self.progress_bar.set_message(format!("Error saving {}: No directory assigned", post.name()));
+                        self.progress_bar.inc(post.file_size() as u64);
+                        continue;
+                    }
+                };
                 let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
 
                 // Create the directory if it doesn't exist
-                create_dir_all(save_dir)
-                    .with_context(|| {
-                        error!("Could not create directories for images!");
-                        format!(
-                            "Directory path unable to be created...\nPath: \"{}\"",
-                            save_dir.to_str().unwrap()
-                        )
-                    })
-                    .unwrap();
-
+                if let Err(err) = create_dir_all(&save_dir) {
+                    let path_str = save_dir.to_string_lossy();
+                    error!("Could not create directory for images: {}", err);
+                    error!("Path: {}", path_str);
+                    self.progress_bar.set_message(format!("Error: Could not create directory {}", path_str));
+                    self.progress_bar.inc(post.file_size() as u64);
+                    continue;
+                }
                 // Download and save the file
                 let bytes = self
                     .request_sender
                     .download_image(post.url(), post.file_size());
-                self.save_image(file_path.to_str().unwrap(), &bytes);
-
-                // Mark the file as downloaded in our tracking system
-                dir_manager.mark_file_downloaded(post.name());
+                
+                // Get file path as string
+                let file_path_str = match file_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        error!("Invalid file path for post: {}", post.name());
+                        self.progress_bar.set_message(format!("Error: Invalid file path for {}", post.name()));
+                        self.progress_bar.inc(post.file_size() as u64);
+                        continue;
+                    }
+                };
+                
+                // Save the image
+                match write(file_path_str, &bytes) {
+                    Ok(_) => {
+                        trace!("Saved {file_path_str}...");
+                        // Mark the file as downloaded in our tracking system
+                        dir_manager.mark_file_downloaded(post.name());
+                        self.progress_bar.set_message(format!("Downloaded: {}", post.name()));
+                    }
+                    Err(err) => {
+                        error!("Failed to save image {}: {}", file_path_str, err);
+                        self.progress_bar.set_message(format!("Error: Could not save {}", post.name()));
+                    }
+                }
 
                 self.progress_bar.inc(post.file_size() as u64);
             }
@@ -226,11 +264,44 @@ impl E621WebConnector {
     }
 
     /// Gets the total size (in KB) of every post image to be downloaded.
+    /// Includes validation to prevent unreasonable file sizes.
     fn get_total_file_size(&self) -> u64 {
-        self.grabber
-            .posts()
-            .iter()
-            .map(|e| e.posts().iter().map(|f| f.file_size() as u64).sum::<u64>())
-            .sum()
+        // Reasonable maximum file size limit (50 GB in KB)
+        const MAX_REASONABLE_SIZE: u64 = 50 * 1024 * 1024;
+        
+        let mut total_size: u64 = 0;
+        let mut post_count: usize = 0;
+        
+        for collection in self.grabber.posts().iter() {
+            for post in collection.posts() {
+                // Skip posts that aren't new to avoid counting duplicates
+                if !post.is_new() {
+                    continue;
+                }
+                
+                let file_size = post.file_size() as u64;
+                
+                // Validate individual file size (max 2GB per file)
+                if file_size > 2 * 1024 * 1024 {
+                    warn!("Post {} has suspiciously large file size: {} KB, capping at 2GB", 
+                          post.name(), file_size);
+                    total_size += 2 * 1024 * 1024; // Cap at 2GB
+                } else {
+                    total_size += file_size;
+                }
+                
+                post_count += 1;
+            }
+        }
+        
+        // Final validation of total size
+        if total_size > MAX_REASONABLE_SIZE {
+            warn!("Total file size ({} KB) exceeds reasonable limit, capping at {} KB", 
+                  total_size, MAX_REASONABLE_SIZE);
+            return MAX_REASONABLE_SIZE;
+        }
+        
+        info!("Preparing to download {} new files totaling {} KB", post_count, total_size);
+        total_size
     }
 }

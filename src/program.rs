@@ -6,7 +6,7 @@ use console::Term;
 use anyhow::Error;
 
 use crate::e621::E621WebConnector;
-use crate::e621::io::{Config, emergency_exit, Login};
+use crate::e621::io::{Config, Login};
 use crate::e621::io::tag::{parse_tag_file, TAG_FILE_EXAMPLE, TAG_NAME};
 use crate::e621::sender::RequestSender;
 
@@ -58,10 +58,20 @@ impl Program {
             write(TAG_NAME, TAG_FILE_EXAMPLE)?;
             trace!("Tag file \"{}\" created...", TAG_NAME);
 
-            emergency_exit(
-                "The tag file is created, the application will close so you can include \
-             the artists, sets, pools, and individual posts you wish to download.",
-            );
+            info!("The tag file has been created.");
+            let confirm_exit = dialoguer::Confirm::new()
+                .with_prompt("Would you like to exit the application to edit the tag file before continuing?")
+                .default(true)
+                .show_default(true)
+                .interact()
+                .unwrap_or(false);
+            
+            if confirm_exit {
+                info!("Exiting so you can edit the tag file to include the artists, sets, pools, and individual posts you wish to download.");
+                return Ok(());
+            } else {
+                info!("Continuing without editing the tag file. Note that no downloads will occur unless the tag file contains valid entries.");
+            }
         }
 
         // Creates connector and requester to prepare for downloading posts.
