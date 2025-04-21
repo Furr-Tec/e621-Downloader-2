@@ -783,13 +783,22 @@ impl DirectoryManager {
         let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
         if let Err(e) = hash_db.save(&self.hash_db_path) {
             warn!("Failed to update hash database after adding file: {}", e);
+            warn!("Failed to update hash database after adding file: {}", e);
         }
     }
+    
+    /// Adds a file with its SHA-512 hash to the tracking set without updating the database
+    /// This is a simplified version to avoid deep recursion during batch operations
+    pub(crate) fn mark_file_downloaded_with_hash_simple(&mut self, file_name: &str, hash: String) {
+        trace!("Adding file '{}' with SHA-512 hash", file_name);
+        self.downloaded_files.insert((file_name.to_string(), Some(hash)));
+        // Database update is deferred to batch completion
+    }
+    
     /// Adds a file with its SHA-512 hash to the tracking set
     /// This is the preferred method for tracking downloaded files
     pub(crate) fn mark_file_downloaded_with_hash(&mut self, file_name: &str, hash: String) {
-        trace!("Adding file '{}' with SHA-512 hash", file_name);
-        self.downloaded_files.insert((file_name.to_string(), Some(hash)));
+        self.mark_file_downloaded_with_hash_simple(file_name, hash);
         
         // Update the hash database file
         let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
@@ -797,7 +806,7 @@ impl DirectoryManager {
             warn!("Failed to update hash database after adding file: {}", e);
         }
     }
-    
+    /// Checks if a file exists by name or hash
     /// Checks if a file exists by name or hash
     /// This is the preferred method for checking duplicates as it uses hash first when available
     pub(crate) fn is_duplicate(&self, file_name: &str, hash: Option<&str>) -> bool {
@@ -812,6 +821,31 @@ impl DirectoryManager {
         self.file_exists(file_name)
     }
     
+    /// An iterative version of is_duplicate that avoids deep recursive calls
+    /// This method is optimized to prevent stack overflow during batch operations
+    pub(crate) fn is_duplicate_iterative(&self, file_name: &str, hash: Option<&str>) -> bool {
+        // Direct iteration over the downloaded_files set to avoid additional function calls
+        
+        // Check by hash first if available (most reliable)
+        if let Some(h) = hash {
+            for (_, stored_hash) in &self.downloaded_files {
+                if let Some(stored) = stored_hash {
+                    if stored == h {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        // Fall back to filename check with direct iteration
+        for (name, _) in &self.downloaded_files {
+            if name == file_name {
+                return true;
+            }
+        }
+        
+        false
+    }
     /// Calculates the SHA-512 hash for a given file path
     /// 
     /// This is a convenience wrapper around the static calculate_sha512 method
