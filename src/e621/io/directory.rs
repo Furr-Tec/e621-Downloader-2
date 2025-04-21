@@ -2,10 +2,82 @@
 use std::fs;
 use std::io::Read;
 use std::collections::HashSet;
+use std::time::Duration;
 use anyhow::{Result, Context, anyhow};
 use rayon::prelude::*;
 use sha2::{Sha512, Digest};
 use hex::encode as hex_encode;
+use serde::{Serialize, Deserialize};
+use indicatif::{ProgressBar, ProgressDrawTarget};
+use crate::e621::tui::{ProgressBarBuilder, ProgressStyleBuilder};
+
+/// Represents a file entry in the hash database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HashDatabaseEntry {
+    /// Filename
+    filename: String,
+    /// SHA-512 hash of the file (when available)
+    hash: Option<String>,
+}
+
+/// Stores and manages file hashes in a persistent JSON file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HashDatabase {
+    /// List of file entries
+    entries: Vec<HashDatabaseEntry>,
+}
+
+impl HashDatabase {
+    /// Load the hash database from the specified file path
+    fn load(file_path: &Path) -> Result<Self> {
+        if !file_path.exists() {
+            // Create an empty database if the file doesn't exist
+            return Ok(HashDatabase { entries: Vec::new() });
+        }
+        
+        let content = fs::read_to_string(file_path)
+            .with_context(|| format!("Failed to read hash database file: {}", file_path.display()))?;
+            
+        let database: HashDatabase = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse hash database file: {}", file_path.display()))?;
+            
+        Ok(database)
+    }
+    
+    /// Save the hash database to the specified file path
+    fn save(&self, file_path: &Path) -> Result<()> {
+        let content = serde_json::to_string_pretty(self)
+            .with_context(|| "Failed to serialize hash database")?;
+            
+        let parent_dir = file_path.parent().unwrap_or_else(|| Path::new(""));
+        fs::create_dir_all(parent_dir)
+            .with_context(|| format!("Failed to create directory for hash database: {}", parent_dir.display()))?;
+            
+        fs::write(file_path, content)
+            .with_context(|| format!("Failed to write hash database file: {}", file_path.display()))?;
+            
+        Ok(())
+    }
+    
+    /// Convert to a HashSet for fast lookups
+    fn to_hash_set(&self) -> HashSet<(String, Option<String>)> {
+        self.entries.iter()
+            .map(|entry| (entry.filename.clone(), entry.hash.clone()))
+            .collect()
+    }
+    
+    /// Convert from a HashSet to update the database
+    fn from_hash_set(hash_set: &HashSet<(String, Option<String>)>) -> Self {
+        let entries = hash_set.iter()
+            .map(|(filename, hash)| HashDatabaseEntry {
+                filename: filename.clone(),
+                hash: hash.clone(),
+            })
+            .collect();
+            
+        HashDatabase { entries }
+    }
+}
 
 /// Manages the directory structure for downloaded content
 #[derive(Debug, Clone)]
@@ -23,6 +95,8 @@ pub(crate) struct DirectoryManager {
     downloaded_files: HashSet<(String, Option<String>)>,
     /// Whether to use strict SHA-512 verification (when available)
     use_strict_verification: bool,
+    /// Path to the hash database file
+    hash_db_path: PathBuf,
 }
 
 impl DirectoryManager {
@@ -32,55 +106,126 @@ impl DirectoryManager {
         let artists = root.join("Artists");
         let tags = root.join("Tags");
         let pools = root.join("Pools");
-
-        let manager = DirectoryManager {
+        let hash_db_path = root.join("hash_database.json");
+        
+        // Create a manager with empty downloaded files initially
+        let mut manager = DirectoryManager {
             root_dir: root.clone(),
             artists_dir: artists.clone(),
             tags_dir: tags.clone(),
             pools_dir: pools.clone(),
             downloaded_files: HashSet::new(),
             use_strict_verification: true, // Enable strict verification by default
+            hash_db_path: hash_db_path.clone(),
         };
-
+        
+        // Create directory structure first
         manager.create_directory_structure()?;
 
-        // Scan directories for existing files in parallel
-        let mut files = HashSet::new();
+        // Try to load hash database first
+        info!("Looking for existing hash database...");
+        let mut loaded_from_db = false;
         
-        info!("Scanning existing files and calculating hashes...");
-        
-        // Scan all three directories in parallel 
-        let scan_result = rayon::join(
-            || DirectoryManager::scan_directory_static(&artists, true),
-            || {
-                rayon::join(
-                    || DirectoryManager::scan_directory_static(&tags, true),
-                    || DirectoryManager::scan_directory_static(&pools, true)
-                )
+        if hash_db_path.exists() {
+            match HashDatabase::load(&hash_db_path) {
+                Ok(db) => {
+                    let file_count = db.entries.len();
+                    info!("Loaded hash database with {} file entries", file_count);
+                    manager.downloaded_files = db.to_hash_set();
+                    loaded_from_db = true;
+                },
+                Err(e) => {
+                    warn!("Failed to load hash database, will scan directories instead: {}", e);
+                }
             }
-        );
+        }
+        
+        // If database wasn't loaded, scan directories
+        if !loaded_from_db {
+            // Create and configure progress bar
+            let progress_bar = ProgressBarBuilder::new(0)
+                .style(
+                    ProgressStyleBuilder::default()
+                        .template("{spinner:.green} Scanning: {wide_msg} | {elapsed_precise} | Found {pos} files")
+                        .progress_chars("=>-")
+                        .build()
+                )
+                .draw_target(ProgressDrawTarget::stderr_with_hz(10))
+                .reset()
+                .steady_tick(Duration::from_millis(100))
+                .build();
+                
+            progress_bar.set_message("Initializing file scan...");
+            
+            // Scan directories for existing files in parallel
+            let mut files = HashSet::new();
+            
+            info!("Scanning existing files and calculating hashes...");
+            progress_bar.set_message("Counting files to process...");
+            
+            // First count total files for the progress bar (quick scan without hash calculation)
+            let total_files = rayon::join(
+                || DirectoryManager::count_files(&artists),
+                || {
+                    rayon::join(
+                        || DirectoryManager::count_files(&tags),
+                        || DirectoryManager::count_files(&pools)
+                    )
+                }
+            );
+            
+            let artist_count = total_files.0?;
+            let (tags_count, pools_count) = total_files.1;
+            let tags_count = tags_count?;
+            let pools_count = pools_count?;
+            let total_count = artist_count + tags_count + pools_count;
+            
+            // Update progress bar with total
+            progress_bar.set_length(total_count as u64);
+            progress_bar.set_position(0);
+            progress_bar.set_message("Starting deep scan with hash calculation...");
+            
+            // Now scan with hash calculation, using the progress bar
+            let scan_result = rayon::join(
+                || DirectoryManager::scan_directory_with_progress(&artists, true, &progress_bar, "Artists directory"),
+                || {
+                    rayon::join(
+                        || DirectoryManager::scan_directory_with_progress(&tags, true, &progress_bar, "Tags directory"),
+                        || DirectoryManager::scan_directory_with_progress(&pools, true, &progress_bar, "Pools directory")
+                    )
+                }
+            );
 
-        // Combine results from parallel scans
-        let artists_files = scan_result.0?;
-        let (tags_files, pools_files) = scan_result.1;
-        let tags_files = tags_files?;
-        let pools_files = pools_files?;
+            // Combine results from parallel scans
+            let artists_files = scan_result.0?;
+            let (tags_files, pools_files) = scan_result.1;
+            let tags_files = tags_files?;
+            let pools_files = pools_files?;
 
-        // Merge all file sets
-        files.extend(artists_files);
-        files.extend(tags_files);
-        files.extend(pools_files);
+            // Merge all file sets
+            files.extend(artists_files);
+            files.extend(tags_files);
+            files.extend(pools_files);
+            
+            progress_bar.finish_with_message(format!("Scan complete! Found {} files with {} having hashes", 
+                files.len(), 
+                files.iter().filter(|(_, hash)| hash.is_some()).count()));
+                
+            // Save the hash database for future use
+            let hash_db = HashDatabase::from_hash_set(&files);
+            if let Err(e) = hash_db.save(&hash_db_path) {
+                warn!("Failed to save hash database: {}", e);
+            } else {
+                info!("Hash database saved to {}", hash_db_path.display());
+            }
+            
+            // Update the manager with the scanned files
+            manager.downloaded_files = files;
+        }
 
-        info!("Found {} existing files in downloads directory", files.len());
+        info!("Found {} existing files in downloads directory", manager.downloaded_files.len());
 
-        Ok(DirectoryManager {
-            root_dir: root,
-            artists_dir: artists,
-            tags_dir: tags,
-            pools_dir: pools,
-            downloaded_files: files,
-            use_strict_verification: true,
-        })
+        Ok(manager)
     }
 
     /// Creates the basic directory structure
@@ -95,8 +240,14 @@ impl DirectoryManager {
             .with_context(|| format!("Failed to create pools directory at {:?}", self.pools_dir))?;
         Ok(())
     }
-
     /// Enable or disable strict SHA-512 verification
+    /// 
+    /// When strict verification is enabled, files are only considered matches if:
+    /// 1. The filename matches exactly AND
+    /// 2. The SHA-512 hash matches (when available)
+    ///
+    /// This method is kept for future configuration options that may allow users
+    /// to toggle verification strictness.
     pub(crate) fn set_strict_verification(&mut self, enabled: bool) {
         self.use_strict_verification = enabled;
         info!("SHA-512 strict verification {}", if enabled { "enabled" } else { "disabled" });
@@ -128,7 +279,105 @@ impl DirectoryManager {
         Ok(hex_encode(hash))
     }
 
+    /// Count total files in a directory (without calculating hashes)
+    fn count_files(dir: &Path) -> Result<usize> {
+        let mut count = 0;
+        
+        if !dir.is_dir() {
+            return Ok(0);
+        }
+        
+        let entries = fs::read_dir(dir)?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+            
+        for entry in entries {
+            let path = entry.path();
+            
+            if path.is_dir() {
+                count += DirectoryManager::count_files(&path)?;
+            } else {
+                count += 1;
+            }
+        }
+        
+        Ok(count)
+    }
+    
+    /// Recursively scans a directory with progress reporting
+    fn scan_directory_with_progress(
+        dir: &Path, 
+        calculate_hashes: bool,
+        progress_bar: &ProgressBar,
+        section_name: &str
+    ) -> Result<HashSet<(String, Option<String>)>> {
+        let mut files = HashSet::new();
+        
+        if !dir.is_dir() {
+            return Ok(files);
+        }
+        
+        // Get all entries
+        let entries = fs::read_dir(dir)?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+            
+        // Process each entry sequentially for better progress reporting
+        for entry in entries {
+            let path = entry.path();
+            
+            if path.is_dir() {
+                // Update progress for directory
+                let dir_name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("[unnamed]");
+                    
+                progress_bar.set_message(format!("{} - Scanning dir: {}", section_name, dir_name));
+                
+                // Recursively scan subdirectory
+                let subdir_files = DirectoryManager::scan_directory_with_progress(
+                    &path, calculate_hashes, progress_bar, section_name
+                )?;
+                
+                files.extend(subdir_files);
+            } else {
+                // Process file
+                if let Some(name) = path.file_name() {
+                    if let Some(name_str) = name.to_str() {
+                        // Update progress
+                        progress_bar.set_message(format!("{} - Processing: {}", section_name, name_str));
+                        
+                        if calculate_hashes {
+                            // Calculate SHA-512 hash
+                            match DirectoryManager::calculate_sha512(&path) {
+                                Ok(hash) => {
+                                    files.insert((name_str.to_string(), Some(hash)));
+                                },
+                                Err(e) => {
+                                    warn!("Failed to calculate hash for {}: {}", path.display(), e);
+                                    files.insert((name_str.to_string(), None));
+                                }
+                            }
+                        } else {
+                            // Just record filename
+                            files.insert((name_str.to_string(), None));
+                        }
+                        
+                        // Increment progress
+                        progress_bar.inc(1);
+                    }
+                }
+            }
+        }
+        
+        Ok(files)
+    }
+    
     /// Recursively scans a directory and returns a set of files with optional hashes
+    /// 
+    /// This method is used for parallel scanning without progress reporting.
+    /// It's kept as a fallback for non-interactive contexts or as an alternative
+    /// to scan_directory_with_progress when a progress bar is not needed.
     fn scan_directory_static(dir: &Path, calculate_hashes: bool) -> Result<HashSet<(String, Option<String>)>> {
         let mut files = HashSet::new();
         
@@ -262,17 +511,29 @@ impl DirectoryManager {
     }
 
     /// Adds a file to the tracking set after successful download
+    /// Adds a file to the tracking set after successful download
     /// Note: This method is deprecated and should only be used when hash calculation fails
     pub(crate) fn mark_file_downloaded(&mut self, file_name: &str) {
         warn!("Adding file '{}' without hash - hash verification will not be possible", file_name);
         self.downloaded_files.insert((file_name.to_string(), None));
+        
+        // Update the hash database file
+        let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
+        if let Err(e) = hash_db.save(&self.hash_db_path) {
+            warn!("Failed to update hash database after adding file: {}", e);
+        }
     }
-    
     /// Adds a file with its SHA-512 hash to the tracking set
     /// This is the preferred method for tracking downloaded files
     pub(crate) fn mark_file_downloaded_with_hash(&mut self, file_name: &str, hash: String) {
         trace!("Adding file '{}' with SHA-512 hash", file_name);
         self.downloaded_files.insert((file_name.to_string(), Some(hash)));
+        
+        // Update the hash database file
+        let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
+        if let Err(e) = hash_db.save(&self.hash_db_path) {
+            warn!("Failed to update hash database after adding file: {}", e);
+        }
     }
     
     /// Checks if a file exists by name or hash
@@ -288,11 +549,25 @@ impl DirectoryManager {
         // Fall back to filename check
         self.file_exists(file_name)
     }
+    
+    /// Calculates the SHA-512 hash for a given file path
+    /// 
+    /// This is a convenience wrapper around the static calculate_sha512 method
+    /// that maintains the same error handling and result type.
+    /// Kept for future batch verification and file integrity checking features.
     pub(crate) fn calculate_hash_for_file(&self, file_path: &Path) -> Result<String> {
         DirectoryManager::calculate_sha512(file_path)
     }
     
     /// Scan and update hashes for all files that don't have them yet
+    ///
+    /// This method scans all directories to find files that are tracked but don't have hashes yet.
+    /// When found, it calculates their SHA-512 hash and updates the tracking information.
+    ///
+    /// Returns the number of files that were successfully updated with hashes.
+    /// 
+    /// Kept for future manual verification features, file recovery tools,
+    /// and database maintenance operations.
     pub(crate) fn update_missing_hashes(&mut self) -> Result<usize> {
         let mut updated_count = 0;
         let mut to_add = HashSet::new();
@@ -344,10 +619,23 @@ impl DirectoryManager {
             self.downloaded_files.insert(item);
         }
         
+        // Update the hash database after changes
+        let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
+        if let Err(e) = hash_db.save(&self.hash_db_path) {
+            warn!("Failed to update hash database after updating hashes: {}", e);
+        } else {
+            info!("Updated hash database with {} newly calculated hashes", updated_count);
+        }
+        
         Ok(updated_count)
     }
 
     /// Find all files with the given name in the directory (recursively)
+    /// 
+    /// Searches through the directory tree to find all files matching the given name.
+    /// This is used for hash calculation of existing files and file recovery operations.
+    ///
+    /// Kept for supporting the update_missing_hashes method and future file verification tools.
     fn find_files_by_name(&self, dir: &Path, file_name: &str) -> Result<Vec<PathBuf>> {
         let mut matching_files = Vec::new();
         
