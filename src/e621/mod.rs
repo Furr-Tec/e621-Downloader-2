@@ -541,6 +541,14 @@ impl E621WebConnector {
             console::style(format!("\"{}\"", collection_info.name)).color256(39).italic()
         );
         
+        // Configure progress bar with proper styling and length
+        self.progress_bar = ProgressBar::new(new_files as u64);
+        let progress_style = ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {prefix}: {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("#>-");
+        self.progress_bar.set_style(progress_style);
+        
         // Set progress bar prefix to current collection (limited to 15 chars for consistent width)
         let short_name = if collection_info.short_name.len() > 13 {
             format!("{}…", &collection_info.short_name[..12])
@@ -596,15 +604,20 @@ impl E621WebConnector {
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
                     
+                    // Update progress message with file info and count
+                    let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
+                    
                     // Use a direct check method rather than nested function calls to reduce stack usage
                     if dir_manager.is_duplicate_iterative(filename, hash_ref) {
-                        self.progress_bar.set_message("Duplicate: verified and skipping".to_string());
+                        self.progress_bar.set_message(format!("[{}/{}] Duplicate: {}", 
+                            current_position, new_files, filename));
                         self.progress_bar.inc(post.file_size() as u64);
                         continue;
                     }
 
-                    // Use a static message to avoid string allocations for every file
-                    self.progress_bar.set_message("Downloading...");
+                    // Show which file is being downloaded and progress information
+                    self.progress_bar.set_message(format!("[{}/{}] Downloading {}", 
+                        current_position, new_files, filename));
                     
                     // Get the save directory from the post
                     let save_dir = match post.save_directory() {
@@ -648,31 +661,42 @@ impl E621WebConnector {
                             match hash_result {
                                 Ok(hash) => {
                                     // Store hash with the downloaded file for future verification
-                                    // Store hash with the downloaded file for future verification
-                                    // Use a direct update method to avoid deep recursion
                                     dir_manager.mark_file_downloaded_with_hash_simple(post.name(), hash.clone());
-                                    
-                                    // since we're iterating through a shared reference. Just store the hash for verification.
                                     trace!("Stored hash {} for post {}", hash, post.name());
+                                    
+                                    // Show success message with file counts
+                                    let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
+                                    let message = format!("[{}/{}] Downloaded & verified: {}", 
+                                        current_position, new_files, filename);
+                                    self.progress_bar.set_message(message);
                                 },
                                 Err(e) => {
                                     // Hash calculation failed but file was saved
                                     warn!("Failed to calculate hash for {}: {}", file_path_str, e);
                                     dir_manager.mark_file_downloaded(post.name());
-                                    let message = format!("Saved but not verified: {}", post.name());
+                                    
+                                    // Show warning message with file counts
+                                    let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
+                                    let message = format!("[{}/{}] Saved but not verified: {}", 
+                                        current_position, new_files, filename);
                                     self.progress_bar.set_message(message);
                                 }
                             }
+                            
+                            // Update progress bar after successful download
+                            self.progress_bar.inc(post.file_size() as u64);
                         },
                         Err(err) => {
                             error!("Failed to download/save image {}: {}", file_path_str, err);
-                            self.progress_bar.set_message("Error: Download/save failed");
+                            
+                            // Show error message with file counts
+                            let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
+                            self.progress_bar.set_message(format!("[{}/{}] Error: Download failed for {}",
+                                current_position, new_files, filename));
                             self.progress_bar.inc(post.file_size() as u64);
                         }
                     }
-                    
-                    self.progress_bar.inc(post.file_size() as u64);
-                }
+                } // End of for post in &batch_vec
                 
                 // Update processed count BEFORE clearing the batch
                 processed += batch_vec.len();
