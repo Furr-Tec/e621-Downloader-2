@@ -1,0 +1,19 @@
+# This is the tag file that you will use so the program can know what tags to search.
+# If you wish to comment in this file, simply put `#` at the beginning or end of line.
+
+# Insert tags you wish to download in the appropriate group (remove all example tags and IDs with what you wish to download):
+
+[artists]
+angiewolf
+
+[pools]
+1106 # Title: Taste of the Order
+
+[sets]
+28495 # Title: Good Picture
+
+[single-post]
+1662487 # Photonoko. Basic Description: Otters
+
+[general]
+lutrine order:score

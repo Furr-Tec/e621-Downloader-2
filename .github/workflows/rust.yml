@@ -1,0 +1,60 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ubuntu_build:
+    name: Ubuntu Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup Rust Toolchain
+      uses: actions-rs/toolchain@v1.0.6
+      with:
+        toolchain: nightly
+    - name: Configure OpenSSL
+      run: sudo apt-get install libssl-dev
+    - name: Install PKG Config
+      run: sudo apt-get install pkg-config
+    - name: Export PKG for OpenSSL
+      run: export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
+    - name: Build
+      run: cargo build
+    - name: Run tests
+      run: cargo test --verbose
+
+  windows_build:
+    name: Windows Build
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup Rust Toolchain
+      uses: actions-rs/toolchain@v1.0.6
+      with:
+        toolchain: nightly
+    - name: Build
+      run: cargo build
+    - name: Run tests
+      run: cargo test --verbose
+
+  mac_build:
+    name: Mac Build
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup Rust Toolchain
+      uses: actions-rs/toolchain@v1.0.6
+      with:
+        toolchain: nightly
+    - name: Build
+      run: cargo build
+    - name: Run tests
+      run: cargo test --verbose
+    
