@@ -794,9 +794,24 @@ impl DirectoryManager {
         self.downloaded_files.insert((file_name.to_string(), Some(hash)));
         // Database update is deferred to batch completion
     }
+
+    /// Explicitly saves the current state of the hash database to disk
+    /// This method should be called after batch operations that use mark_file_downloaded_with_hash_simple
+    pub(crate) fn save_hash_database(&self) -> Result<()> {
+        trace!("Saving hash database to disk...");
+        
+        // Create database from current state
+        let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
+        
+        // Attempt to save and handle errors
+        hash_db.save(&self.hash_db_path)
+            .with_context(|| format!("Failed to save hash database to {}", self.hash_db_path.display()))?;
+            
+        info!("Successfully saved hash database with {} entries", self.downloaded_files.len());
+        Ok(())
+    }
     
     /// Adds a file with its SHA-512 hash to the tracking set
-    /// This is the preferred method for tracking downloaded files
     pub(crate) fn mark_file_downloaded_with_hash(&mut self, file_name: &str, hash: String) {
         self.mark_file_downloaded_with_hash_simple(file_name, hash);
         
