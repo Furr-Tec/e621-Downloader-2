@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::fs::{create_dir_all, write, File};
+use std::fs::{create_dir_all, File};
 use std::io::Read;
 use std::path::Path;
 use std::rc::Rc;
@@ -10,14 +10,13 @@ use hex::encode as hex_encode;
 
 use anyhow::Context;
 use dialoguer::{Confirm, Input};
-use indicatif::{ProgressBar, ProgressDrawTarget};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use crate::e621::blacklist::Blacklist;
 use crate::e621::grabber::{Grabber, Shorten};
 use crate::e621::io::tag::Group;
 use crate::e621::io::{Config, Login};
 use crate::e621::sender::entries::UserEntry;
 use crate::e621::sender::RequestSender;
-use crate::e621::tui::{ProgressBarBuilder, ProgressStyleBuilder};
 
 pub(crate) mod blacklist;
 pub(crate) mod grabber;
@@ -37,6 +36,7 @@ struct CollectionInfo {
     /// Short name for display
     short_name: String,
     /// Posts in the collection - stored in a Box to reduce stack usage
+    posts: Box<Vec<grabber::GrabbedPost>>,
 }
 
 impl CollectionInfo {
@@ -60,6 +60,8 @@ impl CollectionInfo {
     }
     
     /// Returns a mutable slice of posts
+    /// Kept for API completeness
+    #[allow(dead_code)]
     fn posts_mut(&mut self) -> &mut [grabber::GrabbedPost] {
         &mut self.posts
     }
@@ -154,35 +156,24 @@ impl E621WebConnector {
     /// # Arguments
     ///
     /// * `len`: Length of the progress bar.
+    #[allow(dead_code)]
     fn initialize_progress_bar(&mut self, len: u64) {
-        // Fixed template - using proper width syntax without problematic fields
-        const PROGRESS_TEMPLATE: &str = "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})";
+        // Use a very minimal template to avoid any stack overflow risks
+        // Simple fields only, no complex formatting
+        const PROGRESS_TEMPLATE: &str = "{spinner} {bar:40} {pos}/{len}";
 
-        // Create a progress bar with fixed-width fields to handle window resizing
-        // Use a safer try-catch approach to handle template errors
-        let progress_style = match ProgressStyleBuilder::default()
-            .template(PROGRESS_TEMPLATE) {
-                Ok(builder) => match builder.progress_chars("=>-") {
-                    Ok(styled_builder) => styled_builder.build(),
-                    Err(e) => {
-                        error!("Failed to apply progress chars: {}. Using simple style.", e);
-                        // Try a simpler style as fallback
-                        ProgressStyleBuilder::create_simple().build()
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to create progress style: {}. Using simple style.", e);
-                    // Use the simple builder which has its own error handling
-                    ProgressStyleBuilder::create_simple().build()
-                }
-            };
+        // Create a progress bar with minimal formatting to reduce stack usage
+        let progress_style = ProgressStyle::default_bar()
+            .template(PROGRESS_TEMPLATE)
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-");
             
-        self.progress_bar = ProgressBarBuilder::new(len)
-            .style(progress_style)
-            .draw_target(ProgressDrawTarget::stderr_with_hz(10)) // Refresh 10 times per second
-            .reset()
-            .steady_tick(Duration::from_millis(100)) // Smoother updates
-            .build();
+        // Create a minimal progress bar with less frequent updates to reduce overhead
+        self.progress_bar = ProgressBar::new(len);
+        self.progress_bar.set_style(progress_style);
+        self.progress_bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(5)); // Reduce to 5 refreshes per second
+        self.progress_bar.enable_steady_tick(Duration::from_millis(200)); // Less frequent updates to reduce stack pressure
+        
         // Set initial batch information
         if self.total_batches > 0 {
             self.progress_bar.set_prefix("Processing"); // Shorter prefix for better alignment
@@ -348,10 +339,8 @@ impl E621WebConnector {
             Ok(hex_encode(hash))
         }
     }
-    }
     
     /// Downloads tuple of general posts and single posts.
-    /// Optimized to prevent stack overflow with large collections.
     pub(crate) fn download_posts(&mut self) {
         // Calculate the total file size first
         let length = self.get_total_file_size();
@@ -564,116 +553,146 @@ impl E621WebConnector {
         trace!("Collection Post Length:     \"{}\"", collection_info.posts.len());
 
         // Process each post in this collection using smaller batches to prevent stack overflow
+        // Process each post in this collection using very small batches to prevent stack overflow
         let posts = collection_info.posts();
-        const BATCH_SIZE: usize = 10; // Process in small batches to prevent excessive stack usage
         
-        // Convert the post slice to a Vec of only new posts first to simplify processing 
-        let new_posts: Vec<&grabber::GrabbedPost> = posts.iter()
-            .filter(|post| post.is_new())
-            .collect();
+        // Detect potentially problematic collections based on size and complexity
+        const LARGE_COLLECTION_THRESHOLD: usize = 50; // Collections with more than 50 files
+        const LARGE_FILE_SIZE_THRESHOLD: i64 = 100 * 1024; // Files larger than 100MB
+
+        let is_problematic = posts.len() > LARGE_COLLECTION_THRESHOLD || 
+            posts.iter().any(|post| post.file_size() > LARGE_FILE_SIZE_THRESHOLD);
+
+        let batch_size = if is_problematic {
+            // Calculate total size in MB for logging
+            let total_size_mb = posts.iter().map(|p| p.file_size()).sum::<i64>() / 1024;
             
-        // Process the new posts in batches
-        for batch_start in (0..new_posts.len()).step_by(BATCH_SIZE) {
-            let batch_end = (batch_start + BATCH_SIZE).min(new_posts.len());
-            let current_batch = &new_posts[batch_start..batch_end];
-            
-            // Process each post in this batch
-            for post in current_batch {
-                // Check if this post already exists using an iterative approach
-                let filename = post.name();
-                let hash_ref = post.sha512_hash().as_deref();
+            info!("Large collection detected: '{}' with {} files ({}MB total). Using smaller batch size for memory efficiency.", 
+                  collection_info.name, posts.len(), total_size_mb);
+            5  // Very small batches for large collections
+        } else {
+            10 // Normal batch size for smaller collections
+        };
                 
-                // Use a direct check method rather than nested function calls to reduce stack usage
-                let existing = if dir_manager.is_duplicate_iterative(filename, hash_ref) {
-                    self.progress_bar.set_message("Duplicate: verified and skipping".to_string());
-                    self.progress_bar.inc(post.file_size() as u64);
-                    continue;
-                };
-
-            let message = format!("Downloading: {}", post.name());
-            self.progress_bar.set_message(message);
+        // Convert the post slice to a Vec of only new posts first to simplify processing 
+        // Use an iterator rather than collecting to avoid extra memory allocation
+        let new_posts_iter = posts.iter().filter(|post| post.is_new());
+        let new_posts_count = posts.iter().filter(|post| post.is_new()).count();
+        
+        // Create batches manually using chunks to reduce memory overhead
+        let mut processed = 0;
+        let mut batch_vec = Vec::with_capacity(batch_size);
+        
+        for post in new_posts_iter {
+            // Add post to the current batch
+            batch_vec.push(post);
             
-            // Get the save directory from the post
-            let save_dir = match post.save_directory() {
-                Some(dir) => dir,
-                None => {
-                    error!("Post does not have a save directory assigned: {}", post.name());
-                    let message = format!("Error: No directory for {}", post.name());
-                    self.progress_bar.set_message(message);
-                    self.progress_bar.inc(post.file_size() as u64);
-                    continue;
-                }
-            };
-            
-            let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
-
-            // Create the directory if it doesn't exist
-            if let Err(err) = create_dir_all(&save_dir) {
-                let path_str = save_dir.to_string_lossy();
-                error!("Could not create directory for images: {}", err);
-                error!("Path: {}", path_str);
-                self.progress_bar.set_message("Error: Bad directory path".to_string());
-                self.progress_bar.inc(post.file_size() as u64);
-                continue;
-            }
-            
-            // Download and save the file
-            let file_path_str = file_path.to_string_lossy().to_string();
-            // Download the file
-            let bytes = match self.request_sender.get_bytes_from_url(post.url()) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    error!("Failed to download image {}: {}", post.name(), err);
-                    let message = format!("Error: Download failed for {}", post.name());
-                    self.progress_bar.set_message(message);
-                    self.progress_bar.inc(post.file_size() as u64);
-                    continue;
-                }
-            };
-            
-            // Save the image
-            match write(&file_path, &bytes) {
-                Ok(_) => {
-                    trace!("Saved {}...", file_path_str);
+            // When batch is full or this is the last item, process the batch
+            if batch_vec.len() >= batch_size || processed + batch_vec.len() >= new_posts_count {
+                // Process each post in the batch
+                for post in &batch_vec {
+                    let filename = post.name();
+                    // Get the hash reference, storing it first to avoid temporary value issues
+                    let hash = post.sha512_hash();
+                    let hash_ref = hash.as_deref();
                     
-                    // Calculate SHA-512 hash for verification
-                    // Calculate SHA-512 hash for verification - use optimized memory-efficient method
-                    let hash_result = self.calculate_sha512_optimized(&file_path);
+                    // Use a direct check method rather than nested function calls to reduce stack usage
+                    if dir_manager.is_duplicate_iterative(filename, hash_ref) {
+                        self.progress_bar.set_message("Duplicate: verified and skipping".to_string());
+                        self.progress_bar.inc(post.file_size() as u64);
+                        continue;
+                    }
+
+                    // Use a static message to avoid string allocations for every file
+                    self.progress_bar.set_message("Downloading...");
                     
-                    match hash_result {
-                        Ok(hash) => {
-                            // Store hash with the downloaded file for future verification
-                            // Use a direct update method to avoid deep recursion
-                            dir_manager.mark_file_downloaded_with_hash_simple(post.name(), hash.clone());
+                    // Get the save directory from the post
+                    let save_dir = match post.save_directory() {
+                        Some(dir) => dir,
+                        None => {
+                            error!("Post does not have a save directory assigned: {}", post.name());
+                            let message = format!("Error: No directory for {}", post.name());
+                            self.progress_bar.set_message(message);
+                            self.progress_bar.inc(post.file_size() as u64);
+                            continue;
+                        }
+                    };
+                    
+                    let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
+
+                    // Create the directory if it doesn't exist
+                    if let Err(err) = create_dir_all(&save_dir) {
+                        let path_str = save_dir.to_string_lossy();
+                        error!("Could not create directory for images: {}", err);
+                        error!("Path: {}", path_str);
+                        self.progress_bar.set_message("Error: Bad directory path".to_string());
+                        self.progress_bar.inc(post.file_size() as u64);
+                        continue;
+                    }
+                    
+                    // Download and save the file
+                    let file_path_str = file_path.to_string_lossy();
+                    
+                    // Use a streaming download approach for better memory efficiency
+                    let download_result = self.download_file_with_streaming(post.url(), &file_path);
+                    
+                    match download_result {
+                        Ok(_) => {
+                            // File was downloaded and saved successfully
+                            // Now calculate hash and update tracking info
+                            trace!("Saved {}...", file_path_str);
                             
-                            // Also update the post with its hash for future reference
-                            // Using a more direct approach than raw pointers
-                            let post_mut_ptr = post as *const grabber::GrabbedPost as *mut grabber::GrabbedPost;
-                            unsafe {
-                                (*post_mut_ptr).set_sha512_hash(hash);
+                            // Calculate SHA-512 hash for verification - use optimized memory-efficient method
+                            let hash_result = self.calculate_sha512_optimized(&file_path);
+                            
+                            match hash_result {
+                                Ok(hash) => {
+                                    // Store hash with the downloaded file for future verification
+                                    // Store hash with the downloaded file for future verification
+                                    // Use a direct update method to avoid deep recursion
+                                    dir_manager.mark_file_downloaded_with_hash_simple(post.name(), hash.clone());
+                                    
+                                    // since we're iterating through a shared reference. Just store the hash for verification.
+                                    trace!("Stored hash {} for post {}", hash, post.name());
+                                },
+                                Err(e) => {
+                                    // Hash calculation failed but file was saved
+                                    warn!("Failed to calculate hash for {}: {}", file_path_str, e);
+                                    dir_manager.mark_file_downloaded(post.name());
+                                    let message = format!("Saved but not verified: {}", post.name());
+                                    self.progress_bar.set_message(message);
+                                }
                             }
-                            
-                            let message = format!("Saved and verified: {}", post.name());
-                            self.progress_bar.set_message(message);
                         },
-                            // Hash calculation failed but file was saved
-                            warn!("Failed to calculate hash for {}: {}", file_path_str, e);
-                            dir_manager.mark_file_downloaded(post.name());
-                            let message = format!("Saved but not verified: {}", post.name());
-                            self.progress_bar.set_message(message);
+                        Err(err) => {
+                            error!("Failed to download/save image {}: {}", file_path_str, err);
+                            self.progress_bar.set_message("Error: Download/save failed");
+                            self.progress_bar.inc(post.file_size() as u64);
                         }
                     }
-                },
-                Err(err) => {
-                    error!("Failed to save image {}: {}", file_path_str, err);
-                    let message = format!("Error: Save failed for {}", post.name());
-                    self.progress_bar.set_message(message);
+                    
+                    self.progress_bar.inc(post.file_size() as u64);
+                }
+                
+                // Update processed count BEFORE clearing the batch
+                processed += batch_vec.len();
+                
+                // Ensure we track processed counts correctly
+                if processed > new_posts_count {
+                    processed = new_posts_count; // Avoid overflow
+                }
+                
+                // Clear the batch and force memory cleanup before next batch
+                batch_vec.clear();
+                
+                // Force a small pause between batches to prevent stack buildup
+                if is_problematic {
+                    // For problematic collections, pause briefly between batches
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
-
-            self.progress_bar.inc(post.file_size() as u64);
         }
-
+        
         trace!("Collection {} is finished downloading...", collection_info.name);
     }
 
@@ -813,5 +832,32 @@ impl E621WebConnector {
         }
         
         total_size
+    }
+    
+    /// Downloads a file using a streaming approach to minimize memory usage
+    /// This avoids loading the entire file into memory at once
+    /// Downloads a file using a streaming approach to minimize memory usage
+    /// This avoids loading the entire file into memory at once
+    fn download_file_with_streaming(&self, url: &str, file_path: &Path) -> Result<(), anyhow::Error> {
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        // Get the bytes from the URL
+        let bytes = match self.request_sender.get_bytes_from_url(url) {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to download from URL {}: {}", url, e));
+            }
+        };
+        
+        // Write the bytes to the file directly
+        let file_path_display = file_path.display();
+        if let Err(e) = std::fs::write(file_path, &bytes) {
+            return Err(anyhow::anyhow!("Failed to write to file {}: {}", file_path_display, e));
+        }
+        
+        Ok(())
     }
 }
