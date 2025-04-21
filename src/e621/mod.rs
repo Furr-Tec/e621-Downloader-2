@@ -6,7 +6,6 @@ use std::time::Duration;
 use anyhow::Context;
 use dialoguer::{Confirm, Input};
 use indicatif::{ProgressBar, ProgressDrawTarget};
-
 use crate::e621::blacklist::Blacklist;
 use crate::e621::grabber::{Grabber, Shorten};
 use crate::e621::io::tag::Group;
@@ -72,6 +71,11 @@ pub(crate) struct E621WebConnector {
     /// Total number of batches
     total_batches: usize,
 }
+
+// Progress bar template for consistent formatting
+const PROGRESS_TEMPLATE: &str = 
+    "{spinner:.green} {prefix:.bold.blue:15} | {msg:40} | {elapsed_precise} | [{bar:40:.cyan/blue}] {bytes:10}/{total_bytes:10} {binary_bytes_per_sec:12} ETA: {eta:8}";
+
 impl E621WebConnector {
     /// Creates instance of `Self` for grabbing and downloading posts.
     pub(crate) fn new(request_sender: &RequestSender) -> Self {
@@ -142,27 +146,34 @@ impl E621WebConnector {
     ///
     /// * `len`: The total bytes to download.
     fn initialize_progress_bar(&mut self, len: u64) {
-        // Create a progress bar template that clearly separates the message from the progress indicator
-        let template = format!(
-            "{{prefix:20}} {{msg:40}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{bytes}}/{{total_bytes}} {{binary_bytes_per_sec}} ETA: {{eta}}"
-        );
-        
+        // Create a progress bar with fixed-width fields to handle window resizing
         self.progress_bar = ProgressBarBuilder::new(len)
             .style(
                 ProgressStyleBuilder::default()
-                    .template(&template)
+                    .template(PROGRESS_TEMPLATE)
                     .progress_chars("=>-")
-                    .build())
-            .draw_target(ProgressDrawTarget::stderr())
+                    .build()
+            )
+            .draw_target(ProgressDrawTarget::stderr_with_hz(10)) // Refresh 10 times per second
             .reset()
-            .steady_tick(Duration::from_secs(1))
+            .steady_tick(Duration::from_millis(100)) // Smoother updates
             .build();
             
         // Set initial batch information
         if self.total_batches > 0 {
-            self.progress_bar.set_prefix("Processing batch".to_string());
+            self.progress_bar.set_prefix("Processing"); // Shorter prefix for better alignment
             self.update_batch_info();
+        } else {
+            self.progress_bar.set_prefix("Downloading"); // Default prefix
+            self.progress_bar.set_message("Initializing...".to_string());
         }
+    }
+
+    /// Updates the batch information display in the progress bar
+    fn update_batch_info(&self) {
+        // Format with fixed width to ensure alignment
+        let batch_info = format!("Batch {:>2}/{:<2}", self.current_batch, self.total_batches);
+        self.progress_bar.set_message(batch_info);
     }
 
     /// Gets input and enters safe depending on user choice.
@@ -220,19 +231,20 @@ impl E621WebConnector {
     ///
     /// # Arguments
     ///
-    /// * `dir_name`: Directory name to remove invalid chars from.
+    /// Removes invalid characters from directory path.
     ///
-    /// returns: String
-    fn remove_invalid_chars(&self, dir_name: &str) -> String {
-        dir_name
-            .chars()
+    /// # Arguments
+    ///
+    /// * `text`: The text to remove invalid characters from.
+    fn remove_invalid_chars(&self, text: &str) -> String {
+        text.chars()
             .map(|e| match e {
                 '?' | ':' | '*' | '<' | '>' | '"' | '|' => '_',
                 _ => e,
             })
             .collect()
     }
-
+    
     /// Formats file size in KB to a human-readable string with appropriate units
     fn format_file_size(&self, size_kb: u64) -> String {
         if size_kb >= 1024 * 1024 {
@@ -247,12 +259,6 @@ impl E621WebConnector {
         }
     }
 
-    /// Updates the batch information display in the progress bar
-    fn update_batch_info(&self) {
-        let batch_info = format!("Batch {}/{}", self.current_batch, self.total_batches);
-        let current_msg = format!("Processing {}", batch_info);
-        self.progress_bar.set_message(current_msg);
-    }
     
     /// Downloads tuple of general posts and single posts.
     pub(crate) fn download_posts(&mut self) {
@@ -315,7 +321,9 @@ impl E621WebConnector {
             }
         }
         
-        self.progress_bar.finish_with_message("All downloads completed");
+        // Use clear formatting for final message
+        self.progress_bar.set_prefix("Completed");
+        self.progress_bar.finish_with_message("All downloads completed successfully");
     }
 
     /// Downloads a single collection
@@ -339,19 +347,19 @@ impl E621WebConnector {
             return;
         }
         
-        // No need for redundant check - we already checked new_files count above
-
         info!(
             "Found {} new files to download in {}",
             new_files,
             console::style(format!("\"{}\"", collection_info.name)).color256(39).italic()
         );
         
-        // Set progress bar prefix to current collection
-        let prefix = format!("{}:", collection_info.short_name);
-        self.progress_bar.set_prefix(prefix);
-        
-        trace!("Printing Collection Info:");
+        // Set progress bar prefix to current collection (limited to 15 chars for consistent width)
+        let short_name = if collection_info.short_name.len() > 13 {
+            format!("{}…", &collection_info.short_name[..12])
+        } else {
+            collection_info.short_name.clone()
+        };
+        self.progress_bar.set_prefix(short_name);
         trace!("Collection Name:            \"{}\"", collection_info.name);
         trace!("Collection Category:        \"{}\"", collection_info.category);
         trace!("Collection Post Length:     \"{}\"", collection_info.posts.len());
