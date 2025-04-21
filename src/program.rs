@@ -103,7 +103,19 @@ impl Program {
         connector.download_posts();
 
         info!("Finished downloading posts!");
-        info!("Exiting...");
+        
+        // Ask user before exiting
+        if connector.confirm_exit("All operations completed successfully.") {
+            info!("Exiting at user request...");
+        } else {
+            info!("Program will remain open. Press Enter to exit when ready.");
+            
+            // Simple prompt for user to exit when ready
+            let term = Term::stdout();
+            println!("\nPress Enter to exit...");
+            let _ = term.read_line();
+            info!("User requested exit. Closing application...");
+        }
 
         Ok(())
     }

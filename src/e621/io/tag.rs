@@ -238,20 +238,36 @@ impl TagIdentifier {
     ///
     /// returns: Option<TagEntry>
     fn get_tag_from_alias(&self, tag: &str) -> Option<TagEntry> {
-        let entry = match self.request_sender.query_aliases(tag) {
-            Some(e) => e.first().unwrap().clone(),
+        // First, get the alias entry
+        let alias_result = self.request_sender.query_aliases(tag);
+        
+        // If no aliases found, return None early
+        let aliases = match alias_result {
+            Some(aliases) => aliases,
+            None => return None,
+        };
+        
+        // Try to get the first alias
+        let first_alias = match aliases.first() {
+            Some(alias) => alias,
             None => {
+                warn!("Empty alias results for tag: {}", tag);
                 return None;
             }
         };
-
-        Some(
-            self.request_sender
-                .get_tags_by_name(&entry.consequent_name)
-                .first()
-                .unwrap()
-                .clone(),
-        )
+        
+        // Now try to find the consequent tag
+        let consequent_tags = self.request_sender.get_tags_by_name(&first_alias.consequent_name);
+        
+        // Return the first tag if found, otherwise None
+        match consequent_tags.first() {
+            Some(tag_entry) => Some(tag_entry.clone()),
+            None => {
+                warn!("Could not find target tag '{}' for alias '{}'", 
+                      first_alias.consequent_name, tag);
+                None
+            }
+        }
     }
 
     /// Emergency exits if a tag isn't identified.

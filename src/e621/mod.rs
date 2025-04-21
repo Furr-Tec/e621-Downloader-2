@@ -77,10 +77,6 @@ pub(crate) struct E621WebConnector {
     total_batches: usize,
 }
 
-// Progress bar template for consistent formatting
-const PROGRESS_TEMPLATE: &str = 
-    "{spinner:.green} {prefix:.bold.blue:15} | {msg:40} | {elapsed_precise} | [{bar:40:.cyan/blue}] {bytes:10}/{total_bytes:10} {binary_bytes_per_sec:12} ETA: {eta:8}";
-
 impl E621WebConnector {
     /// Creates instance of `Self` for grabbing and downloading posts.
     pub(crate) fn new(request_sender: &RequestSender) -> Self {
@@ -140,30 +136,43 @@ impl E621WebConnector {
             .unwrap_or(self.batch_size);
             
         self.batch_size = batch_size.max(1); // Ensure at least 1
-        
-        
-        info!("Batch size set to {}", self.batch_size);
+        info!("Batch size set to: {}", self.batch_size);
     }
-
-    /// Initializes the progress bar for downloading process.
+    
+    /// Initializes the progress bar with a fresh instance for downloads.
     ///
     /// # Arguments
     ///
-    /// * `len`: The total bytes to download.
+    /// * `len`: Length of the progress bar.
     fn initialize_progress_bar(&mut self, len: u64) {
+        // Fixed template - using proper width syntax without problematic fields
+        const PROGRESS_TEMPLATE: &str = "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})";
+
         // Create a progress bar with fixed-width fields to handle window resizing
+        // Use a safer try-catch approach to handle template errors
+        let progress_style = match ProgressStyleBuilder::default()
+            .template(PROGRESS_TEMPLATE) {
+                Ok(builder) => match builder.progress_chars("=>-") {
+                    Ok(styled_builder) => styled_builder.build(),
+                    Err(e) => {
+                        error!("Failed to apply progress chars: {}. Using simple style.", e);
+                        // Try a simpler style as fallback
+                        ProgressStyleBuilder::create_simple().build()
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to create progress style: {}. Using simple style.", e);
+                    // Use the simple builder which has its own error handling
+                    ProgressStyleBuilder::create_simple().build()
+                }
+            };
+            
         self.progress_bar = ProgressBarBuilder::new(len)
-            .style(
-                ProgressStyleBuilder::default()
-                    .template(PROGRESS_TEMPLATE)
-                    .progress_chars("=>-")
-                    .build()
-            )
+            .style(progress_style)
             .draw_target(ProgressDrawTarget::stderr_with_hz(10)) // Refresh 10 times per second
             .reset()
             .steady_tick(Duration::from_millis(100)) // Smoother updates
             .build();
-            
         // Set initial batch information
         if self.total_batches > 0 {
             self.progress_bar.set_prefix("Processing"); // Shorter prefix for better alignment
@@ -308,6 +317,17 @@ impl E621WebConnector {
             return;
         }
         
+        // Count total posts to be downloaded for confirmation
+        let post_count = collection_infos.iter()
+            .map(|info| info.new_files_count())
+            .sum::<usize>();
+            
+        // Confirm with user if download size is large
+        if !self.confirm_large_download(length, post_count) {
+            info!("Download cancelled by user.");
+            return;
+        }
+        
         // Calculate batch information
         self.total_batches = (total_collections + self.batch_size - 1) / self.batch_size;
         info!("Processing {} collections in {} batches of up to {} collections each", 
@@ -352,6 +372,9 @@ impl E621WebConnector {
         // Use clear formatting for final message
         self.progress_bar.set_prefix("Completed");
         self.progress_bar.finish_with_message("All downloads completed successfully");
+        
+        // Wait for user to confirm they've seen completion before continuing
+        info!("Download process has completed successfully.");
     }
 
     /// Downloads a single collection
@@ -496,6 +519,96 @@ impl E621WebConnector {
         }
 
         trace!("Collection {} is finished downloading...", collection_info.name);
+    }
+
+    /// Gets the total size (in KB) of every post image to be downloaded.
+    /// Shows a prompt for confirming large downloads and gives the option to adjust limits
+    /// Returns true if user chooses to proceed, false if user cancels
+    fn confirm_large_download(&mut self, total_size_kb: u64, post_count: usize) -> bool {
+        // Convert to GB for comparison (20GB threshold)
+        let total_size_gb = total_size_kb as f64 / (1024.0 * 1024.0); 
+        let threshold_gb = 20.0; // 20GB threshold
+        
+        if total_size_gb <= threshold_gb {
+            // Size is below threshold, no need for confirmation
+            return true;
+        }
+        
+        // Format size for display
+        let formatted_size = self.format_file_size(total_size_kb);
+        
+        // Display warning and options
+        println!("\n⚠️  WARNING: Large download detected!");
+        println!("You are about to download {} files totaling {}.", post_count, formatted_size);
+        println!("This exceeds the recommended size of 20GB.\n");
+        
+        // Create selection menu for the user
+        let options = &[
+            "Proceed with download",
+            "Adjust size limits",
+            "Cancel download"
+        ];
+        
+        let selection = dialoguer::Select::new()
+            .with_prompt("What would you like to do?")
+            .default(0)
+            .items(options)
+            .interact();
+            
+        match selection {
+            Ok(0) => {
+                // User chose to proceed
+                info!("User confirmed large download of {}", formatted_size);
+                true
+            },
+            Ok(1) => {
+                // User chose to adjust limits
+                info!("Reconfiguring size limits...");
+                self.configure_size_limits();
+                
+                // Check if the new limits would allow the download
+                let total_size_in_gb = total_size_kb as f64 / (1024.0 * 1024.0);
+                let new_limit_in_gb = self.total_size_cap as f64 / (1024.0 * 1024.0);
+                
+                if total_size_in_gb > new_limit_in_gb {
+                    info!("Total download size ({:.2} GB) still exceeds configured limit ({:.2} GB)",
+                          total_size_in_gb, new_limit_in_gb);
+                          
+                    // Ask if they want to proceed anyway
+                    let proceed_anyway = Confirm::new()
+                        .with_prompt(format!(
+                            "Download size ({:.2} GB) still exceeds your limit ({:.2} GB). Proceed anyway?",
+                            total_size_in_gb, new_limit_in_gb
+                        ))
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false);
+                        
+                    proceed_anyway
+                } else {
+                    // New limits are sufficient
+                    info!("Adjusted limits now accommodate the download size");
+                    true
+                }
+            },
+            Ok(2) | _ => {
+                // User chose to cancel or dialog error
+                info!("User cancelled download due to large file size");
+                false
+            }
+        }
+    }
+    
+    /// Asks the user for confirmation before exiting
+    /// Returns true if the user wants to exit, false to continue
+    pub(crate) fn confirm_exit(&self, message: &str) -> bool {
+        let prompt = format!("{}\nDo you want to exit the program?", message);
+        
+        Confirm::new()
+            .with_prompt(prompt)
+            .default(true)
+            .interact()
+            .unwrap_or(true) // Default to true (exit) if dialog fails
     }
 
     /// Gets the total size (in KB) of every post image to be downloaded.

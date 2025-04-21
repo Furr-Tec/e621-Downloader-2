@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use anyhow::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 /// A builder that helps in making a new [ProgressStyle] for use.
@@ -32,10 +33,50 @@ impl ProgressStyleBuilder {
     ///
     /// * `msg_template`: The template to use.
     ///
-    /// returns: ProgressStyleBuilder
-    pub(crate) fn template(mut self, msg_template: &str) -> Self {
-        self.progress_style = self.progress_style.template(msg_template).unwrap();
-        self
+    /// returns: Result<ProgressStyleBuilder, anyhow::Error>
+    pub(crate) fn template(mut self, msg_template: &str) -> Result<Self> {
+        match self.progress_style.clone().template(msg_template) {
+            Ok(style) => {
+                self.progress_style = style;
+                Ok(self)
+            },
+            Err(err) => {
+                // Log the error and attempt to use a simpler template as fallback
+                warn!("Template error with '{}': {}. Using fallback template.", msg_template, err);
+                // Simplified fallback template without problematic fields
+                let fallback = "{spinner} [{elapsed_precise}] {bar} {pos}/{len}";
+                
+                match self.progress_style.clone().template(fallback) {
+                    Ok(style) => {
+                        self.progress_style = style;
+                        Ok(self)
+                    },
+                    Err(e) => {
+                        // If even the fallback fails, use default_bar
+                        error!("Fallback template also failed: {}. Using default bar.", e);
+                        self.progress_style = ProgressStyle::default_bar();
+                        Ok(self)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Creates a basic ProgressStyleBuilder with sensible defaults
+    /// This is a safer alternative when you just need a basic working style
+    pub(crate) fn create_simple() -> Self {
+        let mut builder = Self::default();
+        // Use a very basic template without any problematic fields
+        match builder.progress_style.clone().template("{spinner} [{elapsed_precise}] {bar} {pos}/{len}") {
+            Ok(style) => {
+                builder.progress_style = style;
+            },
+            Err(e) => {
+                error!("Failed to create simple template: {}. Using default bar.", e);
+                builder.progress_style = ProgressStyle::default_bar();
+            }
+        }
+        builder
     }
 
     /// Sets the progress style chars.
@@ -44,13 +85,12 @@ impl ProgressStyleBuilder {
     ///
     /// * `chars`: Progress chars to use.
     ///
-    /// returns: ProgressStyleBuilder
-    pub(crate) fn progress_chars(mut self, chars: &str) -> Self {
+    /// returns: Result<ProgressStyleBuilder, anyhow::Error>
+    pub(crate) fn progress_chars(mut self, chars: &str) -> Result<Self> {
         self.progress_style = self.progress_style.progress_chars(chars);
-        self
+        Ok(self)
     }
 
-    /// Builds and returns the new [ProgressStyle].
     pub(crate) fn build(self) -> ProgressStyle {
         self.progress_style
     }

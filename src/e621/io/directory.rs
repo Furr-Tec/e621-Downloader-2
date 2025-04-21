@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use sha2::{Sha512, Digest};
 use hex::encode as hex_encode;
 use serde::{Serialize, Deserialize};
-use indicatif::{ProgressBar, ProgressDrawTarget};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use crate::e621::tui::{ProgressBarBuilder, ProgressStyleBuilder};
 
 /// Represents a file entry in the hash database
@@ -149,10 +149,10 @@ impl DirectoryManager {
             // Create and configure progress bar for the first phase
             let phase1_progress = Arc::new(ProgressBarBuilder::new(0)
                 .style(
-                    ProgressStyleBuilder::default()
-                        .template("{spinner:.green} Phase 1: {wide_msg} | {elapsed_precise} | Found {pos} files")
-                        .progress_chars("=>-")
-                        .build()
+                      Self::create_progress_style(
+                          "{spinner:.green} Phase 1: {wide_msg} | {elapsed_precise} | Found {pos} files",
+                          "=>-"
+                      )
                 )
                 .draw_target(ProgressDrawTarget::stderr_with_hz(10))
                 .reset()
@@ -231,10 +231,10 @@ impl DirectoryManager {
             // Create and configure progress bar for the second phase
             let phase2_progress = ProgressBarBuilder::new(total_files as u64)
                 .style(
-                    ProgressStyleBuilder::default()
-                        .template("{spinner:.green} Phase 2: {wide_msg} | {elapsed_precise} | {bar:40.cyan/blue} {pos}/{len} | {per_sec}")
-                        .progress_chars("=>-")
-                        .build()
+                      Self::create_progress_style(
+                          "{spinner:.green} Phase 2: {wide_msg} | {elapsed_precise} | {bar:40.cyan/blue} {pos}/{len} | {per_sec}",
+                          "=>-"
+                      )
                 )
                 .draw_target(ProgressDrawTarget::stderr_with_hz(10))
                 .reset()
@@ -347,11 +347,30 @@ impl DirectoryManager {
     /// 2. The SHA-512 hash matches (when available)
     ///
     /// This method is kept for future configuration options that may allow users
-    /// to toggle verification strictness.
     pub(crate) fn set_strict_verification(&mut self, enabled: bool) {
         self.use_strict_verification = enabled;
         info!("SHA-512 strict verification {}", if enabled { "enabled" } else { "disabled" });
     }
+    
+    /// Creates a progress style with error handling
+    fn create_progress_style(template_str: &str, progress_chars: &str) -> ProgressStyle {
+        // Try to create styled progress bar with template
+        match ProgressStyleBuilder::default()
+            .template(template_str) {
+                Ok(builder) => match builder.progress_chars(progress_chars) {
+                    Ok(styled_builder) => styled_builder.build(),
+                    Err(e) => {
+                        error!("Failed to apply progress chars: {}. Using default style.", e);
+                        ProgressStyle::default_bar()
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to create progress style: {}. Using default style.", e);
+                    ProgressStyle::default_bar()
+                }
+            }
+    }
+    
     
     /// Fast recursive directory scanning using WalkDir
     /// This is an optimized method for quickly finding all files in a directory tree
