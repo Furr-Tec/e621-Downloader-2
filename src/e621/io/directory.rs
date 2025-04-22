@@ -190,41 +190,69 @@ impl DirectoryManager {
                 .build();
             let scan_start = Instant::now();
             bar.set_message(format!("Starting scan… {} files", total));
-            let mut done = already_db;
-            for (filename, path) in candidate_files {
-                // Only add those missing from DB
-                if !manager.downloaded_files.iter().any(|(f,_)| f == &filename) {
-                    match fs::read(&path) {
+            // Partition into new files needing hashing and those found in db
+            let mut files_to_hash: Vec<(String, PathBuf)> = Vec::new();
+            for (filename, path) in &candidate_files {
+                if !manager.downloaded_files.iter().any(|(f, _)| f == filename) {
+                    files_to_hash.push((filename.clone(), path.clone()));
+                }
+            }
+            let n_new = files_to_hash.len();
+            if n_new == 0 {
+                bar.finish_with_message(format!(
+                    "DB scan complete! No new files. {}/{} files known, skipped hashing.",
+                    already_db, total
+                ));
+            } else {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                use rayon::prelude::*;
+                let completed = Arc::new(AtomicUsize::new(0));
+                let milestone = 100usize;
+                // Parallel hash computation
+                let new_results: Vec<(String, Option<String>)> = files_to_hash.par_iter().map(|(filename, path)| {
+                    let hash = match fs::read(path) {
                         Ok(data) => {
                             let mut hasher = Sha512::new();
                             hasher.update(&data);
-                            let hash_hex = format!("{:x}", hasher.finalize());
-                            info!("Detected new file on disk, adding to hash DB: {}", filename);
-                            manager.downloaded_files.insert((filename.clone(), Some(hash_hex)));
-                            let db = HashDatabase::from_hash_set(&manager.downloaded_files);
-                            if let Err(e) = db.save(&hash_db_path) {
-                                error!("Failed to incrementally update hash DB after file: {}: {}", filename, e);
-                            }
+                            Some(format!("{:x}", hasher.finalize()))
                         }
-                        Err(e) => warn!("Could not hash new file '{}': {}", filename, e),
+                        Err(e) => {
+                            warn!("Could not hash file '{}': {}", filename, e);
+                            None
+                        }
+                    };
+                    let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                    if done == 1 || done % milestone == 0 || done == n_new {
+                        let elapsed = scan_start.elapsed();
+                        let per_file = elapsed.as_secs_f64() / (done as f64);
+                        let left = n_new.saturating_sub(done);
+                        let eta = left as f64 * per_file;
+                        let eta_secs = eta.round() as u64;
+                        let eta_fmt = format!("{:02}:{:02}:{:02}", eta_secs / 3600, (eta_secs % 3600) / 60, eta_secs % 60);
+                        bar.set_message(format!(
+                            "New files: {}/{} hashed, {} left, ETA: {}",
+                            done, n_new, left, eta_fmt
+                        ));
+                        if done % (milestone * 10) == 0 || done == n_new {
+                            info!("Milestone: {} new files hashed, {} left, ETA: {}",
+                                done, left, eta_fmt);
+                        }
                     }
+                    bar.inc(1);
+                    (filename.clone(), hash)
+                }).collect();
+                for (filename, hash) in new_results {
+                    manager.downloaded_files.insert((filename, hash));
                 }
-                done += 1;
-                if done == 1 || done % 20 == 0 || done == total {
-                    let elapsed = scan_start.elapsed();
-                    let per_file = if done > already_db { elapsed.as_secs_f64() / (done - already_db) as f64 } else { 0.0 };
-                    let left = total.saturating_sub(done);
-                    let eta = left as f64 * per_file;
-                    let eta_secs = eta.round() as u64;
-                    let eta_fmt = format!("{:02}:{:02}:{:02}", eta_secs / 3600, (eta_secs % 3600) / 60, eta_secs % 60);
-                    bar.set_message(format!(
-                        "{} of {} scanned, {} left, ETA: {}",
-                        done, total, left, eta_fmt
-                    ));
+                bar.finish_with_message(format!(
+                    "DB scan complete! {} new files hashed ({} total in DB), Total time: {:.2?}",
+                    n_new, manager.downloaded_files.len(), scan_start.elapsed()
+                ));
+                let db = HashDatabase::from_hash_set(&manager.downloaded_files);
+                if let Err(e) = db.save(&hash_db_path) {
+                    error!("Failed to persist hash database after scan: {}", e);
                 }
-                bar.inc(1);
             }
-            bar.finish_with_message(format!("DB scan complete! {}/{} files, Total time: {:.2?}", done, total, scan_start.elapsed()));
             // Remove any DB entry no longer present on disk
             let to_remove: Vec<_> = manager.downloaded_files
                 .iter()
