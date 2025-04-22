@@ -207,9 +207,10 @@ impl DirectoryManager {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 use rayon::prelude::*;
                 let completed = Arc::new(AtomicUsize::new(0));
-                let milestone = 100usize;
-                // Parallel hash computation
-                let new_results: Vec<(String, Option<String>)> = files_to_hash.par_iter().map(|(filename, path)| {
+                let milestone = 500usize;
+                let results = Arc::new(Mutex::new(Vec::with_capacity(n_new)));
+                let manager_arc = Arc::new(Mutex::new(&mut manager));
+                files_to_hash.par_iter().for_each(|(filename, path)| {
                     let hash = match fs::read(path) {
                         Ok(data) => {
                             let mut hasher = Sha512::new();
@@ -221,8 +222,21 @@ impl DirectoryManager {
                             None
                         }
                     };
+                    {
+                        let mut results_guard = results.lock().unwrap();
+                        results_guard.push((filename.clone(), hash));
+                    }
                     let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
                     if done == 1 || done % milestone == 0 || done == n_new {
+                        // Flush DB with results, thread-safe
+                        let mut manager_guard = manager_arc.lock().unwrap();
+                        for (f, h) in results.lock().unwrap().drain(..) {
+                            manager_guard.downloaded_files.insert((f, h));
+                        }
+                        let db = HashDatabase::from_hash_set(&manager_guard.downloaded_files);
+                        if let Err(e) = db.save(&manager_guard.hash_db_path) {
+                            error!("Failed DB flush during milestone: {}", e);
+                        }
                         let elapsed = scan_start.elapsed();
                         let per_file = elapsed.as_secs_f64() / (done as f64);
                         let left = n_new.saturating_sub(done);
@@ -233,23 +247,24 @@ impl DirectoryManager {
                             "New files: {}/{} hashed, {} left, ETA: {}",
                             done, n_new, left, eta_fmt
                         ));
-                        if done % (milestone * 10) == 0 || done == n_new {
+                        if done % (milestone * 2) == 0 || done == n_new {
                             info!("Milestone: {} new files hashed, {} left, ETA: {}",
                                 done, left, eta_fmt);
                         }
                     }
                     bar.inc(1);
-                    (filename.clone(), hash)
-                }).collect();
-                for (filename, hash) in new_results {
-                    manager.downloaded_files.insert((filename, hash));
+                });
+                // Any remaining (less than a milestone) results
+                let mut manager_guard = manager_arc.lock().unwrap();
+                for (f, h) in results.lock().unwrap().drain(..) {
+                    manager_guard.downloaded_files.insert((f, h));
                 }
                 bar.finish_with_message(format!(
                     "DB scan complete! {} new files hashed ({} total in DB), Total time: {:.2?}",
-                    n_new, manager.downloaded_files.len(), scan_start.elapsed()
+                    n_new, manager_guard.downloaded_files.len(), scan_start.elapsed()
                 ));
-                let db = HashDatabase::from_hash_set(&manager.downloaded_files);
-                if let Err(e) = db.save(&hash_db_path) {
+                let db = HashDatabase::from_hash_set(&manager_guard.downloaded_files);
+                if let Err(e) = db.save(&manager_guard.hash_db_path) {
                     error!("Failed to persist hash database after scan: {}", e);
                 }
             }
