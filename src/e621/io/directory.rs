@@ -1,5 +1,6 @@
 ﻿use std::path::{Path, PathBuf};
 use std::fs::{self, File};
+use sha2::{Sha512, Digest};
 use std::io::Read;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -9,7 +10,6 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use walkdir::WalkDir;
 use memmap2::Mmap;
-use sha2::{Sha512, Digest};
 use hex::encode as hex_encode;
 use serde::{Serialize, Deserialize};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -144,6 +144,81 @@ impl DirectoryManager {
             }
         }
         
+        // Always resync the hash DB with actual downloaded files found
+        // This ensures new/deleted files are picked up even if DB was loaded.
+        {
+            let mut disk_files = HashSet::new();
+            let subdirs = [&artists, &tags, &pools];
+            for dir in subdirs.iter() {
+                if dir.exists() {
+                    for entry in walkdir::WalkDir::new(dir) {
+                        if let Ok(e) = entry {
+                            let path = e.path();
+                            if path.is_file() {
+                                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                                    disk_files.insert(filename.to_owned());
+                                    // Check if this is a new file not in the hash list
+                                    if !manager.downloaded_files.iter().any(|(f,_)| f == filename) {
+                                        match fs::read(path) {
+                                            Ok(data) => {
+                                                let mut hasher = Sha512::new();
+                                                hasher.update(&data);
+                                                let hash_hex = format!("{:x}", hasher.finalize());
+                                                info!("Detected new file on disk, adding to hash DB: {}", filename);
+                                                manager.downloaded_files.insert((filename.to_owned(), Some(hash_hex)));
+                                            }
+                                            Err(e) => warn!("Could not hash new file '{}': {}", filename, e),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Remove any DB entry no longer present on disk
+            let to_remove: Vec<_> = manager.downloaded_files
+                .iter()
+                .filter(|(f,_)| !disk_files.contains(f))
+                .cloned()
+                .collect();
+            for r in &to_remove {
+                info!("Removing deleted file '{}' from hash DB", r.0);
+                manager.downloaded_files.remove(r);
+            }
+            // Hash any files that are present but missing hash value
+            let mut missing_hash: Vec<_> = vec![];
+            for (f, h) in manager.downloaded_files.iter() {
+                if h.is_none() && disk_files.contains(f) {
+                    missing_hash.push(f.clone());
+                }
+            }
+            for f in &missing_hash {
+                let mut full_path = None;
+                for dir in subdirs.iter() {
+                    let cand = dir.join(&f);
+                    if cand.exists() { full_path = Some(cand); break; }
+                }
+                if let Some(path) = full_path {
+                    match fs::read(&path) {
+                        Ok(data) => {
+                            let mut hasher = Sha512::new();
+                            hasher.update(&data);
+                            let hx = format!("{:x}", hasher.finalize());
+                            info!("Filling missing hash for: {}", f);
+                            manager.downloaded_files.replace((f.to_string(), Some(hx)));
+                        },
+                        Err(e) => warn!("Could not hash file '{}': {}", f, e)
+                    }
+                }
+            }
+            if !to_remove.is_empty() || !missing_hash.is_empty() {
+                // Re-save hash DB if any changes (add, remove, fill missing hashes)
+                let db = HashDatabase::from_hash_set(&manager.downloaded_files);
+                db.save(&hash_db_path)?;
+                info!("Hash DB updated to reflect disk state.");
+            }
+        }
         // If database wasn't loaded, scan directories
         if !loaded_from_db {
             // Create and configure progress bar for the first phase
