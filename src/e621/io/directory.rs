@@ -346,47 +346,30 @@ impl DirectoryManager {
                 .collect();
                 
             let results = Arc::new(Mutex::new(HashSet::new()));
-                
-            // Process each chunk in parallel
-            hash_pool.scope(|s| {
-                for chunk in files_chunks {
-                    let results_clone = Arc::clone(&results);
-                    let progress_clone = phase2_progress.clone();
-                    
-                    s.spawn(move |_| {
-                        // Calculate hashes for each file in the chunk
-                        let chunk_results: Vec<(String, Option<String>)> = chunk.par_iter()
-                            .map(|path| {
-                                let file_name = path.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-                                    
-                                // Update progress
-                                progress_clone.set_message(format!("Hashing: {}", file_name));
-                                
-                                // Calculate hash
-                                let hash = match Self::optimized_calculate_hash(path) {
-                                    Ok(hash) => Some(hash),
-                                    Err(e) => {
-                                        warn!("Failed to calculate hash for {}: {}", path.display(), e);
-                                        None
-                                    }
-                                };
-                                
-                                // Increment progress
-                                progress_clone.inc(1);
-                                
-                                (file_name, hash)
-                            })
-                            .collect();
-                            
-                        // Merge chunk results into the main results set
-                        let mut results_guard = results_clone.lock().unwrap();
-                        for result in chunk_results {
-                            results_guard.insert(result);
+            // Collect all chunks to hash in parallel using rayon at outer level (max concurrency)
+            let all_files_for_hash: Vec<PathBuf> = all_files.clone();
+            all_files_for_hash.par_chunks(chunk_size).for_each(|chunk| {
+                // All hashing for this chunk done here, lock only at insert for results
+                let chunk_results: Vec<(String, Option<String>)> = chunk.iter().map(|path| {
+                    let file_name = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    // Update progress (atomic, minimal hold)
+                    phase2_progress.set_message(format!("Hashing: {}", file_name));
+                    let hash = match Self::optimized_calculate_hash(path) {
+                        Ok(hash) => Some(hash),
+                        Err(e) => {
+                            warn!("Failed to calculate hash for {}: {}", path.display(), e);
+                            None
                         }
-                    });
+                    };
+                    phase2_progress.inc(1);
+                    (file_name, hash)
+                }).collect();
+                let mut results_guard = results.lock().unwrap();
+                for result in chunk_results {
+                    results_guard.insert(result);
                 }
             });
                 
