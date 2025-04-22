@@ -315,7 +315,7 @@ impl DirectoryManager {
             phase1_progress.finish_with_message(format!("Phase 1 complete! Found {} files", total_files));
             // PHASE 2: Calculate hashes for all files
             info!("Phase 2: Calculating SHA-512 hashes for {} files...", total_files);
-            
+
             // Create and configure progress bar for the second phase
             let phase2_progress = ProgressBarBuilder::new(total_files as u64)
                 .style(
@@ -328,34 +328,38 @@ impl DirectoryManager {
                 .reset()
                 .steady_tick(Duration::from_millis(100))
                 .build();
-                
+
             phase2_progress.set_message("Calculating hashes...");
-            
-            // Create optimized thread pool for hash calculations
-            let hash_threads = num_cpus::get().max(4); // Use at least 4 threads for hash calculations
-            let hash_pool = ThreadPoolBuilder::new()
-                .num_threads(hash_threads)
-                .thread_name(|i| format!("hash-worker-{}", i))
-                .build()?;
-                
-            // Process files in chunks to avoid excessive memory usage
-            let chunk_size = 1000.min(total_files);
-            let files_chunks: Vec<Vec<PathBuf>> = all_files
-                .chunks(chunk_size)
-                .map(|chunk| chunk.to_vec())
-                .collect();
-                
+
+            // Dynamically decide thread count, chunk size, and shuffle/size-sort strategy
+            let hash_threads = num_cpus::get();
+
+            // Optionally prioritize largest files to maximize core utilization on SSD/NVMe
+            let mut all_files_for_hash = all_files.clone();
+            all_files_for_hash.sort_unstable_by_key(|p| {
+                fs::metadata(p).map(|m| -(m.len() as i64)).unwrap_or(0)
+            });
+
+            // Dynamic chunk size logic
+            let chunk_size = if total_files < 8_000 {
+                1000
+            } else if total_files < 30_000 {
+                2000
+            } else {
+                (total_files / hash_threads.max(1)).max(1000)
+            };
+
+            // Optionally shuffle for IO balancing:
+            // use rand::{thread_rng, seq::SliceRandom};
+            // all_files_for_hash.shuffle(&mut thread_rng());
+
             let results = Arc::new(Mutex::new(HashSet::new()));
-            // Collect all chunks to hash in parallel using rayon at outer level (max concurrency)
-            let all_files_for_hash: Vec<PathBuf> = all_files.clone();
             all_files_for_hash.par_chunks(chunk_size).for_each(|chunk| {
-                // All hashing for this chunk done here, lock only at insert for results
                 let chunk_results: Vec<(String, Option<String>)> = chunk.iter().map(|path| {
                     let file_name = path.file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    // Update progress (atomic, minimal hold)
                     phase2_progress.set_message(format!("Hashing: {}", file_name));
                     let hash = match Self::optimized_calculate_hash(path) {
                         Ok(hash) => Some(hash),
