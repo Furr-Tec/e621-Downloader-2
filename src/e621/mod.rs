@@ -25,7 +25,6 @@ pub(crate) mod sender;
 pub(crate) mod tui;
 
 /// Helper struct to hold collection information for downloading
-/// Helper struct to hold collection information for downloading
 /// Optimized to use heap allocation and avoid excessive stack usage
 #[derive(Debug)]
 struct CollectionInfo {

@@ -14,7 +14,8 @@ use hex::encode as hex_encode;
 use serde::{Serialize, Deserialize};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use crate::e621::tui::{ProgressBarBuilder, ProgressStyleBuilder};
-
+use crate::e621::io::file_metadata::{get_file_metadata, file_metadata_changed, FileMeta};
+mod walk; // Declare the walk submodule
 /// Represents a file entry in the hash database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HashDatabaseEntry {
