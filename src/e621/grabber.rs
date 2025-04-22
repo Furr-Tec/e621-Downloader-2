@@ -101,7 +101,13 @@ impl NewVec<Vec<PostEntry>> for GrabbedPost {
                 }
                 // Check if this file has been downloaded before
                 // Use hash-based duplicate detection when available
-                post.set_is_new(!dir_manager.is_duplicate(&post.name, post.sha512_hash()));
+                let relpath = if let Some(dir) = post.save_directory() {
+                    let file_path = dir.join(post.name());
+                    file_path.strip_prefix(&Config::get().download_directory()).unwrap_or(&file_path).to_string_lossy().to_string()
+                } else {
+                    post.name.clone()
+                };
+                post.set_is_new(!dir_manager.is_duplicate(&relpath, post.sha512_hash()));
                 post
             })
             .collect()
@@ -120,7 +126,13 @@ impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
                 }
                 // Check if this file has been downloaded before
                 // Use hash-based duplicate detection when available
-                post.set_is_new(!dir_manager.is_duplicate(&post.name, post.sha512_hash()));
+                let relpath = if let Some(dir) = post.save_directory() {
+                    let file_path = dir.join(post.name());
+                    file_path.strip_prefix(&Config::get().download_directory()).unwrap_or(&file_path).to_string_lossy().to_string()
+                } else {
+                    post.name.clone()
+                };
+                post.set_is_new(!dir_manager.is_duplicate(&relpath, post.sha512_hash()));
                 post
             })
             .collect()

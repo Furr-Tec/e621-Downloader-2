@@ -671,7 +671,9 @@ impl E621WebConnector {
                             match hash_result {
                                 Ok(hash) => {
                                     // Store hash with the downloaded file for future verification
-                                    dir_manager.mark_file_downloaded_with_hash_simple(post.name(), hash.clone());
+                                    let relpath = save_dir.join(post.name());
+                                    let relpath_str = relpath.strip_prefix(Config::get().download_directory()).unwrap_or(&relpath).to_string_lossy();
+                                    dir_manager.mark_file_downloaded_with_hash_simple(&relpath_str, hash.clone());
                                     trace!("Stored hash {} for post {}", hash, post.name());
 
                                     // Show success message with file counts
@@ -683,7 +685,9 @@ impl E621WebConnector {
                                 Err(e) => {
                                     // Hash calculation failed but file was saved
                                     warn!("Failed to calculate hash for {}: {}", file_path_str, e);
-                                    dir_manager.mark_file_downloaded(post.name());
+                                    let relpath = save_dir.join(post.name());
+                                    let relpath_str = relpath.strip_prefix(Config::get().download_directory()).unwrap_or(&relpath).to_string_lossy();
+                                    dir_manager.mark_file_downloaded(&relpath_str);
 
                                     // Show warning message with file counts
                                     let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;

@@ -1,0 +1,42 @@
+﻿# Enable all standard lints and warn on any Clippy warning
+warns = ["clippy::all"]
+deny = [
+    "clippy::pedantic",          # Enforces strict stylistic best practices
+    "clippy::nursery",           # Enables experimental but useful lints
+    "clippy::unwrap_used",       # Prevents unguarded unwrap(), expect()
+    "clippy::panic",             # Discourages direct panic! usage in library code
+    "clippy::clone_on_ref_ptr",  # Prevents unnecessary clone()s on Arc/Rc
+    "clippy::dbg_macro",         # Disallow dbg! in production code
+    "clippy::todo",              # Disallow todo! macro usage
+    "clippy::unimplemented",     # Disallow unimplemented! macro usage
+    "clippy::wildcard_enum_match_arms", # Require exhaustive and named enum arms
+    "clippy::indexing_slicing",  # Prevent unchecked indexing (slice[i])
+    "clippy::unwrap_in_result",  # Prevent unwrapping inside error-returning functions
+    "clippy::missing_docs_in_private_items", # Enforce documentation even on private functions
+]
+
+# Allow some cases that may be useful during prototyping or internal APIs
+allow = [
+    "clippy::module_name_repetitions", # Allows natural naming like mod::ModStruct
+    "clippy::similar_names",           # Temporarily allow if clearly scoped
+]
+
+# Enforce coding clarity and correctness
+warn = [
+    "clippy::cast_possible_truncation",
+    "clippy::cast_lossless",
+    "clippy::cast_precision_loss",
+    "clippy::cast_sign_loss",
+    "clippy::float_cmp",               # Warn on direct floating-point equality
+    "clippy::manual_assert",           # Prefer assert_eq! and assert_ne!
+    "clippy::redundant_clone",
+    "clippy::needless_pass_by_value",
+    "clippy::needless_return",
+    "clippy::semicolon_if_nothing_returned",
+    "clippy::explicit_into_iter_loop",
+    "clippy::explicit_iter_loop",
+    "clippy::manual_map",              # Use `.map()` instead of match-wrapping
+]
+
+# Miscellaneous options
+msrv = "1.76.0"        # Set minimum supported Rust version (adjust as needed)
