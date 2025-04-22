@@ -157,6 +157,8 @@ impl DirectoryManager {
         {
             let mut disk_files = HashSet::new();
             let subdirs = [&artists, &tags, &pools];
+            // Gather all candidate files up front for correct ETA math
+            let mut candidate_files = Vec::new();
             for dir in subdirs.iter() {
                 if dir.exists() {
                     for entry in walkdir::WalkDir::new(dir) {
@@ -164,31 +166,65 @@ impl DirectoryManager {
                             let path = e.path();
                             if path.is_file() {
                                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                                    candidate_files.push((filename.to_owned(), path.to_path_buf()));
                                     disk_files.insert(filename.to_owned());
-                                    // Check if this is a new file not in the hash list
-                                    if !manager.downloaded_files.iter().any(|(f,_)| f == filename) {
-                                        match fs::read(path) {
-                                            Ok(data) => {
-                                                let mut hasher = Sha512::new();
-                                                hasher.update(&data);
-                                                let hash_hex = format!("{:x}", hasher.finalize());
-                                                info!("Detected new file on disk, adding to hash DB: {}", filename);
-                                                manager.downloaded_files.insert((filename.to_owned(), Some(hash_hex)));
-                                                // Immediately flush DB for every new file, for crash integrity
-                                                let db = HashDatabase::from_hash_set(&manager.downloaded_files);
-                                                if let Err(e) = db.save(&hash_db_path) {
-                                                    error!("Failed to incrementally update hash DB after file: {}: {}", filename, e);
-                                                }
-                                            }
-                                            Err(e) => warn!("Could not hash new file '{}': {}", filename, e),
-                                        }
-                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            let total = candidate_files.len();
+            let already_db = manager.downloaded_files.len();
+            use std::time::{Instant};
+            let bar = ProgressBarBuilder::new(total as u64)
+                .style(
+                    Self::create_progress_style(
+                        "{spinner:.green} DB SCAN: {wide_msg} | {elapsed_precise} | {bar:40.red/blue} {pos}/{len} | {per_sec}",
+                        "=>-"
+                    )
+                )
+                .draw_target(ProgressDrawTarget::stderr_with_hz(5))
+                .reset()
+                .steady_tick(Duration::from_millis(100))
+                .build();
+            let scan_start = Instant::now();
+            bar.set_message(format!("Starting scan… {} files", total));
+            let mut done = already_db;
+            for (filename, path) in candidate_files {
+                // Only add those missing from DB
+                if !manager.downloaded_files.iter().any(|(f,_)| f == &filename) {
+                    match fs::read(&path) {
+                        Ok(data) => {
+                            let mut hasher = Sha512::new();
+                            hasher.update(&data);
+                            let hash_hex = format!("{:x}", hasher.finalize());
+                            info!("Detected new file on disk, adding to hash DB: {}", filename);
+                            manager.downloaded_files.insert((filename.clone(), Some(hash_hex)));
+                            let db = HashDatabase::from_hash_set(&manager.downloaded_files);
+                            if let Err(e) = db.save(&hash_db_path) {
+                                error!("Failed to incrementally update hash DB after file: {}: {}", filename, e);
+                            }
+                        }
+                        Err(e) => warn!("Could not hash new file '{}': {}", filename, e),
+                    }
+                }
+                done += 1;
+                if done == 1 || done % 20 == 0 || done == total {
+                    let elapsed = scan_start.elapsed();
+                    let per_file = if done > already_db { elapsed.as_secs_f64() / (done - already_db) as f64 } else { 0.0 };
+                    let left = total.saturating_sub(done);
+                    let eta = left as f64 * per_file;
+                    let eta_secs = eta.round() as u64;
+                    let eta_fmt = format!("{:02}:{:02}:{:02}", eta_secs / 3600, (eta_secs % 3600) / 60, eta_secs % 60);
+                    bar.set_message(format!(
+                        "{} of {} scanned, {} left, ETA: {}",
+                        done, total, left, eta_fmt
+                    ));
+                }
+                bar.inc(1);
+            }
+            bar.finish_with_message(format!("DB scan complete! {}/{} files, Total time: {:.2?}", done, total, scan_start.elapsed()));
             // Remove any DB entry no longer present on disk
             let to_remove: Vec<_> = manager.downloaded_files
                 .iter()
@@ -329,6 +365,8 @@ impl DirectoryManager {
                 .steady_tick(Duration::from_millis(100))
                 .build();
 
+            use std::time::Instant;
+            let scan_start = Instant::now();
             phase2_progress.set_message("Calculating hashes...");
 
             // Dynamically decide thread count, chunk size, and shuffle/size-sort strategy
@@ -354,13 +392,17 @@ impl DirectoryManager {
             // all_files_for_hash.shuffle(&mut thread_rng());
 
             let results = Arc::new(Mutex::new(HashSet::new()));
+            let progress_bar = &phase2_progress;
+            let total_files = all_files_for_hash.len();
+            let mut processed_counter = Arc::new(AtomicUsize::new(0));
+
             all_files_for_hash.par_chunks(chunk_size).for_each(|chunk| {
+                let counter = Arc::clone(&processed_counter);
                 let chunk_results: Vec<(String, Option<String>)> = chunk.iter().map(|path| {
                     let file_name = path.file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    phase2_progress.set_message(format!("Hashing: {}", file_name));
                     let hash = match Self::optimized_calculate_hash(path) {
                         Ok(hash) => Some(hash),
                         Err(e) => {
@@ -368,7 +410,20 @@ impl DirectoryManager {
                             None
                         }
                     };
-                    phase2_progress.inc(1);
+                    let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    if done == 1 || done % 20 == 0 || done == total_files {
+                        let elapsed = scan_start.elapsed();
+                        let per_file = elapsed.as_secs_f64() / done as f64;
+                        let left = total_files.saturating_sub(done);
+                        let eta = left as f64 * per_file;
+                        let eta_secs = eta.round() as u64;
+                        let eta_fmt = format!("{:02}:{:02}:{:02}", eta_secs / 3600, (eta_secs % 3600) / 60, eta_secs % 60);
+                        progress_bar.set_message(format!(
+                            "{}/{} hashed — {} left — ETA {}",
+                            done, total_files, left, eta_fmt
+                        ));
+                    }
+                    progress_bar.inc(1);
                     (file_name, hash)
                 }).collect();
                 let mut results_guard = results.lock().unwrap();
@@ -382,9 +437,15 @@ impl DirectoryManager {
                 .into_inner()
                 .expect("Failed to unwrap Mutex");
             
-            phase2_progress.finish_with_message(format!("Phase 2 complete! Calculated hashes for {} files, {} successful", 
-                files.len(), 
-                files.iter().filter(|(_, hash)| hash.is_some()).count()));
+            let total_time = scan_start.elapsed();
+            let speed = if total_time.as_secs() > 0 { files.len() as u64 / total_time.as_secs().max(1) } else { files.len() as u64 };
+            phase2_progress.finish_with_message(format!(
+                "Phase 2 complete! {}/{} hashed successfully | Total time: {:.2?} | Throughput: {}/s",
+                files.iter().filter(|(_, hash)| hash.is_some()).count(),
+                files.len(),
+                total_time,
+                speed,
+            ));
                 
             // Save the hash database for future use
             let hash_db = HashDatabase::from_hash_set(&files);
