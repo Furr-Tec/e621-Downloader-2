@@ -142,6 +142,14 @@ impl DirectoryManager {
                     warn!("Failed to load hash database, will scan directories instead: {}", e);
                 }
             }
+        } else {
+            // Hash database is missing, create and persist it immediately for integrity.
+            info!("hash_database.json does not exist; creating new hash database.");
+            let db = HashDatabase { entries: vec![] };
+            if let Err(e) = db.save(&hash_db_path) {
+                error!("Failed to create empty hash database: {}", e);
+            }
+            manager.downloaded_files = db.to_hash_set();
         }
         
         // Always resync the hash DB with actual downloaded files found
@@ -166,6 +174,11 @@ impl DirectoryManager {
                                                 let hash_hex = format!("{:x}", hasher.finalize());
                                                 info!("Detected new file on disk, adding to hash DB: {}", filename);
                                                 manager.downloaded_files.insert((filename.to_owned(), Some(hash_hex)));
+                                                // Immediately flush DB for every new file, for crash integrity
+                                                let db = HashDatabase::from_hash_set(&manager.downloaded_files);
+                                                if let Err(e) = db.save(&hash_db_path) {
+                                                    error!("Failed to incrementally update hash DB after file: {}: {}", filename, e);
+                                                }
                                             }
                                             Err(e) => warn!("Could not hash new file '{}': {}", filename, e),
                                         }
@@ -867,11 +880,15 @@ impl DirectoryManager {
     pub(crate) fn mark_file_downloaded_with_hash_simple(&mut self, file_name: &str, hash: String) {
         trace!("Adding file '{}' with SHA-512 hash", file_name);
         self.downloaded_files.insert((file_name.to_string(), Some(hash)));
-        // Database update is deferred to batch completion
+        // Immediate DB update for atomicity/regression prevention
+        let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
+        if let Err(e) = hash_db.save(&self.hash_db_path) {
+            warn!("Failed to update hash database after adding file: {}", e);
+        }
     }
 
     /// Explicitly saves the current state of the hash database to disk
-    /// This method should be called after batch operations that use mark_file_downloaded_with_hash_simple
+    /// This method can be called at the end of session for reconciliation only.
     pub(crate) fn save_hash_database(&self) -> Result<()> {
         trace!("Saving hash database to disk...");
         
