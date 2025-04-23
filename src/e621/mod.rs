@@ -482,6 +482,9 @@ impl E621WebConnector {
                 .map(|info| info.new_files_count())
                 .sum();
 
+            // Set progress bar total to exact number of files to be downloaded (never over- or under-count)
+            self.progress_bar = ProgressBar::new(new_post_count as u64);
+
             // Confirm with user if download size is large
             if !self.confirm_large_download(length, new_post_count) {
                 info!("Download cancelled by user.");
@@ -719,6 +722,7 @@ impl E621WebConnector {
                     };
                     if is_dup {
                         update_progress("Duplicate");
+                        drop(progress_bar);
                         return;
                     }
                     update_progress("Downloading");
@@ -731,6 +735,7 @@ impl E621WebConnector {
                                 post.name()
                             );
                             update_progress("Error: No directory");
+                            drop(progress_bar);
                             return;
                         }
                     };
@@ -741,6 +746,7 @@ impl E621WebConnector {
                         error!("Could not create directory for images: {}", err);
                         error!("Path: {}", path_str);
                         update_progress("Error: Bad directory path");
+                        drop(progress_bar);
                         return;
                     }
                     let file_path_str = file_path.to_string_lossy();
@@ -784,9 +790,14 @@ impl E621WebConnector {
                             update_progress("Error: Download failed");
                         }
                     }
+                    // Explicitly drop the progress bar clone so thread does not outlive intended scope
+                    drop(progress_bar);
                 }); // s.spawn
             } // for post in posts
         }); // pool.scope
+
+        // Finish the progress bar to prevent further status updates
+        progress_bar.finish_with_message("Done");
 
         // No more batch Vec or manual batch tracking is necessary here. Clean up and trace log.
         trace!("Collection {} is finished downloading...", collection_info.name);

@@ -428,10 +428,10 @@ impl RequestSender {
     /// * `page`: The page to search for.
     ///
     /// returns: BulkPostEntry
-    pub(crate) fn bulk_search(&self, searching_tag: &str, page: u16) -> BulkPostEntry {
+    pub(crate) fn bulk_search(&self, searching_tag: &str, page: u16) -> Result<BulkPostEntry, anyhow::Error> {
         debug!("Downloading page {page} of tag {searching_tag}");
 
-        self.check_response(
+        let response = self.check_response(
             self.client
                 .get_with_auth(&self.urls.lock().unwrap()["posts"])
                 .query(&[
@@ -440,16 +440,29 @@ impl RequestSender {
                     ("limit", &320.to_string()),
                 ])
                 .send(),
-        )
-        .json()
-        .with_context(|| {
-            error!(
-                "Unable to deserialize json to \"{}\"!",
-                type_name::<Vec<PostEntry>>()
-            );
-            "Failed to perform bulk search...".to_string()
-        })
-        .unwrap()
+        );
+        let json: BulkPostEntry = response
+            .json()
+            .with_context(|| {
+                error!(
+                    "Unable to deserialize json to \"{}\"!",
+                    type_name::<BulkPostEntry>()
+                );
+                "Failed to perform bulk search...".to_string()
+            })?;
+        Ok(json)
+    }
+
+    /// Handles a bulk post search with error propagation.
+    /// Returns an empty vector if the API response is empty or invalid, but never panics.
+    pub(crate) fn safe_bulk_post_search(&self, searching_tag: &str, page: u16) -> BulkPostEntry {
+        match self.bulk_search(searching_tag, page) {
+            Ok(entry) => entry,
+            Err(e) => {
+                error!("Bulk post search failed: {}", e);
+                BulkPostEntry::default()
+            }
+        }
     }
 
     /// Gets tags by their name.
@@ -510,22 +523,11 @@ impl RequestSender {
             }
         }
     }
-}
+
     
 
-    /// Queries aliases and returns response.
-    ///
-    /// # Arguments
-    ///
-    /// * `tag`: The alias to search for.
-    ///
-    /// returns: Option<Vec<AliasEntry, Global>>
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// 
-    /// ```
+
+}
 
 impl Clone for RequestSender {
     fn clone(&self) -> Self {

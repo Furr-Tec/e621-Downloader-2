@@ -558,7 +558,7 @@ impl Grabber {
         let mut page = 1;
 
         loop {
-            let mut searched_posts = self.request_sender.bulk_search(searching_tag, page).posts;
+             let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page).posts;
             if searched_posts.is_empty() {
                 break;
             }
@@ -580,7 +580,7 @@ impl Grabber {
         invalid_posts: &mut u16,
     ) {
         for page in 1..POST_SEARCH_LIMIT {
-            let mut searched_posts = self.request_sender.bulk_search(searching_tag, page as u16).posts;
+             let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page as u16).posts;
             if searched_posts.is_empty() {
                 break;
             }
