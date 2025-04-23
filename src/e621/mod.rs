@@ -706,8 +706,9 @@ impl E621WebConnector {
                     
                     // Helper closure for progress updates and increments
                     let update_progress = |status: &str| {
-                        let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        progress_bar.set_message(format!("[{}/{}] {}: {}", count, new_files, status, filename));
+                        let current = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let display_count = std::cmp::min(current, new_files);
+                        progress_bar.set_message(format!("[{}/{}] {}: {}", display_count, new_files, status, filename));
                         progress_bar.inc(post.file_size() as u64);
                     };
                     

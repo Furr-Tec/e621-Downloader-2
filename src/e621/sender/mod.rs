@@ -199,6 +199,37 @@ impl RequestSender {
 
 
 impl RequestSender {
+    /// Queries aliases and returns response.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag`: The alias to search for.
+    ///
+    /// returns: Option<Vec<AliasEntry, Global>>
+    pub(crate) fn query_aliases(&self, tag: &str) -> Option<Vec<AliasEntry>> {
+        let result = self
+            .check_response(
+                self.client
+                    .get(&self.urls.lock().unwrap()["alias"])
+                    .query(&[
+                        ("commit", "Search"),
+                        ("search[name_matches]", tag),
+                        ("search[order]", "status"),
+                    ])
+                    .send(),
+            )
+            .json::<Vec<AliasEntry>>();
+
+        match result {
+            Ok(e) => Some(e),
+            Err(e) => {
+                trace!("No alias was found for {tag}...");
+                trace!("Printing trace message for why None was returned...");
+                trace!("{}", e.to_string());
+                None
+            }
+        }
+    }
     /// If a request failed, this will output what type of error it is before exiting.
     ///
     /// # Arguments
@@ -426,41 +457,52 @@ impl RequestSender {
     /// # Arguments
     ///
     /// * `tag`: The name of the tag.
-    ///
-    /// returns: Vec<TagEntry, Global>
     pub(crate) fn get_tags_by_name(&self, tag: &str) -> Vec<TagEntry> {
-        let result: Value = self
+        let response = self
             .check_response(
                 self.client
                     .get(&self.urls.lock().unwrap()["tag_bulk"])
                     .query(&[("search[name]", tag)])
                     .send(),
-            )
-            .json()
-            .with_context(|| {
-                format!(
-                    "Json was unable to deserialize to \"{}\"!\n\
-                     url_type_key: tag_bulk\n\
-                     tag: {}",
-                    type_name::<Value>(),
-                    tag
-                )
-            })
-            .unwrap();
-        if result.is_object() {
-            vec![]
-        } else {
-            from_value::<Vec<TagEntry>>(result)
-                .with_context(|| {
-                    error!(
-                        "Unable to deserialize Value to \"{}\"!",
-                        type_name::<Vec<TagEntry>>()
-                    );
-                    "Failed to perform bulk search...".to_string()
-                })
-                .unwrap()
+            );
+
+        // Try parsing JSON, log errors and return an empty Vec on fail
+        let body = match response.text() {
+            Ok(body_str) => body_str,
+            Err(e) => {
+                error!("Failed to read response body for tag {}: {}", tag, e);
+                return vec![];
+            }
+        };
+        let result: serde_json::Result<Value> = serde_json::from_str(&body);
+        match result {
+            Ok(val) => {
+                if val.is_object() {
+                    vec![]
+                } else {
+                    match from_value::<Vec<TagEntry>>(val) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!(
+                                "Unable to deserialize Value to Vec<TagEntry>: tag = {}. Error: {}. Body: {}", 
+                                tag, e, body
+                            );
+                            vec![]
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "JSON deserialization failed for tag_bulk, tag: {}: {}. Body: {}",
+                    tag, e, body
+                );
+                vec![]
+            }
         }
     }
+}
+    
 
     /// Queries aliases and returns response.
     ///
@@ -475,31 +517,7 @@ impl RequestSender {
     /// ```
     /// 
     /// ```
-    pub(crate) fn query_aliases(&self, tag: &str) -> Option<Vec<AliasEntry>> {
-        let result = self
-            .check_response(
-                self.client
-                    .get(&self.urls.lock().unwrap()["alias"])
-                    .query(&[
-                        ("commit", "Search"),
-                        ("search[name_matches]", tag),
-                        ("search[order]", "status"),
-                    ])
-                    .send(),
-            )
-            .json::<Vec<AliasEntry>>();
 
-        match result {
-            Ok(e) => Some(e),
-            Err(e) => {
-                trace!("No alias was found for {tag}...");
-                trace!("Printing trace message for why None was returned...");
-                trace!("{}", e.to_string());
-                None
-            }
-        }
-    }
-}
 impl Clone for RequestSender {
     fn clone(&self) -> Self {
         RequestSender {
