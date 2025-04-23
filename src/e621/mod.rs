@@ -38,7 +38,6 @@ struct CollectionInfo {
 }
 
 use rayon::ThreadPoolBuilder;
-const MAX_DOWNLOAD_CONCURRENCY: usize = 3;
 
 impl CollectionInfo {
     /// Creates a new CollectionInfo from a PostCollection
@@ -84,6 +83,8 @@ pub(crate) struct E621WebConnector {
     total_size_cap: u64,
     /// Number of collections to download simultaneously (default 2).
     batch_size: usize,
+    /// Number of simultaneous downloads (concurrency level)
+    max_download_concurrency: usize,
     /// Current batch number being processed
     current_batch: usize,
     /// Total number of batches
@@ -105,6 +106,7 @@ impl E621WebConnector {
             file_size_cap: default_file_cap,
             total_size_cap: default_total_cap,
             batch_size: 2, // Default to 2 collections at a time
+            max_download_concurrency: 3, // Default concurrency level
             current_batch: 0,
             total_batches: 0,
         }
@@ -150,6 +152,25 @@ impl E621WebConnector {
 
         self.batch_size = batch_size.max(1); // Ensure at least 1
         info!("Batch size set to: {}", self.batch_size);
+        
+        // Configure download concurrency
+        let concurrency_prompt = "Enable high concurrency downloads? (5 vs default 3, may hit API limits)";
+        println!("\nℹ️  Concurrency controls how many files can be downloaded simultaneously.");
+        println!("⚠️  Higher concurrency (5) may improve download speed but risks hitting e621's API rate limits.");
+        println!("    This could result in temporary IP blocks or throttled connections.");
+        
+        if Confirm::new()
+            .with_prompt(concurrency_prompt)
+            .default(false)
+            .interact()
+            .unwrap_or(false) 
+        {
+            self.max_download_concurrency = 5;
+            info!("High concurrency enabled: {} simultaneous downloads", self.max_download_concurrency);
+        } else {
+            self.max_download_concurrency = 3;
+            info!("Using default concurrency: {} simultaneous downloads", self.max_download_concurrency);
+        }
     }
 
     /// Initializes the progress bar with a fresh instance for downloads.
@@ -666,11 +687,11 @@ impl E621WebConnector {
             }
         });
         // Declare the rayon thread pool with configured concurrency
+        // Declare the rayon thread pool with configured concurrency
         let pool = ThreadPoolBuilder::new()
-            .num_threads(MAX_DOWNLOAD_CONCURRENCY)
+            .num_threads(self.max_download_concurrency)
             .build()
             .expect("Failed to create download thread pool");
-
         pool.scope(|s| {
             for post in posts.into_iter() {
                 let dir_manager = Arc::clone(&dir_manager_arc);
