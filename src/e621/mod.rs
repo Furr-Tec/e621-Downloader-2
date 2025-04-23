@@ -666,20 +666,13 @@ impl E621WebConnector {
                     }
 
                     let file_path_str = file_path.to_string_lossy();
-                    let download_result = /* self. */  {
-                        // Place download_file_with_streaming logic here or adapt as needed if available as static
-                        Ok::<(), anyhow::Error>(())
-                    };
-
+                    let download_result = self.download_file_with_streaming(post.url(), &file_path);
                     match download_result {
                         Ok(_) => {
                             // File was downloaded and saved successfully
                             // Now calculate hash and update tracking info
                             trace!("Saved {}...", file_path_str);
-                            let hash_result = /* self. */ {
-                                // Calculation logic or call to static equivalent
-                                Ok::<String, anyhow::Error>("dummyhash".to_string())
-                            };
+                            let hash_result = self.calculate_sha512_optimized(&file_path);
                             match hash_result {
                                 Ok(hash) => {
                                     // Store hash with the downloaded file for future verification
