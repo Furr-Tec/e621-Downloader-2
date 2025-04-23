@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs::{create_dir_all, File};
 use std::io::Read;
 use std::path::Path;
@@ -251,14 +252,6 @@ impl E621WebConnector {
     ///
     /// # Arguments
     ///
-    /// * `text`: The text to remove invalid characters from.
-    // fn remove_invalid_chars(&self, text: &str) -> String {
-    //     text.chars()
-    //         .map(|e| match e {
-    //             '?' | ':' | '*' | '<' | '>' | '"' | '|' => '_',
-    //             _ => e,
-    //         })
-    //         .collect()
     // }
 
     /// Formats file size in KB to a human-readable string with appropriate units
@@ -581,11 +574,9 @@ impl E621WebConnector {
         trace!("Collection Category:        \"{}\"", collection_info.category);
         trace!("Collection Post Length:     \"{}\"", collection_info.posts.len());
 
-        // Process each post in this collection using smaller batches to prevent stack overflow
-        // Process each post in this collection using very small batches to prevent stack overflow
+        // Process each post in this collection using batches to prevent stack overflow
         let posts = collection_info.posts();
 
-        // Detect potentially problematic collections based on size and complexity
         // Detect potentially problematic collections based on size and complexity
         const LARGE_COLLECTION_THRESHOLD: usize = 50; // Collections with more than 50 files
         const LARGE_FILE_SIZE_THRESHOLD: i64 = 100 * 1024 * 1024; // 100MB in bytes
@@ -611,6 +602,9 @@ impl E621WebConnector {
         let posts: Vec<_> = posts.iter().filter(|post| post.is_new()).cloned().collect();
         let new_files = posts.len();
 
+        // Atomic counter for thread-safe progress reporting
+        let download_counter = Arc::new(AtomicUsize::new(0));
+
         // Declare the rayon thread pool with configured concurrency
         let pool = ThreadPoolBuilder::new()
             .num_threads(MAX_DOWNLOAD_CONCURRENCY)
@@ -618,31 +612,32 @@ impl E621WebConnector {
             .expect("Failed to create download thread pool");
 
         pool.scope(|s| {
-            for (processed, post) in posts.into_iter().enumerate() {
+            for post in posts.into_iter() {
                 let dir_manager = Arc::clone(&dir_manager_arc);
                 let progress_bar = progress_bar.clone();
+                let download_counter = Arc::clone(&download_counter);
                 s.spawn(move |_| {
                     let filename = post.name();
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
-                    let current_position = processed + 1;
-
+                    
+                    // Check for duplicates
                     let is_dup = {
                         let dm = dir_manager.lock().unwrap();
                         dm.is_duplicate_iterative(filename, hash_ref)
                     };
                     if is_dup {
+                        let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
                         progress_bar.set_message(format!(
                             "[{}/{}] Duplicate: {}",
-                            current_position, new_files, filename
+                            count, new_files, filename
                         ));
                         progress_bar.inc(post.file_size() as u64);
                         return;
                     }
-
                     progress_bar.set_message(format!(
                         "[{}/{}] Downloading {}",
-                        current_position, new_files, filename
+                        download_counter.load(Ordering::SeqCst) + 1, new_files, filename
                     ));
 
                     let save_dir = match post.save_directory() {
@@ -664,6 +659,7 @@ impl E621WebConnector {
                         let path_str = save_dir.to_string_lossy();
                         error!("Could not create directory for images: {}", err);
                         error!("Path: {}", path_str);
+                        let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
                         progress_bar.set_message("Error: Bad directory path".to_string());
                         progress_bar.inc(post.file_size() as u64);
                         return;
@@ -696,9 +692,10 @@ impl E621WebConnector {
                                     dm.mark_file_downloaded_with_hash_simple(&relpath_str, hash.clone());
                                     trace!("Stored hash {} for post {}", hash, post.name());
                                     // Show success message with file counts
+                                    let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
                                     let message = format!(
                                         "[{}/{}] Downloaded & verified: {}",
-                                        current_position, new_files, filename
+                                        count, new_files, filename
                                     );
                                     progress_bar.set_message(message);
                                 }
@@ -711,9 +708,10 @@ impl E621WebConnector {
                                         .to_string_lossy();
                                     let mut dm = dir_manager.lock().unwrap();
                                     dm.mark_file_downloaded(&relpath_str);
+                                    let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
                                     let message = format!(
                                         "[{}/{}] Saved but not verified: {}",
-                                        current_position, new_files, filename
+                                        count, new_files, filename
                                     );
                                     progress_bar.set_message(message);
                                 }
@@ -725,22 +723,22 @@ impl E621WebConnector {
                         Err(err) => {
                             error!("Failed to download/save image {}: {}", file_path_str, err);
                             // Show error message with file counts
+                            let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
                             let message = format!(
                                 "[{}/{}] Error: Download failed for {}",
-                                current_position, new_files, filename
+                                count, new_files, filename
                             );
                             progress_bar.set_message(message);
                             progress_bar.inc(post.file_size() as u64);
                         }
                     }
-                });
-            }
-        });
+                }); // s.spawn
+            } // for post in posts
+        }); // pool.scope
 
         // No more batch Vec or manual batch tracking is necessary here. Clean up and trace log.
         trace!("Collection {} is finished downloading...", collection_info.name);
     }
-
     /// Gets the total size (in KB) of every post image to be downloaded.
     /// Shows a prompt for confirming large downloads and gives the option to adjust limits
     /// Returns true if user chooses to proceed, false if user cancels
@@ -880,8 +878,6 @@ impl E621WebConnector {
         total_size
     }
 
-    /// Downloads a file using a streaming approach to minimize memory usage
-    /// This avoids loading the entire file into memory at once
     /// Downloads a file using a streaming approach to minimize memory usage
     /// This avoids loading the entire file into memory at once
     fn download_file_with_streaming(&self, url: &str, file_path: &Path) -> Result<(), anyhow::Error> {
