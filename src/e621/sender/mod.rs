@@ -474,7 +474,8 @@ impl RequestSender {
                 return vec![];
             }
         };
-        let result: serde_json::Result<Value> = serde_json::from_str(&body);
+        let result = serde_json::from_str::<Value>(&body);
+        let is_maintenance = body.to_ascii_lowercase().contains("maintenance");
         match result {
             Ok(val) => {
                 if val.is_object() {
@@ -483,20 +484,28 @@ impl RequestSender {
                     match from_value::<Vec<TagEntry>>(val) {
                         Ok(v) => v,
                         Err(e) => {
-                            error!(
-                                "Unable to deserialize Value to Vec<TagEntry>: tag = {}. Error: {}. Body: {}", 
-                                tag, e, body
-                            );
+                            if is_maintenance {
+                                info!("e621 is currently under maintenance. Tag query aborted.");
+                            } else {
+                                error!(
+                                    "Unable to deserialize Value to Vec<TagEntry>: tag = {}. Error: {}.",
+                                    tag, e
+                                );
+                            }
                             vec![]
                         }
                     }
                 }
             }
             Err(e) => {
-                error!(
-                    "JSON deserialization failed for tag_bulk, tag: {}: {}. Body: {}",
-                    tag, e, body
-                );
+                if is_maintenance {
+                    info!("e621 is currently under maintenance. Tag query aborted.");
+                } else {
+                    error!(
+                        "JSON deserialization failed for tag_bulk, tag: {}: {}.",
+                        tag, e
+                    );
+                }
                 vec![]
             }
         }
