@@ -248,11 +248,6 @@ impl E621WebConnector {
     ///
     /// # Arguments
     ///
-    /// Removes invalid characters from directory path.
-    ///
-    /// # Arguments
-    ///
-    // }
 
     /// Formats file size in KB to a human-readable string with appropriate units
     /// Formats file size in bytes to a human-readable string with appropriate units
@@ -621,24 +616,23 @@ impl E621WebConnector {
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
                     
+                    // Helper closure for progress updates
+                    // Helper closure for progress updates and increments
+                    let update_progress = |status: &str| {
+                        let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        progress_bar.set_message(format!("[{}/{}] {}: {}", count, new_files, status, filename));
+                        progress_bar.inc(post.file_size() as u64);
+                    };
                     // Check for duplicates
                     let is_dup = {
                         let dm = dir_manager.lock().unwrap();
                         dm.is_duplicate_iterative(filename, hash_ref)
                     };
                     if is_dup {
-                        let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        progress_bar.set_message(format!(
-                            "[{}/{}] Duplicate: {}",
-                            count, new_files, filename
-                        ));
-                        progress_bar.inc(post.file_size() as u64);
+                        update_progress("Duplicate");
                         return;
                     }
-                    progress_bar.set_message(format!(
-                        "[{}/{}] Downloading {}",
-                        download_counter.load(Ordering::SeqCst) + 1, new_files, filename
-                    ));
+                    update_progress("Downloading");
 
                     let save_dir = match post.save_directory() {
                         Some(dir) => dir,
@@ -647,9 +641,7 @@ impl E621WebConnector {
                                 "Post does not have a save directory assigned: {}",
                                 post.name()
                             );
-                            let message = format!("Error: No directory for {}", post.name());
-                            progress_bar.set_message(message);
-                            progress_bar.inc(post.file_size() as u64);
+                            update_progress("Error: No directory");
                             return;
                         }
                     };
@@ -659,12 +651,9 @@ impl E621WebConnector {
                         let path_str = save_dir.to_string_lossy();
                         error!("Could not create directory for images: {}", err);
                         error!("Path: {}", path_str);
-                        let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        progress_bar.set_message("Error: Bad directory path".to_string());
-                        progress_bar.inc(post.file_size() as u64);
+                        update_progress("Error: Bad directory path");
                         return;
                     }
-
                     let file_path_str = file_path.to_string_lossy();
                     let download_result = self.download_file_with_streaming(post.url(), &file_path);
                     match download_result {
@@ -685,13 +674,8 @@ impl E621WebConnector {
                                     dm.mark_file_downloaded_with_hash_simple(&relpath_str, hash.clone());
                                     trace!("Stored hash {} for post {}", hash, post.name());
                                     // Show success message with file counts
-                                    let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                                    let message = format!(
-                                        "[{}/{}] Downloaded & verified: {}",
-                                        count, new_files, filename
-                                    );
-                                    progress_bar.set_message(message);
-                                }
+                                    update_progress("Downloaded & verified");
+                                },
                                 Err(e) => {
                                     warn!("Failed to calculate hash for {}: {}", file_path_str, e);
                                     let relpath = save_dir.join(post.name());
@@ -701,28 +685,14 @@ impl E621WebConnector {
                                         .to_string_lossy();
                                     let mut dm = dir_manager.lock().unwrap();
                                     dm.mark_file_downloaded(&relpath_str);
-                                    let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                                    let message = format!(
-                                        "[{}/{}] Saved but not verified: {}",
-                                        count, new_files, filename
-                                    );
-                                    progress_bar.set_message(message);
+                                    update_progress("Saved but not verified");
                                 }
                             }
-
-                            // Update progress bar after successful download
-                            progress_bar.inc(post.file_size() as u64);
                         }
                         Err(err) => {
                             error!("Failed to download/save image {}: {}", file_path_str, err);
                             // Show error message with file counts
-                            let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                            let message = format!(
-                                "[{}/{}] Error: Download failed for {}",
-                                count, new_files, filename
-                            );
-                            progress_bar.set_message(message);
-                            progress_bar.inc(post.file_size() as u64);
+                            update_progress("Error: Download failed");
                         }
                     }
                 }); // s.spawn
