@@ -1,6 +1,5 @@
-﻿use std::cell::RefCell;
-use std::cmp::Ordering;
-use std::rc::Rc;
+﻿use std::cmp::Ordering;
+use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
 use crate::e621::blacklist::Blacklist;
@@ -331,7 +330,7 @@ impl Shorten<char> for PostCollection {
 pub(crate) struct Grabber {
     posts: Vec<PostCollection>,
     request_sender: RequestSender,
-    blacklist: Option<Rc<RefCell<Blacklist>>>,
+    blacklist: Option<Arc<Mutex<Blacklist>>>,
     safe_mode: bool,
 }
 
@@ -349,8 +348,12 @@ impl Grabber {
         &self.posts
     }
 
-    pub(crate) fn set_blacklist(&mut self, blacklist: Rc<RefCell<Blacklist>>) {
-        if !blacklist.borrow_mut().is_empty() {
+    pub(crate) fn set_blacklist(&mut self, blacklist: Arc<Mutex<Blacklist>>) {
+        let set = match blacklist.lock() {
+            Ok(bl) => !bl.is_empty(),
+            Err(_) => false,
+        };
+        if set {
             self.blacklist = Some(blacklist);
         }
     }
@@ -593,7 +596,10 @@ impl Grabber {
     fn filter_posts_with_blacklist(&self, posts: &mut Vec<PostEntry>) -> u16 {
         if self.request_sender.is_authenticated() {
             if let Some(ref blacklist) = self.blacklist {
-                return blacklist.borrow_mut().filter_posts(posts);
+                if let Ok(mut bl) = blacklist.lock() {
+                    return bl.filter_posts(posts);
+                }
+                return 0;
             }
         }
         0

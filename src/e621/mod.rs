@@ -1,10 +1,8 @@
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::fs::{create_dir_all, File};
 use std::io::Read;
 use std::path::Path;
-use std::rc::Rc;
 use std::time::Duration;
-
 use sha2::{Sha512, Digest};
 use hex::encode as hex_encode;
 
@@ -37,6 +35,9 @@ struct CollectionInfo {
     /// Posts in the collection - stored in a Box to reduce stack usage
     posts: Box<Vec<grabber::GrabbedPost>>,
 }
+
+use rayon::ThreadPoolBuilder;
+const MAX_DOWNLOAD_CONCURRENCY: usize = 3;
 
 impl CollectionInfo {
     /// Creates a new CollectionInfo from a PostCollection
@@ -75,7 +76,7 @@ pub(crate) struct E621WebConnector {
     /// Grabber which is responsible for grabbing posts.
     grabber: Grabber,
     /// The user's blacklist.
-    blacklist: Rc<RefCell<Blacklist>>,
+    blacklist: Arc<Mutex<Blacklist>>,
     /// Maximum file size cap for individual files in KB (default 20GB).
     file_size_cap: u64,
     /// Total overall download size cap in KB (default 100GB).
@@ -99,7 +100,7 @@ impl E621WebConnector {
             request_sender: request_sender.clone(),
             progress_bar: ProgressBar::hidden(),
             grabber: Grabber::new(request_sender.clone(), false),
-            blacklist: Rc::new(RefCell::new(Blacklist::new(request_sender.clone()))),
+            blacklist: Arc::new(Mutex::new(Blacklist::new(request_sender.clone()))),
             file_size_cap: default_file_cap,
             total_size_cap: default_total_cap,
             batch_size: 2, // Default to 2 collections at a time
@@ -219,12 +220,13 @@ impl E621WebConnector {
             .get_entry_from_appended_id(username, "user");
         if let Some(blacklist_tags) = user.blacklisted_tags {
             if !blacklist_tags.is_empty() {
-                let blacklist = self.blacklist.clone();
-                blacklist
-                    .borrow_mut()
-                    .parse_blacklist(blacklist_tags)
-                    .cache_users();
-                self.grabber.set_blacklist(blacklist);
+                if let Ok(mut bl) = self.blacklist.lock() {
+                    bl.parse_blacklist(blacklist_tags)
+                        .cache_users();
+                } else {
+                    error!("Blacklist mutex is poisoned");
+                }
+                self.grabber.set_blacklist(self.blacklist.clone());
             }
         }
     }
@@ -422,7 +424,7 @@ impl E621WebConnector {
                 return;
             }
 
-            info!("Processing {} collections in {} batches of up to {} collections each", 
+            info!("Processing {} collections in {} batches of up to {} collections each",
                   total_collections, self.total_batches, self.batch_size);
 
             // Process collections one at a time to minimize memory usage
@@ -440,7 +442,7 @@ impl E621WebConnector {
                         let collection = &self.grabber.posts()[idx];
                         let name = collection.name().to_string();
 
-                        info!("Processing batch {}/{}: {}", 
+                        info!("Processing batch {}/{}: {}",
                              self.current_batch, self.total_batches, name);
 
                         // Create CollectionInfo for just this collection
@@ -477,7 +479,7 @@ impl E621WebConnector {
                 return;
             }
 
-            info!("Processing {} collections in {} batches of up to {} collections each", 
+            info!("Processing {} collections in {} batches of up to {} collections each",
                   total_collections, self.total_batches, self.batch_size);
 
             // Process in batches
@@ -584,7 +586,7 @@ impl E621WebConnector {
             let total_size_bytes: i64 = posts.iter().map(|p| p.file_size_bytes()).sum();
             let total_size_mb = total_size_bytes / (1024 * 1024);
 
-            info!("Large collection detected: '{}' with {} files ({}MB total). Using smaller batch size for memory efficiency.", 
+            info!("Large collection detected: '{}' with {} files ({}MB total). Using smaller batch size for memory efficiency.",
                   collection_info.name, posts.len(), total_size_mb);
             5  // Very small batches for large collections
         } else {
@@ -598,138 +600,131 @@ impl E621WebConnector {
 
         // Create batches manually using chunks to reduce memory overhead
         let mut processed = 0;
-        let mut batch_vec = Vec::with_capacity(batch_size);
+        let mut batch_vec: Vec<&grabber::GrabbedPost> = Vec::with_capacity(batch_size);
 
-        for post in new_posts_iter {
-            // Add post to the current batch
-            batch_vec.push(post);
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(MAX_DOWNLOAD_CONCURRENCY)
+            .build()
+            .expect("Failed to create download thread pool");
 
-            // When batch is full or this is the last item, process the batch
-            if batch_vec.len() >= batch_size || processed + batch_vec.len() >= new_posts_count {
-                // Process each post in the batch
-                for post in &batch_vec {
+        let progress_bar = &self.progress_bar;
+
+        pool.scope(|s| {
+            for post in posts.iter().filter(|post| post.is_new()) {
+                s.spawn(|_| {
                     let filename = post.name();
-                    // Get the hash reference, storing it first to avoid temporary value issues
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
+                    let current_position = processed + 1;
 
-                    // Update progress message with file info and count
-                    let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
-
-                    // Use a direct check method rather than nested function calls to reduce stack usage
                     if dir_manager.is_duplicate_iterative(filename, hash_ref) {
-                        self.progress_bar.set_message(format!("[{}/{}] Duplicate: {}",
-                                                              current_position, new_files, filename));
-                        self.progress_bar.inc(post.file_size() as u64);
-                        continue;
+                        progress_bar.set_message(format!(
+                            "[{}/{}] Duplicate: {}",
+                            current_position, new_files, filename
+                        ));
+                        progress_bar.inc(post.file_size() as u64);
+                        return;
                     }
 
-                    // Show which file is being downloaded and progress information
-                    self.progress_bar.set_message(format!("[{}/{}] Downloading {}",
-                                                          current_position, new_files, filename));
+                    progress_bar.set_message(format!(
+                        "[{}/{}] Downloading {}",
+                        current_position, new_files, filename
+                    ));
 
-                    // Get the save directory from the post
                     let save_dir = match post.save_directory() {
                         Some(dir) => dir,
                         None => {
-                            error!("Post does not have a save directory assigned: {}", post.name());
-                            let message = format!("Error: No directory for {}", post.name());
-                            self.progress_bar.set_message(message);
-                            self.progress_bar.inc(post.file_size() as u64);
-                            continue;
+                            error!(
+                                "Post does not have a save directory assigned: {}",
+                                post.name()
+                            );
+                            let message =
+                                format!("Error: No directory for {}", post.name());
+                            progress_bar.set_message(message);
+                            progress_bar.inc(post.file_size() as u64);
+                            return;
                         }
                     };
 
-                    let file_path = save_dir.join(self.remove_invalid_chars(post.name()));
+                    let file_path =
+                        save_dir.join(self.remove_invalid_chars(post.name()));
 
-                    // Create the directory if it doesn't exist
                     if let Err(err) = create_dir_all(&save_dir) {
                         let path_str = save_dir.to_string_lossy();
                         error!("Could not create directory for images: {}", err);
                         error!("Path: {}", path_str);
-                        self.progress_bar.set_message("Error: Bad directory path".to_string());
-                        self.progress_bar.inc(post.file_size() as u64);
-                        continue;
+                        progress_bar
+                            .set_message("Error: Bad directory path".to_string());
+                        progress_bar.inc(post.file_size() as u64);
+                        return;
                     }
 
-                    // Download and save the file
                     let file_path_str = file_path.to_string_lossy();
-
-                    // Use a streaming download approach for better memory efficiency
-                    let download_result = self.download_file_with_streaming(post.url(), &file_path);
+                    let download_result =
+                        self.download_file_with_streaming(post.url(), &file_path);
 
                     match download_result {
                         Ok(_) => {
-                            // File was downloaded and saved successfully
-                            // Now calculate hash and update tracking info
                             trace!("Saved {}...", file_path_str);
-
-                            // Calculate SHA-512 hash for verification - use optimized memory-efficient method
-                            let hash_result = self.calculate_sha512_optimized(&file_path);
+                            let hash_result =
+                                self.calculate_sha512_optimized(&file_path);
 
                             match hash_result {
                                 Ok(hash) => {
-                                    // Store hash with the downloaded file for future verification
                                     let relpath = save_dir.join(post.name());
-                                    let relpath_str = relpath.strip_prefix(Config::get().download_directory()).unwrap_or(&relpath).to_string_lossy();
-                                    dir_manager.mark_file_downloaded_with_hash_simple(&relpath_str, hash.clone());
-                                    trace!("Stored hash {} for post {}", hash, post.name());
-
-                                    // Show success message with file counts
-                                    let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
-                                    let message = format!("[{}/{}] Downloaded & verified: {}",
-                                                          current_position, new_files, filename);
-                                    self.progress_bar.set_message(message);
-                                },
+                                    let relpath_str = relpath.strip_prefix(
+                                        Config::get().download_directory(),
+                                    ).unwrap_or(&relpath).to_string_lossy();
+                                    dir_manager.mark_file_downloaded_with_hash_simple(
+                                        &relpath_str,
+                                        hash.clone(),
+                                    );
+                                    trace!(
+                                        "Stored hash {} for post {}",
+                                        hash,
+                                        post.name()
+                                    );
+                                    let message = format!(
+                                        "[{}/{}] Downloaded & verified: {}",
+                                        current_position, new_files, filename
+                                    );
+                                    progress_bar.set_message(message);
+                                }
                                 Err(e) => {
-                                    // Hash calculation failed but file was saved
-                                    warn!("Failed to calculate hash for {}: {}", file_path_str, e);
+                                    warn!(
+                                        "Failed to calculate hash for {}: {}",
+                                        file_path_str, e
+                                    );
                                     let relpath = save_dir.join(post.name());
-                                    let relpath_str = relpath.strip_prefix(Config::get().download_directory()).unwrap_or(&relpath).to_string_lossy();
+                                    let relpath_str = relpath
+                                        .strip_prefix(Config::get().download_directory())
+                                        .unwrap_or(&relpath)
+                                        .to_string_lossy();
                                     dir_manager.mark_file_downloaded(&relpath_str);
-
-                                    // Show warning message with file counts
-                                    let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
-                                    let message = format!("[{}/{}] Saved but not verified: {}",
-                                                          current_position, new_files, filename);
-                                    self.progress_bar.set_message(message);
+                                    let message = format!(
+                                        "[{}/{}] Saved but not verified: {}",
+                                        current_position, new_files, filename
+                                    );
+                                    progress_bar.set_message(message);
                                 }
                             }
-
-                            // Update progress bar after successful download
-                            self.progress_bar.inc(post.file_size() as u64);
-                        },
+                            progress_bar.inc(post.file_size() as u64);
+                        }
                         Err(err) => {
                             error!("Failed to download/save image {}: {}", file_path_str, err);
-
-                            // Show error message with file counts
-                            let current_position = processed + batch_vec.iter().position(|p| p.name() == filename).unwrap_or(0) + 1;
-                            self.progress_bar.set_message(format!("[{}/{}] Error: Download failed for {}",
-                                                                  current_position, new_files, filename));
-                            self.progress_bar.inc(post.file_size() as u64);
+                            let message = format!(
+                                "[{}/{}] Error: Download failed for {}",
+                                current_position, new_files, filename
+                            );
+                            progress_bar.set_message(message);
+                            progress_bar.inc(post.file_size() as u64);
                         }
                     }
-                } // End of for post in &batch_vec
-
-                // Update processed count BEFORE clearing the batch
-                processed += batch_vec.len();
-
-                // Ensure we track processed counts correctly
-                if processed > new_posts_count {
-                    processed = new_posts_count; // Avoid overflow
-                }
-
-                // Clear the batch and force memory cleanup before next batch
-                batch_vec.clear();
-
-                // Force a small pause between batches to prevent stack buildup
-                if is_problematic {
-                    // For problematic collections, pause briefly between batches
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
+                });
             }
-        }
+        });
 
+        // No more batch Vec or manual batch tracking is necessary here. Clean up and trace log.
         trace!("Collection {} is finished downloading...", collection_info.name);
     }
 
@@ -849,7 +844,7 @@ impl E621WebConnector {
                     let formatted_original = self.format_file_size(file_size_bytes);
                     let formatted_cap = self.format_file_size(file_size_cap_bytes);
 
-                    warn!("Post {} has large file size: {}, capping at {}", 
+                    warn!("Post {} has large file size: {}, capping at {}",
                           post.name(), formatted_original, formatted_cap);
 
                     total_size += file_size_cap_bytes;
@@ -863,7 +858,7 @@ impl E621WebConnector {
         let formatted_size = self.format_file_size(total_size);
 
         if capped_files > 0 {
-            info!("Preparing to download {} new files ({} will be size-capped) totaling {}", 
+            info!("Preparing to download {} new files ({} will be size-capped) totaling {}",
                   post_count, capped_files, formatted_size);
         } else {
             info!("Preparing to download {} new files totaling {}", post_count, formatted_size);

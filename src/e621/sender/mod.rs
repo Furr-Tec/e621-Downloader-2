@@ -15,9 +15,8 @@
  */
 
 use std::any::type_name;
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -72,12 +71,12 @@ const USER_AGENT_VALUE: &str = concat!(
 
 /// A reference counted client used for all searches by the [Grabber], [Blacklist], [E621WebConnector], etc.
 struct SenderClient {
-    /// [Client] wrapped in a [Rc] so only one instance of the client exists. This will prevent an overabundance of
+    /// [Client] wrapped in an [Arc] so only one instance of the client exists. This will prevent an overabundance of
     /// clients in the code.
-    client: Rc<Client>,
+    client: Arc<Client>,
     /// The base64 encrypted username and password of the user. This is passed only through the [AUTHORIZATION] header
     /// of the request and is a highly secured method of login through client.
-    auth: Rc<String>,
+    auth: Arc<String>,
 }
 
 impl SenderClient {
@@ -86,8 +85,8 @@ impl SenderClient {
         trace!("SenderClient initializing with USER_AGENT_VALUE \"{USER_AGENT_VALUE}\"");
 
         SenderClient {
-            client: Rc::new(SenderClient::build_client()),
-            auth: Rc::new(auth),
+            client: Arc::new(SenderClient::build_client()),
+            auth: Arc::new(auth),
         }
     }
 
@@ -137,8 +136,8 @@ impl Clone for SenderClient {
     /// going to the same client.
     fn clone(&self) -> Self {
         SenderClient {
-            client: Rc::clone(&self.client),
-            auth: Rc::clone(&self.auth),
+            client: Arc::clone(&self.client),
+            auth: Arc::clone(&self.auth),
         }
     }
 }
@@ -148,12 +147,11 @@ impl Clone for SenderClient {
 /// This acts as a safety layer to ensure calls to the API are less error prone.
 pub(crate) struct RequestSender {
     /// The client that will be used to send all requests.
-    ///
-    /// Even though the [SenderClient] isn't wrapped in a [Rc], the main client inside of it is, this will ensure that
-    /// all request are only sent through one client.
+    /// 
+    /// Now thread-safe using Arc.
     client: SenderClient,
     /// All available urls to use with the sender.
-    urls: Rc<RefCell<HashMap<String, String>>>,
+    urls: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RequestSender {
@@ -167,7 +165,7 @@ impl RequestSender {
 
         RequestSender {
             client: SenderClient::new(auth),
-            urls: Rc::new(RefCell::new(RequestSender::initialize_url_map())),
+            urls: Arc::new(Mutex::new(RequestSender::initialize_url_map())),
         }
     }
 
@@ -191,14 +189,16 @@ impl RequestSender {
         !self.client.auth.is_empty()
     }
 
-    /// Updates all the urls from e621 to e926.
     pub(crate) fn update_to_safe(&mut self) {
-        self.urls
-            .borrow_mut()
-            .iter_mut()
-            .for_each(|(_, value)| *value = value.replace("e621", "e926"));
+        if let Ok(mut map) = self.urls.lock() {
+            map.iter_mut()
+                .for_each(|(_, value)| *value = value.replace("e621", "e926"));
+        }
     }
+}
 
+
+impl RequestSender {
     /// If a request failed, this will output what type of error it is before exiting.
     ///
     /// # Arguments
@@ -344,7 +344,12 @@ impl RequestSender {
         let value: Value = self
             .check_response(
                 self.client
-                    .get_with_auth(&self.append_url(&self.urls.borrow()[url_type_key], id))
+                    .get_with_auth(
+                        &self.append_url(
+                            &self.urls.lock().unwrap()[url_type_key],
+                            id
+                        )
+                    )
                     .send(),
             )
             .json()
@@ -397,7 +402,7 @@ impl RequestSender {
 
         self.check_response(
             self.client
-                .get_with_auth(&self.urls.borrow()["posts"])
+                .get_with_auth(&self.urls.lock().unwrap()["posts"])
                 .query(&[
                     ("tags", searching_tag),
                     ("page", &format!("{page}")),
@@ -427,7 +432,7 @@ impl RequestSender {
         let result: Value = self
             .check_response(
                 self.client
-                    .get(&self.urls.borrow()["tag_bulk"])
+                    .get(&self.urls.lock().unwrap()["tag_bulk"])
                     .query(&[("search[name]", tag)])
                     .send(),
             )
@@ -468,13 +473,13 @@ impl RequestSender {
     /// # Examples
     ///
     /// ```
-    ///
+    /// 
     /// ```
     pub(crate) fn query_aliases(&self, tag: &str) -> Option<Vec<AliasEntry>> {
         let result = self
             .check_response(
                 self.client
-                    .get(&self.urls.borrow()["alias"])
+                    .get(&self.urls.lock().unwrap()["alias"])
                     .query(&[
                         ("commit", "Search"),
                         ("search[name_matches]", tag),
@@ -495,12 +500,11 @@ impl RequestSender {
         }
     }
 }
-
 impl Clone for RequestSender {
     fn clone(&self) -> Self {
         RequestSender {
             client: self.client.clone(),
-            urls: Rc::clone(&self.urls),
+            urls: Arc::clone(&self.urls),
         }
     }
 }
