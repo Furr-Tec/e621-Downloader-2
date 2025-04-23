@@ -600,6 +600,71 @@ impl E621WebConnector {
         // Atomic counter for thread-safe progress reporting
         let download_counter = Arc::new(AtomicUsize::new(0));
 
+        // Extract functions from self that we'll need in threads
+        let request_sender = self.request_sender.clone();
+
+        // Create download function that doesn't capture self
+        let download_fn = Arc::new(move |url: &str, path: &Path| -> Result<(), anyhow::Error> {
+            // Create parent directory if it doesn't exist
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Get the bytes from the URL
+            let bytes = match request_sender.get_bytes_from_url(url) {
+                Ok(data) => data,
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to download from URL {}: {}", url, e));
+                }
+            };
+
+            // Write the bytes to the file directly
+            let file_path_display = path.display();
+            if let Err(e) = std::fs::write(path, &bytes) {
+                return Err(anyhow::anyhow!("Failed to write to file {}: {}", file_path_display, e));
+            }
+
+            Ok(())
+        });
+
+        // Create hash calculation function that doesn't capture self
+        let calculate_hash = Arc::new(|file_path: &Path| -> Result<String, anyhow::Error> {
+            const LARGE_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32MB
+
+            let file = File::open(file_path)?;
+            let metadata = file.metadata()?;
+            let file_size = metadata.len();
+
+            // For large files, use memory mapping for better performance and memory efficiency
+            if file_size > LARGE_FILE_THRESHOLD {
+                // Use memory mapping for large files
+                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+                let mut hasher = Sha512::new();
+                hasher.update(&mmap[..]);
+                let hash = hasher.finalize();
+
+                Ok(hex_encode(hash))
+            } else {
+                // For smaller files, use heap-allocated buffers instead of stack buffers
+                let mut hasher = Sha512::new();
+                let mut buffer = vec![0; 1024 * 1024]; // 1MB buffer allocated on the heap
+                let mut reader = &file;
+
+                loop {
+                    let bytes_read = reader.read(&mut buffer)?;
+
+                    if bytes_read == 0 {
+                        break; // End of file
+                    }
+
+                    hasher.update(&buffer[..bytes_read]);
+                }
+
+                let hash = hasher.finalize();
+                Ok(hex_encode(hash))
+            }
+        });
         // Declare the rayon thread pool with configured concurrency
         let pool = ThreadPoolBuilder::new()
             .num_threads(MAX_DOWNLOAD_CONCURRENCY)
@@ -611,18 +676,20 @@ impl E621WebConnector {
                 let dir_manager = Arc::clone(&dir_manager_arc);
                 let progress_bar = progress_bar.clone();
                 let download_counter = Arc::clone(&download_counter);
+                let download_fn = Arc::clone(&download_fn);
+                let calculate_hash = Arc::clone(&calculate_hash);
                 s.spawn(move |_| {
                     let filename = post.name();
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
                     
-                    // Helper closure for progress updates
                     // Helper closure for progress updates and increments
                     let update_progress = |status: &str| {
                         let count = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
                         progress_bar.set_message(format!("[{}/{}] {}: {}", count, new_files, status, filename));
                         progress_bar.inc(post.file_size() as u64);
                     };
+                    
                     // Check for duplicates
                     let is_dup = {
                         let dm = dir_manager.lock().unwrap();
@@ -655,13 +722,13 @@ impl E621WebConnector {
                         return;
                     }
                     let file_path_str = file_path.to_string_lossy();
-                    let download_result = self.download_file_with_streaming(post.url(), &file_path);
+                    let download_result = download_fn(post.url(), &file_path);
                     match download_result {
                         Ok(_) => {
                             // File was downloaded and saved successfully
                             // Now calculate hash and update tracking info
                             trace!("Saved {}...", file_path_str);
-                            let hash_result = self.calculate_sha512_optimized(&file_path);
+                            let hash_result = calculate_hash(&file_path);
                             match hash_result {
                                 Ok(hash) => {
                                     // Store hash with the downloaded file for future verification
@@ -866,3 +933,4 @@ impl E621WebConnector {
         Ok(())
     }
 }
+
