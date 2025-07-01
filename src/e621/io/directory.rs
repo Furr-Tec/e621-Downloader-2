@@ -216,7 +216,8 @@ impl DirectoryManager {
                         Ok(data) => {
                             let mut hasher = Sha512::new();
                             hasher.update(&data);
-                            Some(format!("{:x}", hasher.finalize()))
+                            let hash = hasher.finalize();
+                            Some(hex::encode(hash))
                         }
                         Err(e) => {
                             warn!("Could not hash file '{}': {}", filename, e);
@@ -297,7 +298,8 @@ impl DirectoryManager {
                         Ok(data) => {
                             let mut hasher = Sha512::new();
                             hasher.update(&data);
-                            let hx = format!("{:x}", hasher.finalize());
+                            let hash = hasher.finalize();
+                            let hx = hex::encode(hash);
                             info!("Filling missing hash for: {}", f);
                             manager.downloaded_files.replace((f.to_string(), Some(hx)));
                         },
@@ -675,7 +677,7 @@ impl DirectoryManager {
             hasher.update(&mmap[..]);
             let hash = hasher.finalize();
             
-            Ok(hex_encode(hash))
+            Ok(hex::encode(hash))
         } else {
             // For smaller files, use buffered reading with a larger buffer
             let mut hasher = Sha512::new();
@@ -721,7 +723,7 @@ impl DirectoryManager {
         
         // Finalize the hash and convert to hex string
         let hash = hasher.finalize();
-        Ok(hex_encode(hash))
+        Ok(hex::encode(hash))
     }
     /// Count total files in a directory (without calculating hashes)
     fn count_files(dir: &Path) -> Result<usize> {
