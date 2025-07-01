@@ -59,16 +59,38 @@ impl Program {
             trace!("Tag file \"{}\" created...", TAG_NAME);
 
             info!("The tag file has been created.");
-            let confirm_exit = dialoguer::Confirm::new()
-                .with_prompt("Would you like to exit the application to edit the tag file before continuing?")
-                .default(true)
-                .show_default(true)
-                .interact()
-                .unwrap_or_else(|err| {
-                    warn!("Failed to get confirmation: {}", err);
-                    warn!("Defaulting to continue without editing tag file.");
-                    false
-                });
+            // Use console::Term::read_line for robust input that works in both terminals and IDEs
+            let confirm_exit = {
+                use console::Term;
+                use std::io::Write;
+                
+                let term = Term::stdout();
+                
+                // Show the prompt with default indication
+                print!("Would you like to exit the application to edit the tag file before continuing? [Y/n]: ");
+                std::io::stdout().flush().unwrap_or(());
+                
+                // Read line from terminal
+                match term.read_line() {
+                    Ok(input) => {
+                        let input = input.trim().to_lowercase();
+                        match input.as_str() {
+                            "y" | "yes" | "" => true,  // Default to yes
+                            "n" | "no" => false,
+                            _ => {
+                                // Invalid input, use default
+                                println!("Invalid input '{}', using default: yes", input);
+                                true
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        warn!("Failed to get user input: {}", err);
+                        warn!("Defaulting to continue without editing tag file.");
+                        false
+                    }
+                }
+            };
             
             if confirm_exit {
                 info!("Exiting so you can edit the tag file to include the artists, sets, pools, and individual posts you wish to download.");

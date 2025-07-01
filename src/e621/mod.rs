@@ -91,6 +91,111 @@ pub(crate) struct E621WebConnector {
 }
 
 impl E621WebConnector {
+    /// Robust confirmation prompt that works in both standalone terminals and IDE environments
+    /// Falls back to console input when dialoguer fails due to TTY detection issues
+    fn robust_confirm_prompt(prompt: &str, default: bool) -> Result<bool, anyhow::Error> {
+        // First try dialoguer (works in real terminals)
+        match Confirm::new()
+            .with_prompt(prompt)
+            .show_default(true)
+            .default(default)
+            .interact()
+        {
+            Ok(result) => Ok(result),
+            Err(dialoguer_err) => {
+                // dialoguer failed (likely due to TTY detection), fall back to console input
+                use console::Term;
+                use std::io::Write;
+                
+                let term = Term::stdout();
+                let default_str = if default { "Y/n" } else { "y/N" };
+                
+                // Show the prompt with default indication
+                print!("{} [{}]: ", prompt, default_str);
+                std::io::stdout().flush()?;
+                
+                // Read line from terminal
+                match term.read_line() {
+                    Ok(input) => {
+                        let input = input.trim().to_lowercase();
+                        match input.as_str() {
+                            "y" | "yes" => Ok(true),
+                            "n" | "no" => Ok(false),
+                            "" => Ok(default), // Empty input uses default
+                            _ => {
+                                // Invalid input, use default and inform user
+                                println!("Invalid input '{}', using default: {}", input, default);
+                                Ok(default)
+                            }
+                        }
+                    },
+                    Err(console_err) => {
+                        // Both dialoguer and console failed, return the original dialoguer error
+                        // but log both errors for debugging
+                        warn!("dialoguer failed: {}", dialoguer_err);
+                        warn!("console fallback also failed: {}", console_err);
+                        Err(anyhow::anyhow!("Failed to get user input: {}", dialoguer_err))
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Robust input prompt that works in both standalone terminals and IDE environments
+    /// Falls back to console input when dialoguer fails due to TTY detection issues
+    fn robust_input_prompt<T>(prompt: &str, default: T) -> Result<T, anyhow::Error> 
+    where 
+        T: Clone + std::str::FromStr + std::fmt::Display,
+        T::Err: std::fmt::Display,
+    {
+        // First try dialoguer (works in real terminals)
+        match Input::<T>::new()
+            .with_prompt(prompt)
+            .default(default.clone())
+            .interact()
+        {
+            Ok(result) => Ok(result),
+            Err(dialoguer_err) => {
+                // dialoguer failed (likely due to TTY detection), fall back to console input
+                use console::Term;
+                use std::io::Write;
+                
+                let term = Term::stdout();
+                
+                // Show the prompt with default indication
+                print!("{} [{}]: ", prompt, default);
+                std::io::stdout().flush()?;
+                
+                // Read line from terminal
+                match term.read_line() {
+                    Ok(input) => {
+                        let input = input.trim();
+                        if input.is_empty() {
+                            // Empty input uses default
+                            Ok(default)
+                        } else {
+                            // Try to parse the input
+                            match input.parse::<T>() {
+                                Ok(parsed) => Ok(parsed),
+                                Err(parse_err) => {
+                                    // Invalid input, use default and inform user
+                                    println!("Invalid input '{}' ({}), using default: {}", input, parse_err, default);
+                                    Ok(default)
+                                }
+                            }
+                        }
+                    },
+                    Err(console_err) => {
+                        // Both dialoguer and console failed, return the original dialoguer error
+                        warn!("dialoguer failed: {}", dialoguer_err);
+                        warn!("console fallback also failed: {}", console_err);
+                        Err(anyhow::anyhow!("Failed to get user input: {}", dialoguer_err))
+                    }
+                }
+            }
+        }
+    }
+    
     /// Creates instance of `Self` for grabbing and downloading posts.
     pub(crate) fn new(request_sender: &RequestSender) -> Self {
         // Default caps: 20GB per file, 100GB total
@@ -119,10 +224,7 @@ impl E621WebConnector {
         let default_total_size_gb = self.total_size_cap / 1024 / 1024;
 
         let file_size_prompt = format!("Maximum size for individual files in GB (default: {}GB)", default_file_size_gb);
-        let file_size_gb: u64 = Input::new()
-            .with_prompt(&file_size_prompt)
-            .default(default_file_size_gb)
-            .interact()
+        let file_size_gb: u64 = Self::robust_input_prompt(&file_size_prompt, default_file_size_gb)
             .unwrap_or_else(|err| {
                 warn!("Failed to get file size input: {}", err);
                 warn!("Using default file size limit: {}GB", default_file_size_gb);
@@ -130,10 +232,7 @@ impl E621WebConnector {
             });
 
         let total_size_prompt = format!("Maximum total download size in GB (default: {}GB)", default_total_size_gb);
-        let total_size_gb: u64 = Input::new()
-            .with_prompt(&total_size_prompt)
-            .default(default_total_size_gb)
-            .interact()
+        let total_size_gb: u64 = Self::robust_input_prompt(&total_size_prompt, default_total_size_gb)
             .unwrap_or_else(|err| {
                 warn!("Failed to get total size input: {}", err);
                 warn!("Using default total size limit: {}GB", default_total_size_gb);
@@ -150,10 +249,7 @@ impl E621WebConnector {
     /// Asks the user to configure the batch size for downloads.
     pub(crate) fn configure_batch_size(&mut self) {
         let batch_size_prompt = format!("Number of collections to download simultaneously (default: {})", self.batch_size);
-        let batch_size: usize = Input::new()
-            .with_prompt(&batch_size_prompt)
-            .default(self.batch_size)
-            .interact()
+        let batch_size: usize = Self::robust_input_prompt(&batch_size_prompt, self.batch_size)
             .unwrap_or_else(|err| {
                 warn!("Failed to get batch size input: {}", err);
                 warn!("Using default batch size: {}", self.batch_size);
@@ -166,10 +262,7 @@ impl E621WebConnector {
         println!("⚠️  Higher concurrency (5) may improve download speed but risks hitting e621's API rate limits.");
         println!("    This could result in temporary IP blocks or throttled connections.");
         
-        let enable_high_concurrency = Confirm::new()
-            .with_prompt(concurrency_prompt)
-            .default(false)
-            .interact()
+        let enable_high_concurrency = Self::robust_confirm_prompt(concurrency_prompt, false)
             .unwrap_or_else(|err| {
                 warn!("Failed to get concurrency input: {}", err);
                 warn!("Using default concurrency (3 downloads)");
@@ -232,11 +325,7 @@ impl E621WebConnector {
     pub(crate) fn should_enter_safe_mode(&mut self) {
         trace!("Prompt for safe mode...");
         
-        let confirm_prompt = Confirm::new()
-            .with_prompt("Should enter safe mode?")
-            .show_default(true)
-            .default(false)
-            .interact()
+        let confirm_prompt = Self::robust_confirm_prompt("Should enter safe mode?", false)
             .unwrap_or_else(|err| {
                 warn!("Failed to setup confirmation prompt: {}", err);
                 warn!("Defaulting to normal mode (safe mode: false) due to prompt failure.");
@@ -836,18 +925,18 @@ impl E621WebConnector {
                           total_size_in_gb, new_limit_in_gb);
 
                     // Ask if they want to proceed anyway
-                    let proceed_anyway = Confirm::new()
-                        .with_prompt(format!(
+                    let proceed_anyway = Self::robust_confirm_prompt(
+                        &format!(
                             "Download size ({:.2} GB) still exceeds your limit ({:.2} GB). Proceed anyway?",
                             total_size_in_gb, new_limit_in_gb
-                        ))
-                        .default(false)
-                        .interact()
-                        .unwrap_or_else(|err| {
-                            warn!("Failed to get confirmation: {}", err);
-                            warn!("Defaulting to not proceed due to prompt failure.");
-                            false
-                        });
+                        ),
+                        false
+                    )
+                    .unwrap_or_else(|err| {
+                        warn!("Failed to get confirmation: {}", err);
+                        warn!("Defaulting to not proceed due to prompt failure.");
+                        false
+                    });
 
                     proceed_anyway
                 } else {
@@ -869,10 +958,7 @@ impl E621WebConnector {
     pub(crate) fn confirm_exit(&self, message: &str) -> bool {
         let prompt = format!("{}\nDo you want to exit the program?", message);
 
-        Confirm::new()
-            .with_prompt(prompt)
-            .default(true)
-            .interact()
+        Self::robust_confirm_prompt(&prompt, true)
             .unwrap_or_else(|err| {
                 warn!("Failed to get exit confirmation: {}", err);
                 warn!("Defaulting to exit due to prompt failure.");
