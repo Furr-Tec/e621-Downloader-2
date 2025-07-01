@@ -59,12 +59,21 @@ impl Program {
             trace!("Tag file \"{}\" created...", TAG_NAME);
 
             info!("The tag file has been created.");
-            let confirm_exit = dialoguer::Confirm::new()
-                .with_prompt("Would you like to exit the application to edit the tag file before continuing?")
-                .default(true)
-                .show_default(true)
-                .interact()
-                .unwrap_or(false);
+            // Check if we're running in an interactive terminal environment
+            let term = Term::stdout();
+            let confirm_exit = if !term.is_term() {
+                // Non-interactive environment - default to false (continue)
+                warn!("Running in non-interactive environment. Continuing without editing tag file.");
+                false
+            } else {
+                // Interactive terminal - show the prompt
+                dialoguer::Confirm::new()
+                    .with_prompt("Would you like to exit the application to edit the tag file before continuing?")
+                    .default(true)
+                    .show_default(true)
+                    .interact()
+                    .unwrap_or(false)
+            };
             
             if confirm_exit {
                 info!("Exiting so you can edit the tag file to include the artists, sets, pools, and individual posts you wish to download.");
@@ -110,11 +119,15 @@ impl Program {
         } else {
             info!("Program will remain open. Press Enter to exit when ready.");
             
-            // Simple prompt for user to exit when ready
+            // Simple prompt for user to exit when ready - check if terminal is interactive
             let term = Term::stdout();
-            println!("\nPress Enter to exit...");
-            let _ = term.read_line();
-            info!("User requested exit. Closing application...");
+            if term.is_term() {
+                println!("\nPress Enter to exit...");
+                let _ = term.read_line();
+                info!("User requested exit. Closing application...");
+            } else {
+                info!("Non-interactive environment. Exiting automatically.");
+            }
         }
 
         Ok(())

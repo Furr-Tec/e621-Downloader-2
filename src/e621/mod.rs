@@ -7,7 +7,6 @@ use std::time::Duration;
 use sha2::{Sha512, Digest};
 use hex::encode as hex_encode;
 
-use anyhow::Context;
 use dialoguer::{Confirm, Input};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use crate::e621::blacklist::Blacklist;
@@ -114,25 +113,37 @@ impl E621WebConnector {
 
     /// Asks the user for file size limits and sets them in the connector.
     pub(crate) fn configure_size_limits(&mut self) {
+        use console::Term;
+        let term = Term::stdout();
+        
         // Default is 20GB per file
         let default_file_size_gb = self.file_size_cap / 1024 / 1024;
-
-        let file_size_prompt = format!("Maximum size for individual files in GB (default: {}GB)", default_file_size_gb);
-        let file_size_gb: u64 = Input::new()
-            .with_prompt(&file_size_prompt)
-            .default(default_file_size_gb)
-            .interact()
-            .unwrap_or(default_file_size_gb);
-
         // Default is 100GB total
         let default_total_size_gb = self.total_size_cap / 1024 / 1024;
 
-        let total_size_prompt = format!("Maximum total download size in GB (default: {}GB)", default_total_size_gb);
-        let total_size_gb: u64 = Input::new()
-            .with_prompt(&total_size_prompt)
-            .default(default_total_size_gb)
-            .interact()
-            .unwrap_or(default_total_size_gb);
+        let (file_size_gb, total_size_gb) = if !term.is_term() {
+            // Non-interactive environment - use defaults
+            warn!("Running in non-interactive environment. Using default size limits: {}GB per file, {}GB total.", 
+                  default_file_size_gb, default_total_size_gb);
+            (default_file_size_gb, default_total_size_gb)
+        } else {
+            // Interactive terminal - show prompts
+            let file_size_prompt = format!("Maximum size for individual files in GB (default: {}GB)", default_file_size_gb);
+            let file_size_gb: u64 = Input::new()
+                .with_prompt(&file_size_prompt)
+                .default(default_file_size_gb)
+                .interact()
+                .unwrap_or(default_file_size_gb);
+
+            let total_size_prompt = format!("Maximum total download size in GB (default: {}GB)", default_total_size_gb);
+            let total_size_gb: u64 = Input::new()
+                .with_prompt(&total_size_prompt)
+                .default(default_total_size_gb)
+                .interact()
+                .unwrap_or(default_total_size_gb);
+                
+            (file_size_gb, total_size_gb)
+        };
 
         // Convert GB to KB and store
         self.file_size_cap = file_size_gb * 1024 * 1024;
@@ -143,28 +154,41 @@ impl E621WebConnector {
 
     /// Asks the user to configure the batch size for downloads.
     pub(crate) fn configure_batch_size(&mut self) {
-        let batch_size_prompt = format!("Number of collections to download simultaneously (default: {})", self.batch_size);
-        let batch_size: usize = Input::new()
-            .with_prompt(&batch_size_prompt)
-            .default(self.batch_size)
-            .interact()
-            .unwrap_or(self.batch_size);
+        use console::Term;
+        let term = Term::stdout();
+        
+        let (batch_size, enable_high_concurrency) = if !term.is_term() {
+            // Non-interactive environment - use defaults
+            warn!("Running in non-interactive environment. Using default batch size: {} and concurrency: 3.", self.batch_size);
+            (self.batch_size, false)
+        } else {
+            // Interactive terminal - show prompts
+            let batch_size_prompt = format!("Number of collections to download simultaneously (default: {})", self.batch_size);
+            let batch_size: usize = Input::new()
+                .with_prompt(&batch_size_prompt)
+                .default(self.batch_size)
+                .interact()
+                .unwrap_or(self.batch_size);
+            
+            // Configure download concurrency
+            let concurrency_prompt = "Enable high concurrency downloads? (5 vs default 3, may hit API limits)";
+            println!("\nℹ️  Concurrency controls how many files can be downloaded simultaneously.");
+            println!("⚠️  Higher concurrency (5) may improve download speed but risks hitting e621's API rate limits.");
+            println!("    This could result in temporary IP blocks or throttled connections.");
+            
+            let enable_high_concurrency = Confirm::new()
+                .with_prompt(concurrency_prompt)
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+                
+            (batch_size, enable_high_concurrency)
+        };
 
         self.batch_size = batch_size.max(1); // Ensure at least 1
         info!("Batch size set to: {}", self.batch_size);
         
-        // Configure download concurrency
-        let concurrency_prompt = "Enable high concurrency downloads? (5 vs default 3, may hit API limits)";
-        println!("\nℹ️  Concurrency controls how many files can be downloaded simultaneously.");
-        println!("⚠️  Higher concurrency (5) may improve download speed but risks hitting e621's API rate limits.");
-        println!("    This could result in temporary IP blocks or throttled connections.");
-        
-        if Confirm::new()
-            .with_prompt(concurrency_prompt)
-            .default(false)
-            .interact()
-            .unwrap_or(false) 
-        {
+        if enable_high_concurrency {
             self.max_download_concurrency = 5;
             info!("High concurrency enabled: {} simultaneous downloads", self.max_download_concurrency);
         } else {
@@ -216,21 +240,37 @@ impl E621WebConnector {
     /// Gets input and enters safe depending on user choice.
     pub(crate) fn should_enter_safe_mode(&mut self) {
         trace!("Prompt for safe mode...");
-        let confirm_prompt = Confirm::new()
-            .with_prompt("Should enter safe mode?")
-            .show_default(true)
-            .default(false)
-            .interact()
-            .with_context(|| {
-                error!("Failed to setup confirmation prompt!");
-                "Terminal unable to set up confirmation prompt..."
-            })
-            .unwrap();
+        
+        // Check if we're running in an interactive terminal environment
+        use console::Term;
+        let term = Term::stdout();
+        
+        let confirm_prompt = if !term.is_term() {
+            // Non-interactive environment (e.g., IDE output, redirected output, CI/CD)
+            // Default to false (don't enter safe mode) for automated environments
+            warn!("Running in non-interactive environment. Defaulting to normal mode (safe mode: false). ");
+            false
+        } else {
+            // Interactive terminal - show the prompt
+            Confirm::new()
+                .with_prompt("Should enter safe mode?")
+                .show_default(true)
+                .default(false)
+                .interact()
+                .unwrap_or_else(|err| {
+                    error!("Failed to setup confirmation prompt: {}", err);
+                    warn!("Defaulting to normal mode (safe mode: false) due to prompt failure.");
+                    false // Default to false if the prompt fails
+                })
+        };
 
         trace!("Safe mode decision: {confirm_prompt}");
         if confirm_prompt {
+            info!("Entering safe mode as requested.");
             self.request_sender.update_to_safe();
             self.grabber.set_safe_mode(true);
+        } else {
+            info!("Continuing in normal mode.");
         }
     }
 
@@ -816,6 +856,18 @@ impl E621WebConnector {
 
         // Format size for display
         let formatted_size = self.format_file_size(total_size_kb);
+        
+        // Check if we're running in an interactive terminal environment
+        use console::Term;
+        let term = Term::stdout();
+
+        if !term.is_term() {
+            // Non-interactive environment - proceed with warning
+            warn!("Large download detected in non-interactive environment: {} files totaling {}.", 
+                  post_count, formatted_size);
+            warn!("This exceeds the recommended size of 20GB but proceeding automatically.");
+            return true;
+        }
 
         // Display warning and options
         println!("\n⚠️  WARNING: Large download detected!");
@@ -854,15 +906,20 @@ impl E621WebConnector {
                     info!("Total download size ({:.2} GB) still exceeds configured limit ({:.2} GB)",
                           total_size_in_gb, new_limit_in_gb);
 
-                    // Ask if they want to proceed anyway
-                    let proceed_anyway = Confirm::new()
-                        .with_prompt(format!(
-                            "Download size ({:.2} GB) still exceeds your limit ({:.2} GB). Proceed anyway?",
-                            total_size_in_gb, new_limit_in_gb
-                        ))
-                        .default(false)
-                        .interact()
-                        .unwrap_or(false);
+                    // Ask if they want to proceed anyway - check for terminal again
+                    let proceed_anyway = if !term.is_term() {
+                        warn!("Cannot show interactive prompt in non-interactive environment. Proceeding with download.");
+                        true
+                    } else {
+                        Confirm::new()
+                            .with_prompt(format!(
+                                "Download size ({:.2} GB) still exceeds your limit ({:.2} GB). Proceed anyway?",
+                                total_size_in_gb, new_limit_in_gb
+                            ))
+                            .default(false)
+                            .interact()
+                            .unwrap_or(false)
+                    };
 
                     proceed_anyway
                 } else {
@@ -882,6 +939,17 @@ impl E621WebConnector {
     /// Asks the user for confirmation before exiting
     /// Returns true if the user wants to exit, false to continue
     pub(crate) fn confirm_exit(&self, message: &str) -> bool {
+        // Check if we're running in an interactive terminal environment
+        use console::Term;
+        let term = Term::stdout();
+
+        if !term.is_term() {
+            // Non-interactive environment - default to exit
+            info!("{}", message);
+            info!("Running in non-interactive environment. Exiting automatically.");
+            return true;
+        }
+
         let prompt = format!("{}\nDo you want to exit the program?", message);
 
         Confirm::new()

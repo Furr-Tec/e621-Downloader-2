@@ -343,14 +343,13 @@ impl DirectoryManager {
                 .build()?;
 
             // First collect all files from directories in parallel using WalkDir
-            let mut all_files: Vec<PathBuf> = Vec::new();
-            let all_files_mutex = Arc::new(Mutex::new(&mut all_files));
+            let all_files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
             let file_count = Arc::new(AtomicUsize::new(0));
 
             // Scan all three directories in parallel using the scan pool
             scan_pool.scope(|s| {
                 // Scan artists directory
-                let files_mutex_clone = Arc::clone(&all_files_mutex);
+                let files_mutex_clone = Arc::clone(&all_files);
                 let count_clone = Arc::clone(&file_count);
                 let progress_clone = Arc::clone(&phase1_progress);
                 s.spawn(move |_| {
@@ -364,7 +363,7 @@ impl DirectoryManager {
                 });
                 
                 // Scan tags directory
-                let files_mutex_clone = Arc::clone(&all_files_mutex);
+                let files_mutex_clone = Arc::clone(&all_files);
                 let count_clone = Arc::clone(&file_count);
                 let progress_clone = Arc::clone(&phase1_progress);
                 s.spawn(move |_| {
@@ -378,7 +377,7 @@ impl DirectoryManager {
                 });
                 
                 // Scan pools directory
-                let files_mutex_clone = Arc::clone(&all_files_mutex);
+                let files_mutex_clone = Arc::clone(&all_files);
                 let count_clone = Arc::clone(&file_count);
                 let progress_clone = Arc::clone(&phase1_progress);
                 s.spawn(move |_| {
@@ -419,10 +418,14 @@ impl DirectoryManager {
             let hash_threads = num_cpus::get();
 
             // Optionally prioritize largest files to maximize core utilization on SSD/NVMe
-            let mut all_files_for_hash = all_files.clone();
-            all_files_for_hash.sort_unstable_by_key(|p| {
-                fs::metadata(p).map(|m| -(m.len() as i64)).unwrap_or(0)
-            });
+            let mut all_files_for_hash = {
+                let files_guard = all_files.lock().unwrap();
+                let mut files_vec = files_guard.clone();
+                files_vec.sort_unstable_by_key(|p| {
+                    fs::metadata(p).map(|m| -(m.len() as i64)).unwrap_or(0)
+                });
+                files_vec
+            };
 
             // Dynamic chunk size logic
             let chunk_size = if total_files < 8_000 {
@@ -560,7 +563,7 @@ impl DirectoryManager {
         dir: &Path, 
         section_name: &str, 
         progress_bar: &Arc<ProgressBar>,
-        files_mutex: Arc<Mutex<&mut Vec<PathBuf>>>,
+        files_mutex: Arc<Mutex<Vec<PathBuf>>>,
         file_count: Arc<AtomicUsize>
     ) {
         // Check if directory exists
