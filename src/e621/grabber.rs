@@ -688,7 +688,7 @@ impl Grabber {
         filtered: &mut u16,
         invalid_posts: &mut u16,
     ) {
-        const THREAD_COUNT: usize = 4;
+        let thread_count = Config::get().parallel_search_threads();
         const RATE_LIMIT_DELAY: Duration = Duration::from_millis(250); // 250ms between requests per thread
         
         let progress_bar = ProgressBar::new_spinner();
@@ -697,7 +697,7 @@ impl Grabber {
                 .template("{spinner:.green} Parallel searching {msg}...")
                 .unwrap_or_else(|_| ProgressStyle::default_spinner())
         );
-        progress_bar.set_message("batches of 4 pages");
+        progress_bar.set_message(format!("batches of {} pages", thread_count));
         
         let mut batch_start = 1u16;
         let mut total_pages = 0;
@@ -706,9 +706,9 @@ impl Grabber {
             // Channel for this batch
             let (result_tx, result_rx) = mpsc::channel::<(u16, Vec<PostEntry>)>();
             
-            // Spawn threads for this batch (pages: batch_start, batch_start+1, batch_start+2, batch_start+3)
+            // Spawn threads for this batch
             let mut handles = Vec::new();
-            for thread_id in 0..THREAD_COUNT {
+            for thread_id in 0..thread_count {
                 let page_to_search = batch_start + thread_id as u16;
                 let request_sender = self.request_sender.clone();
                 let searching_tag = searching_tag.to_string();
@@ -735,7 +735,7 @@ impl Grabber {
             
             // Collect results from this batch
             let mut batch_results = Vec::new();
-            for _ in 0..THREAD_COUNT {
+            for _ in 0..thread_count {
                 if let Ok((page, searched_posts)) = result_rx.recv() {
                     batch_results.push((page, searched_posts));
                     total_pages += 1;
@@ -764,19 +764,19 @@ impl Grabber {
                 }
             }
             
-            progress_bar.set_message(format!("processed {} pages in batches of 4", total_pages));
+            progress_bar.set_message(format!("processed {} pages in batches of {}", total_pages, thread_count));
             
             // If no posts found in this entire batch, we're done
             if !found_posts_in_batch {
                 break;
             }
             
-            // Move to next batch of 4 pages
-            batch_start += THREAD_COUNT as u16;
+            // Move to next batch
+            batch_start += thread_count as u16;
         }
         
         progress_bar.finish_with_message(format!("Found {} posts across {} pages using {} threads in batches", 
-                                                posts.len(), total_pages, THREAD_COUNT));
+                                                posts.len(), total_pages, thread_count));
     }
 
     fn general_search(

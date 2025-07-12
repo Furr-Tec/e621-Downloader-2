@@ -40,6 +40,9 @@ pub(crate) struct Config {
     /// Whether to use simplified folder structure (only Tags, no Artists/Pools)
     #[serde(rename = "simplifiedFolders", default = "default_simplified_folders")]
     simplified_folders: bool,
+    /// Number of parallel threads for searching pages (default: 4)
+    #[serde(rename = "parallelSearchThreads", default = "default_parallel_search_threads")]
+    parallel_search_threads: usize,
     #[serde(skip)]
     directory_manager: Option<DirectoryManager>,
 }
@@ -47,6 +50,7 @@ pub(crate) struct Config {
 fn default_batch_size() -> usize { 4 }
 fn default_download_concurrency() -> usize { 3 }
 fn default_simplified_folders() -> bool { true }
+fn default_parallel_search_threads() -> usize { 4 }
 
 static CONFIG: OnceCell<Config> = OnceCell::new();
 
@@ -74,6 +78,11 @@ impl Config {
     /// Whether to use simplified folder structure
     pub(crate) fn simplified_folders(&self) -> bool {
         self.simplified_folders
+    }
+
+    /// Number of parallel threads for searching pages
+    pub(crate) fn parallel_search_threads(&self) -> usize {
+        self.parallel_search_threads
     }
 
     /// Get the directory manager instance
@@ -143,6 +152,7 @@ impl Default for Config {
             batch_size: default_batch_size(),
             download_concurrency: default_download_concurrency(),
             simplified_folders: default_simplified_folders(),
+            parallel_search_threads: default_parallel_search_threads(),
             directory_manager: None,
         }
     }
