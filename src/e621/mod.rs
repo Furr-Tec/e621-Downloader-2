@@ -613,6 +613,20 @@ impl E621WebConnector {
             // Get the actual total post count we calculated earlier
             let post_count = total_post_count;
 
+            // Initialize progress bar for large downloads
+            self.progress_bar = ProgressBar::new(post_count as u64);
+            
+            // Configure progress bar to show file counts and download size
+            let total_size_formatted = self.format_file_size(length * 1024); // Convert KB to bytes for formatting
+            let progress_style = ProgressStyle::default_bar()
+                .template(&format!("{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} files ({}) - {{msg}}", total_size_formatted))
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-");
+            self.progress_bar.set_style(progress_style);
+            
+            // Enable the progress bar to be displayed during downloads
+            self.progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+
             // Confirm large download with the user
             if !self.confirm_large_download(length, post_count) {
                 info!("Download cancelled by user.");
@@ -768,14 +782,8 @@ impl E621WebConnector {
             console::style(format!("\"{}\"", collection_info.name)).color256(39).italic()
         );
 
-        // Configure progress bar with proper styling and length - track file counts
-        self.progress_bar.set_length(new_files as u64);
-        self.progress_bar.set_position(0); // Reset position for new collection
-        let progress_style = ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files - {prefix}: {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("#>-");
-        self.progress_bar.set_style(progress_style);
+        // Don't reset progress bar for individual collections - use the main progress bar
+        // Just update the prefix to show current collection name
 
         // Set progress bar prefix to current collection (limited to 15 chars for consistent width)
         let short_name = if collection_info.short_name.len() > 13 {
@@ -903,6 +911,7 @@ impl E621WebConnector {
         info!("Using concurrency level: {} (recommended: {}, memory usage: {:.1}%)", 
               final_concurrency, optimal_concurrency, concurrency_recommendation.memory_info.usage_percentage);
         
+        
         // Declare the rayon thread pool with optimized concurrency
         let pool = ThreadPoolBuilder::new()
             .num_threads(final_concurrency)
@@ -922,14 +931,16 @@ impl E621WebConnector {
                     
                     // Helper closure for status updates (without incrementing)
                     let update_status = |status: &str| {
+                        let current = download_counter.load(Ordering::SeqCst);
                         progress_bar.set_message(format!("{}: {}", status, filename));
+                        progress_bar.set_position(current as u64);
                     };
                     
                     // Helper closure for completing a file (with progress increment)
                     let complete_file = |status: &str| {
-                        let _current = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let current = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
                         progress_bar.set_message(format!("{}: {}", status, filename));
-                        progress_bar.inc(1); // Increment by 1 file, not file size
+                        progress_bar.set_position(current as u64);
                     };
                     
                     // Check for duplicates
@@ -967,15 +978,27 @@ impl E621WebConnector {
                         return;
                     }
                     let file_path_str = file_path.to_string_lossy();
+                    
+                    // Track download start time for speed calculation
+                    let download_start = std::time::Instant::now();
+                    let file_size = post.file_size_bytes();
+                    
+                    update_status("Starting download");
                     let download_result = download_fn(post.url(), &file_path);
                     match download_result {
                         Ok(_) => {
                             // File was downloaded and saved successfully
                             // Now calculate hash and update tracking info
+                            let duration = download_start.elapsed();
+                            let speed_kbps = file_size as f64 / 1024.0 / duration.as_secs_f64();
+                            
                             trace!("Saved {}...", file_path_str);
+                            update_status(&format!("Verifying hash ({:.2} KB/s)", speed_kbps));
                             let hash_result = calculate_hash(&file_path);
                             match hash_result {
                                 Ok(hash) => {
+                                    update_status(&format!("Saving to database ({:.2} KB/s)", speed_kbps));
+                                    
                                     // Store hash with the downloaded file for future verification
                                     let relpath = save_dir.join(post.name());
                                     let relpath_str = relpath
@@ -985,11 +1008,16 @@ impl E621WebConnector {
                                     let mut dm = dir_manager.lock().unwrap();
                                     dm.mark_file_downloaded_with_hash_simple(&relpath_str, hash.clone());
                                     trace!("Stored hash {} for post {}", hash, post.name());
-                                    // Show success message with file counts
-                                    complete_file("Downloaded & verified");
+                                    // Show success message with file counts and speed
+                                    complete_file(&format!("Downloaded & verified ({:.2} KB/s)", speed_kbps));
                                 },
                                 Err(e) => {
                                     warn!("Failed to calculate hash for {}: {}", file_path_str, e);
+                                    
+                                    // Calculate download speed even for hash verification failure
+                                    let duration = download_start.elapsed();
+                                    let speed_kbps = file_size as f64 / 1024.0 / duration.as_secs_f64();
+                                    
                                     let relpath = save_dir.join(post.name());
                                     let relpath_str = relpath
                                         .strip_prefix(Config::get().download_directory())
@@ -997,7 +1025,7 @@ impl E621WebConnector {
                                         .to_string_lossy();
                                     let mut dm = dir_manager.lock().unwrap();
                                     dm.mark_file_downloaded(&relpath_str);
-                                    complete_file("Saved but not verified");
+                                    complete_file(&format!("Saved but not verified ({:.2} KB/s)", speed_kbps));
                                 }
                             }
                         }
@@ -1013,8 +1041,9 @@ impl E621WebConnector {
             } // for post in posts
         }); // pool.scope
 
-        // Finish the progress bar to prevent further status updates
-        progress_bar.finish_with_message("Done");
+        // Don't finish the main progress bar here - it continues across collections
+        // Just log completion of this collection
+        info!("Completed downloading {} files from collection: {}", new_files, collection_info.name);
 
         // No more batch Vec or manual batch tracking is necessary here. Clean up and trace log.
         trace!("Collection {} is finished downloading...", collection_info.name);
