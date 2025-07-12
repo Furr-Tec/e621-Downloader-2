@@ -688,35 +688,95 @@ impl Grabber {
         filtered: &mut u16,
         invalid_posts: &mut u16,
     ) {
-        let mut page = 1;
+        const THREAD_COUNT: usize = 4;
+        const RATE_LIMIT_DELAY: Duration = Duration::from_millis(250); // 250ms between requests per thread
+        
         let progress_bar = ProgressBar::new_spinner();
         progress_bar.set_style(
             ProgressStyle::default_spinner()
-                .template("{spinner:.green} Searching {msg}...")
+                .template("{spinner:.green} Parallel searching {msg}...")
                 .unwrap_or_else(|_| ProgressStyle::default_spinner())
         );
-        progress_bar.set_message(format!("page {}", page));
-
+        progress_bar.set_message("batches of 4 pages");
+        
+        let mut batch_start = 1u16;
+        let mut total_pages = 0;
+        
         loop {
-            let page_start = Instant::now();
-            let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page).posts;
+            // Channel for this batch
+            let (result_tx, result_rx) = mpsc::channel::<(u16, Vec<PostEntry>)>();
             
-            if searched_posts.is_empty() {
+            // Spawn threads for this batch (pages: batch_start, batch_start+1, batch_start+2, batch_start+3)
+            let mut handles = Vec::new();
+            for thread_id in 0..THREAD_COUNT {
+                let page_to_search = batch_start + thread_id as u16;
+                let request_sender = self.request_sender.clone();
+                let searching_tag = searching_tag.to_string();
+                let result_tx = result_tx.clone();
+                
+                let handle = thread::spawn(move || {
+                    let page_start = Instant::now();
+                    let searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
+                    
+                    trace!("Thread {} - Page {} completed in {:.2?} - found {} posts", 
+                           thread_id, page_to_search, page_start.elapsed(), searched_posts.len());
+                    
+                    // Send results back
+                    let _ = result_tx.send((page_to_search, searched_posts));
+                    
+                    // Rate limiting - wait between requests
+                    thread::sleep(RATE_LIMIT_DELAY);
+                });
+                handles.push(handle);
+            }
+            
+            // Drop our copy of the result sender
+            drop(result_tx);
+            
+            // Collect results from this batch
+            let mut batch_results = Vec::new();
+            for _ in 0..THREAD_COUNT {
+                if let Ok((page, searched_posts)) = result_rx.recv() {
+                    batch_results.push((page, searched_posts));
+                    total_pages += 1;
+                }
+            }
+            
+            // Wait for all threads in this batch to complete
+            for handle in handles {
+                let _ = handle.join();
+            }
+            
+            // Sort results by page number to maintain order
+            batch_results.sort_by_key(|(page, _)| *page);
+            
+            // Process results and check if we should continue
+            let mut found_posts_in_batch = false;
+            for (_page, mut searched_posts) in batch_results {
+                if !searched_posts.is_empty() {
+                    found_posts_in_batch = true;
+                    
+                    // Process the posts
+                    *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
+                    *invalid_posts += Self::remove_invalid_posts(&mut searched_posts);
+                    searched_posts.reverse();
+                    posts.append(&mut searched_posts);
+                }
+            }
+            
+            progress_bar.set_message(format!("processed {} pages in batches of 4", total_pages));
+            
+            // If no posts found in this entire batch, we're done
+            if !found_posts_in_batch {
                 break;
             }
-
-            *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
-            *invalid_posts += Self::remove_invalid_posts(&mut searched_posts);
-
-            searched_posts.reverse();
-            posts.append(&mut searched_posts);
             
-            trace!("Page {} completed in {:.2?} - found {} posts", page, page_start.elapsed(), searched_posts.len());
-            page += 1;
-            progress_bar.set_message(format!("page {}", page));
+            // Move to next batch of 4 pages
+            batch_start += THREAD_COUNT as u16;
         }
         
-        progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), page - 1));
+        progress_bar.finish_with_message(format!("Found {} posts across {} pages using {} threads in batches", 
+                                                posts.len(), total_pages, THREAD_COUNT));
     }
 
     fn general_search(
@@ -726,35 +786,8 @@ impl Grabber {
         filtered: &mut u16,
         invalid_posts: &mut u16,
     ) {
-        let mut page = 1;
-        let progress_bar = ProgressBar::new_spinner();
-        progress_bar.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} Searching {msg}...")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner())
-        );
-        progress_bar.set_message(format!("page {}", page));
-        
-        loop {
-            let page_start = Instant::now();
-            let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page).posts;
-            
-            if searched_posts.is_empty() {
-                break;
-            }
-
-            *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
-            *invalid_posts += Self::remove_invalid_posts(&mut searched_posts);
-
-            searched_posts.reverse();
-            posts.append(&mut searched_posts);
-            
-            trace!("Page {} completed in {:.2?} - found {} posts", page, page_start.elapsed(), searched_posts.len());
-            page += 1;
-            progress_bar.set_message(format!("page {}", page));
-        }
-        
-        progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), page - 1));
+        // Use the same parallel implementation as special_search
+        self.special_search(searching_tag, posts, filtered, invalid_posts);
     }
 
     fn filter_posts_with_blacklist(&self, posts: &mut Vec<PostEntry>) -> u16 {
