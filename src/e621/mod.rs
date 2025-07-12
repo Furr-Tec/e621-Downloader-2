@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs::{create_dir_all, File};
 use std::io::Read;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use sha2::{Sha512, Digest};
 use hex::encode as hex_encode;
 
@@ -116,6 +116,103 @@ impl<'a> LazyCollectionProcessor<'a> {
 }
 
 use rayon::ThreadPoolBuilder;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+use std::collections::VecDeque;
+use num_cpus;
+
+/// Represents a download job in the pipeline
+#[derive(Debug, Clone)]
+struct DownloadJob {
+    url: String,
+    file_path: PathBuf,
+    post_name: String,
+    file_size: i64,
+    hash: Option<String>,
+    save_directory: PathBuf,
+}
+
+/// Represents a completed download ready for hashing
+#[derive(Debug)]
+struct DownloadedFile {
+    file_path: PathBuf,
+    post_name: String,
+    file_size: i64,
+    hash: Option<String>,
+    save_directory: PathBuf,
+    download_duration: Duration,
+}
+
+/// Represents a hashing job
+#[derive(Debug)]
+struct HashingJob {
+    file_path: PathBuf,
+    post_name: String,
+    file_size: i64,
+    expected_hash: Option<String>,
+    save_directory: PathBuf,
+    download_duration: Duration,
+}
+
+/// Represents a completed file processing result
+#[derive(Debug)]
+struct ProcessedFile {
+    post_name: String,
+    file_path: PathBuf,
+    save_directory: PathBuf,
+    calculated_hash: String,
+    download_duration: Duration,
+    hash_duration: Duration,
+    file_size: i64,
+    success: bool,
+    error_message: Option<String>,
+}
+
+/// Configuration for the multicore pipeline
+#[derive(Debug, Clone)]
+struct PipelineConfig {
+    total_cores: usize,
+    download_threads: usize,
+    hash_threads: usize,
+    download_queue_size: usize,
+    hash_queue_size: usize,
+}
+
+impl PipelineConfig {
+    /// Creates a new pipeline configuration based on system capabilities
+    fn new() -> Self {
+        let total_cores = num_cpus::get();
+        let download_threads = std::cmp::max(1, total_cores / 2);
+        let hash_threads = std::cmp::max(1, total_cores - download_threads);
+        
+        // Queue sizes based on thread counts to prevent memory overflow
+        let download_queue_size = download_threads * 4; // 4 jobs per thread
+        let hash_queue_size = hash_threads * 4; // 4 jobs per thread
+        
+        PipelineConfig {
+            total_cores,
+            download_threads,
+            hash_threads,
+            download_queue_size,
+            hash_queue_size,
+        }
+    }
+    
+    /// Adjusts the configuration based on user concurrency settings
+    fn with_user_concurrency(mut self, user_concurrency: usize) -> Self {
+        // Respect user's total concurrency preference but split intelligently
+        let total_requested = user_concurrency;
+        self.download_threads = std::cmp::max(1, total_requested / 2);
+        self.hash_threads = std::cmp::max(1, total_requested - self.download_threads);
+        
+        // Adjust queue sizes accordingly
+        self.download_queue_size = self.download_threads * 4;
+        self.hash_queue_size = self.hash_threads * 4;
+        
+        self
+    }
+}
+
 impl CollectionInfo {
     /// Creates a new CollectionInfo from a PostCollection
     fn from_collection(collection: &grabber::PostCollection) -> Self {
@@ -827,8 +924,20 @@ impl E621WebConnector {
         info!("Download process has completed successfully.");
     }
 
-    /// Downloads a single collection
+    /// Downloads a single collection using multicore pipeline
     fn download_single_collection(&mut self, collection_info: &CollectionInfo) {
+        // Get pipeline configuration
+        let pipeline_config = PipelineConfig::new().with_user_concurrency(self.max_download_concurrency);
+        
+        info!("🚀 Multicore pipeline configured: {} download threads, {} hash threads (total: {} cores)", 
+              pipeline_config.download_threads, pipeline_config.hash_threads, pipeline_config.total_cores);
+        
+        // Use multicore pipeline for this collection
+        self.download_collection_with_pipeline(collection_info, pipeline_config);
+    }
+    
+    /// Downloads a collection using the multicore pipeline system
+    fn download_collection_with_pipeline(&mut self, collection_info: &CollectionInfo, config: PipelineConfig) {
         // Get directory manager
         let dir_manager = match Config::get().directory_manager() {
             Ok(manager_ref) => Arc::new(Mutex::new(manager_ref.clone())), // assumes DirectoryManager: Clone
@@ -839,6 +948,143 @@ impl E621WebConnector {
                 return;
             }
         };
+
+        // Queue for download jobs and completed downloads
+        let (download_tx, download_rx): (Sender<DownloadJob>, Receiver<DownloadJob>) = channel();
+        let (completed_tx, completed_rx): (Sender<DownloadedFile>, Receiver<DownloadedFile>) = channel();
+
+        // Queue for hashing jobs and completed processing
+        let (hash_tx, hash_rx): (Sender<HashingJob>, Receiver<HashingJob>) = channel();
+        let (processed_tx, processed_rx): (Sender<ProcessedFile>, Receiver<ProcessedFile>) = channel();
+        
+        // Wrap receivers in Arc<Mutex<>> for sharing across threads
+        let download_rx = Arc::new(Mutex::new(download_rx));
+        let hash_rx = Arc::new(Mutex::new(hash_rx));
+
+        // Initialize job queue
+        let mut download_queue = VecDeque::new();
+
+        // Thread pool for downloads
+        let download_pool = ThreadPoolBuilder::new()
+            .num_threads(config.download_threads)
+            .build()
+            .expect("Failed to create download thread pool");
+
+        // Thread pool for hashing
+        let hash_pool = ThreadPoolBuilder::new()
+            .num_threads(config.hash_threads)
+            .build()
+            .expect("Failed to create hash thread pool");
+
+        // Clone shared variables
+        let progress_bar = self.progress_bar.clone();
+        let request_sender = self.request_sender.clone();
+        let global_progress_counter = Arc::clone(&self.global_progress_counter);
+
+        // Create cloneable functions for the threads
+        let download_fn = self.clone_download_fn();
+        let calculate_hash = self.clone_calculate_hash();
+        
+        // Spawn download threads
+        let mut download_handles = Vec::new();
+        for _ in 0..config.download_threads {
+            let download_rx = Arc::clone(&download_rx);
+            let completed_tx = completed_tx.clone();
+            let download_fn = Arc::clone(&download_fn);
+        
+            let handle = thread::spawn(move || {
+                loop {
+                    let job = {
+                        let rx = download_rx.lock().unwrap();
+                        rx.recv()
+                    };
+                    
+                    match job {
+                        Ok(job) => {
+                            // Perform download
+                            let start_time = Instant::now();
+                            let download_result = download_fn(&job.url, &job.file_path);
+                            let duration = start_time.elapsed();
+                            
+                            match download_result {
+                                Ok(_) => {
+                                    // Send completed download
+                                    let completed_file = DownloadedFile {
+                                        file_path: job.file_path,
+                                        post_name: job.post_name,
+                                        file_size: job.file_size,
+                                        hash: job.hash.clone(),
+                                        save_directory: job.save_directory.clone(),
+                                        download_duration: duration,
+                                    };
+                                    let _ = completed_tx.send(completed_file);
+                                },
+                                Err(_) => {
+                                    // Handle download error - could log here
+                                }
+                            }
+                        },
+                        Err(_) => break, // Channel closed
+                    }
+                }
+            });
+            download_handles.push(handle);
+        }
+
+        // Spawn hashing threads
+        let mut hash_handles = Vec::new();
+        for _ in 0..config.hash_threads {
+            let hash_rx = Arc::clone(&hash_rx);
+            let processed_tx = processed_tx.clone();
+            let calculate_hash = Arc::clone(&calculate_hash);
+
+            let handle = thread::spawn(move || {
+                loop {
+                    let job = {
+                        let rx = hash_rx.lock().unwrap();
+                        rx.recv()
+                    };
+                    
+                    match job {
+                        Ok(job) => {
+                            // Perform hashing
+                            let start_time = Instant::now();
+                            let hash_result = calculate_hash(&job.file_path);
+                            let duration = start_time.elapsed();
+
+                            let processed_file = match hash_result {
+                                Ok(calculated_hash) => ProcessedFile {
+                                    post_name: job.post_name,
+                                    file_path: job.file_path,
+                                    save_directory: job.save_directory.clone(),
+                                    calculated_hash,
+                                    download_duration: job.download_duration,
+                                    hash_duration: duration,
+                                    file_size: job.file_size,
+                                    success: true,
+                                    error_message: None,
+                                },
+                                Err(err) => ProcessedFile {
+                                    post_name: job.post_name,
+                                    file_path: job.file_path,
+                                    save_directory: job.save_directory.clone(),
+                                    calculated_hash: String::new(),
+                                    download_duration: job.download_duration,
+                                    hash_duration: duration,
+                                    file_size: job.file_size,
+                                    success: false,
+                                    error_message: Some(err.to_string()),
+                                },
+                            };
+
+                            let _ = processed_tx.send(processed_file);
+                        },
+                        Err(_) => break, // Channel closed
+                    }
+                }
+            });
+            hash_handles.push(handle);
+        }
 
         let progress_bar = self.progress_bar.clone();
 
@@ -853,20 +1099,19 @@ impl E621WebConnector {
         }
 
         // Count new files that will be downloaded
-        let new_files = collection_info.new_files_count();
-        if new_files == 0 {
+        let new_files: Vec<_> = collection_info.posts().iter().filter(|post| post.is_new()).collect();
+        let total_files = new_files.len();
+        
+        if total_files == 0 {
             // No new files to download in this collection
             return;
         }
 
         info!(
             "Found {} new files to download in {}",
-            new_files,
+            total_files,
             console::style(format!("\"{}\"", collection_info.name)).color256(39).italic()
         );
-
-        // Don't reset progress bar for individual collections - use the main progress bar
-        // Just update the prefix to show current collection name
 
         // Set progress bar prefix to current collection (limited to 15 chars for consistent width)
         let short_name = if collection_info.short_name.len() > 13 {
@@ -875,263 +1120,116 @@ impl E621WebConnector {
             collection_info.short_name.clone()
         };
         self.progress_bar.set_prefix(short_name);
-        trace!("Collection Name:            \"{}\"", collection_info.name);
-        trace!("Collection Category:        \"{}\"", collection_info.category);
-        trace!("Collection Post Length:     \"{}\"", collection_info.posts.len());
-
-        // Process each post in this collection using batches to prevent stack overflow
-        let posts = collection_info.posts();
-
-        // Detect potentially problematic collections based on size and complexity
-        const LARGE_COLLECTION_THRESHOLD: usize = 50; // Collections with more than 50 files
-        const LARGE_FILE_SIZE_THRESHOLD: i64 = 100 * 1024 * 1024; // 100MB in bytes
-
-        let is_problematic = posts.len() > LARGE_COLLECTION_THRESHOLD ||
-            posts.iter().any(|post| post.file_size_bytes() > LARGE_FILE_SIZE_THRESHOLD);
-        let _batch_size = if is_problematic {
-            // Calculate total size in MB for logging
-            let total_size_bytes: i64 = posts.iter().map(|p| p.file_size_bytes()).sum();
-            let total_size_mb = total_size_bytes / (1024 * 1024);
-
-            info!("Large collection detected: '{}' with {} files ({}MB total). Using smaller batch size for memory efficiency.",
-                  collection_info.name, posts.len(), total_size_mb);
-            5  // Very small batches for large collections
-        } else {
-            10 // Normal batch size for smaller collections
-        };
-
-        // Convert the post slice to a Vec of only new posts first to simplify processing 
-        // Use an iterator rather than collecting to avoid extra memory allocation
-        let dir_manager_arc = Arc::clone(&dir_manager);
-        let progress_bar = progress_bar.clone();
-        let posts: Vec<_> = posts.iter().filter(|post| post.is_new()).cloned().collect();
-        let _new_files = posts.len();
-
-        // Use the global progress counter instead of a local one
-        let global_progress_counter = Arc::clone(&self.global_progress_counter);
-
-        // Extract functions from self that we'll need in threads
-        let request_sender = self.request_sender.clone();
-
-        // Create download function - use the same logic as download_file_with_streaming
-        let download_fn = Arc::new(move |url: &str, path: &Path| -> Result<(), anyhow::Error> {
-            // Create parent directory if it doesn't exist
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            // Get the bytes from the URL
-            let bytes = match request_sender.get_bytes_from_url(url) {
-                Ok(data) => data,
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to download from URL {}: {}", url, e));
+        
+        // Prepare download jobs
+        for post in &new_files {
+            let save_dir = match post.save_directory() {
+                Some(dir) => dir,
+                None => {
+                    error!(
+                        "Post does not have a save directory assigned: {}",
+                        post.name()
+                    );
+                    continue;
                 }
             };
-
-            // Write the bytes to the file directly
-            let file_path_display = path.display();
-            if let Err(e) = std::fs::write(path, &bytes) {
-                return Err(anyhow::anyhow!("Failed to write to file {}: {}", file_path_display, e));
+            
+            let file_path = save_dir.join(remove_invalid_chars(post.name()));
+            
+            let download_job = DownloadJob {
+                url: post.url().to_string(),
+                file_path,
+                post_name: post.name().to_string(),
+                file_size: post.file_size_bytes(),
+                hash: post.sha512_hash().map(|s| s.to_string()),
+                save_directory: save_dir.clone(),
+            };
+            
+            download_queue.push_back(download_job);
+        }
+        
+        // Start pipeline processing
+        info!("Starting pipeline: {} jobs queued for download", download_queue.len());
+        
+        // Feed initial jobs to download threads
+        for _ in 0..std::cmp::min(config.download_queue_size, download_queue.len()) {
+            if let Some(job) = download_queue.pop_front() {
+                download_tx.send(job).unwrap();
             }
-
-            Ok(())
-        });
-
-        // Create hash calculation function - use the same logic as calculate_sha512_optimized
-        let calculate_hash = Arc::new(|file_path: &Path| -> Result<String, anyhow::Error> {
-            const LARGE_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32MB
-
-            let file = File::open(file_path)?;
-            let metadata = file.metadata()?;
-            let file_size = metadata.len();
-
-            // For large files, use memory mapping for better performance and memory efficiency
-            if file_size > LARGE_FILE_THRESHOLD {
-                // Use memory mapping for large files
-                let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
-                let mut hasher = Sha512::new();
-                hasher.update(&mmap[..]);
-                let hash = hasher.finalize();
-
-                Ok(hex_encode(hash))
-            } else {
-                // For smaller files, use heap-allocated buffers instead of stack buffers
-                let mut hasher = Sha512::new();
-                let mut buffer = vec![0; 1024 * 1024]; // 1MB buffer allocated on the heap
-                let mut reader = &file;
-
-                loop {
-                    let bytes_read = reader.read(&mut buffer)?;
-
-                    if bytes_read == 0 {
-                        break; // End of file
-                    }
-
-                    hasher.update(&buffer[..bytes_read]);
+        }
+        
+        // Pipeline coordination loop
+        let mut files_completed = 0;
+        let mut files_processing = 0;
+        
+        loop {
+            // Process completed downloads
+            if let Ok(downloaded_file) = completed_rx.try_recv() {
+                files_processing += 1;
+                
+                // Create hashing job
+                let hash_job = HashingJob {
+                    file_path: downloaded_file.file_path,
+                    post_name: downloaded_file.post_name,
+                    file_size: downloaded_file.file_size,
+                    expected_hash: downloaded_file.hash,
+                    save_directory: downloaded_file.save_directory,
+                    download_duration: downloaded_file.download_duration,
+                };
+                
+                // Send to hash queue
+                hash_tx.send(hash_job).unwrap();
+                
+                // Feed more download jobs if available
+                if let Some(job) = download_queue.pop_front() {
+                    download_tx.send(job).unwrap();
                 }
-
-                let hash = hasher.finalize();
-                Ok(hex_encode(hash))
             }
-        });
-        // Get optimal concurrency based on current system state for comparison
-        let concurrency_recommendation = self.memory_manager.calculate_optimal_concurrency();
-        let optimal_concurrency = concurrency_recommendation.concurrency;
-        
-        // Always use the user's chosen concurrency level - they made the choice for a reason
-        let final_concurrency = self.max_download_concurrency;
-        
-        // Warn if the user's choice is significantly higher than recommended
-        if final_concurrency > optimal_concurrency * 2 {
-            warn!("User concurrency ({}) is much higher than recommended ({}). Memory usage: {:.1}%", 
-                  final_concurrency, optimal_concurrency, concurrency_recommendation.memory_info.usage_percentage);
-            warn!("This may cause performance issues or connection failures.");
+            
+            // Process completed hashes
+            if let Ok(processed_file) = processed_rx.try_recv() {
+                files_completed += 1;
+                files_processing -= 1;
+                
+                // Update progress and database
+                let current = global_progress_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                
+                if processed_file.success {
+                    let speed_kbps = processed_file.file_size as f64 / 1024.0 / processed_file.download_duration.as_secs_f64();
+                    
+                    // Store hash with the downloaded file for future verification
+                    let relpath = processed_file.save_directory.join(&processed_file.post_name);
+                    let relpath_str = relpath
+                        .strip_prefix(Config::get().download_directory())
+                        .unwrap_or(&relpath)
+                        .to_string_lossy();
+                    let mut dm = dir_manager.lock().unwrap();
+                    dm.mark_file_downloaded_with_hash_simple(&relpath_str, processed_file.calculated_hash.clone());
+                    
+                    progress_bar.set_message(format!("Downloaded & verified: {} ({:.2} KB/s)", processed_file.post_name, speed_kbps));
+                    trace!("Stored hash {} for post {}", processed_file.calculated_hash, processed_file.post_name);
+                } else {
+                    warn!("Failed to process {}: {}", processed_file.post_name, processed_file.error_message.unwrap_or_else(|| "Unknown error".to_string()));
+                    progress_bar.set_message(format!("Error processing: {}", processed_file.post_name));
+                }
+                
+                progress_bar.set_position(current as u64);
+            }
+            
+            // Check if all files are done
+            if files_completed >= total_files {
+                break;
+            }
+            
+            // Small delay to prevent busy waiting
+            std::thread::sleep(Duration::from_millis(10));
         }
         
-        // Log memory allocation if high concurrency is being used
-        if final_concurrency > 8 {
-            info!("High concurrency mode: Allocating additional memory buffers for {} threads", final_concurrency);
-        }
+        // Wait for all threads to complete
+        drop(download_tx);
+        drop(hash_tx);
         
-        info!("Using concurrency level: {} (recommended: {}, memory usage: {:.1}%)", 
-              final_concurrency, optimal_concurrency, concurrency_recommendation.memory_info.usage_percentage);
-        
-        
-        // Declare the rayon thread pool with optimized concurrency
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(final_concurrency)
-            .build()
-            .expect("Failed to create download thread pool");
-        pool.scope(|s| {
-            for post in posts.into_iter() {
-                let dir_manager = Arc::clone(&dir_manager_arc);
-                let progress_bar = progress_bar.clone();
-                let global_counter = Arc::clone(&global_progress_counter);
-                let download_fn = Arc::clone(&download_fn);
-                let calculate_hash = Arc::clone(&calculate_hash);
-                s.spawn(move |_| {
-                    let filename = post.name();
-                    let hash = post.sha512_hash();
-                    let hash_ref = hash.as_deref();
-                    
-                    // Helper closure for status updates (without incrementing global counter)
-                    let update_status = |status: &str| {
-                        let current = global_counter.load(Ordering::SeqCst);
-                        progress_bar.set_message(format!("{}: {}", status, filename));
-                        progress_bar.set_position(current as u64);
-                    };
-                    
-                    // Helper closure for completing a file (with global progress increment)
-                    let complete_file = |status: &str| {
-                        let current = global_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        progress_bar.set_message(format!("{}: {}", status, filename));
-                        progress_bar.set_position(current as u64);
-                    };
-                    
-                    // Check for duplicates
-                    let is_dup = {
-                        let dm = dir_manager.lock().unwrap();
-                        dm.is_duplicate_iterative(filename, hash_ref)
-                    };
-                    if is_dup {
-                        complete_file("Duplicate");
-                        drop(progress_bar);
-                        return;
-                    }
-                    update_status("Downloading");
-
-                    let save_dir = match post.save_directory() {
-                        Some(dir) => dir,
-                        None => {
-                            error!(
-                                "Post does not have a save directory assigned: {}",
-                                post.name()
-                            );
-                            complete_file("Error: No directory");
-                            drop(progress_bar);
-                            return;
-                        }
-                    };
-                    let file_path = save_dir.join(remove_invalid_chars(post.name()));
-
-                    if let Err(err) = create_dir_all(&save_dir) {
-                        let path_str = save_dir.to_string_lossy();
-                        error!("Could not create directory for images: {}", err);
-                        error!("Path: {}", path_str);
-                        complete_file("Error: Bad directory path");
-                        drop(progress_bar);
-                        return;
-                    }
-                    let file_path_str = file_path.to_string_lossy();
-                    
-                    // Track download start time for speed calculation
-                    let download_start = std::time::Instant::now();
-                    let file_size = post.file_size_bytes();
-                    
-                    update_status("Starting download");
-                    let download_result = download_fn(post.url(), &file_path);
-                    match download_result {
-                        Ok(_) => {
-                            // File was downloaded and saved successfully
-                            // Now calculate hash and update tracking info
-                            let duration = download_start.elapsed();
-                            let speed_kbps = file_size as f64 / 1024.0 / duration.as_secs_f64();
-                            
-                            trace!("Saved {}...", file_path_str);
-                            update_status(&format!("Verifying hash ({:.2} KB/s)", speed_kbps));
-                            let hash_result = calculate_hash(&file_path);
-                            match hash_result {
-                                Ok(hash) => {
-                                    update_status(&format!("Saving to database ({:.2} KB/s)", speed_kbps));
-                                    
-                                    // Store hash with the downloaded file for future verification
-                                    let relpath = save_dir.join(post.name());
-                                    let relpath_str = relpath
-                                        .strip_prefix(Config::get().download_directory())
-                                        .unwrap_or(&relpath)
-                                        .to_string_lossy();
-                                    let mut dm = dir_manager.lock().unwrap();
-                                    dm.mark_file_downloaded_with_hash_simple(&relpath_str, hash.clone());
-                                    trace!("Stored hash {} for post {}", hash, post.name());
-                                    // Show success message with file counts and speed
-                                    complete_file(&format!("Downloaded & verified ({:.2} KB/s)", speed_kbps));
-                                },
-                                Err(e) => {
-                                    warn!("Failed to calculate hash for {}: {}", file_path_str, e);
-                                    
-                                    // Calculate download speed even for hash verification failure
-                                    let duration = download_start.elapsed();
-                                    let speed_kbps = file_size as f64 / 1024.0 / duration.as_secs_f64();
-                                    
-                                    let relpath = save_dir.join(post.name());
-                                    let relpath_str = relpath
-                                        .strip_prefix(Config::get().download_directory())
-                                        .unwrap_or(&relpath)
-                                        .to_string_lossy();
-                                    let mut dm = dir_manager.lock().unwrap();
-                                    dm.mark_file_downloaded(&relpath_str);
-                                    complete_file(&format!("Saved but not verified ({:.2} KB/s)", speed_kbps));
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            error!("Failed to download/save image {}: {}", file_path_str, err);
-                            // Show error message with file counts
-                            complete_file("Error: Download failed");
-                        }
-                    }
-                    // Explicitly drop the progress bar clone so thread does not outlive intended scope
-                    drop(progress_bar);
-                }); // s.spawn
-            } // for post in posts
-        }); // pool.scope
-
-        // Don't finish the main progress bar here - it continues across collections
-        // Just log completion of this collection
-        info!("Completed downloading {} files from collection: {}", new_files, collection_info.name);
-
-        // No more batch Vec or manual batch tracking is necessary here. Clean up and trace log.
+        info!("Completed downloading {} files from collection: {}", total_files, collection_info.name);
         trace!("Collection {} is finished downloading...", collection_info.name);
     }
     /// Gets the total size (in KB) of every post image to be downloaded.
@@ -1229,6 +1327,75 @@ impl E621WebConnector {
             })
     }
 
+    /// Helper method to create a cloneable download function
+    fn clone_download_fn(&self) -> Arc<dyn Fn(&str, &Path) -> Result<(), anyhow::Error> + Send + Sync> {
+        let request_sender = self.request_sender.clone();
+        
+        Arc::new(move |url: &str, path: &Path| -> Result<(), anyhow::Error> {
+            // Create parent directory if it doesn't exist
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Get the bytes from the URL
+            let bytes = match request_sender.get_bytes_from_url(url) {
+                Ok(data) => data,
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to download from URL {}: {}", url, e));
+                }
+            };
+
+            // Write the bytes to the file directly
+            let file_path_display = path.display();
+            if let Err(e) = std::fs::write(path, &bytes) {
+                return Err(anyhow::anyhow!("Failed to write to file {}: {}", file_path_display, e));
+            }
+
+            Ok(())
+        })
+    }
+    
+    /// Helper method to create a cloneable hash calculation function
+    fn clone_calculate_hash(&self) -> Arc<dyn Fn(&Path) -> Result<String, anyhow::Error> + Send + Sync> {
+        Arc::new(|file_path: &Path| -> Result<String, anyhow::Error> {
+            const LARGE_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32MB
+
+            let file = File::open(file_path)?;
+            let metadata = file.metadata()?;
+            let file_size = metadata.len();
+
+            // For large files, use memory mapping for better performance and memory efficiency
+            if file_size > LARGE_FILE_THRESHOLD {
+                // Use memory mapping for large files
+                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+                let mut hasher = Sha512::new();
+                hasher.update(&mmap[..]);
+                let hash = hasher.finalize();
+
+                Ok(hex_encode(hash))
+            } else {
+                // For smaller files, use heap-allocated buffers instead of stack buffers
+                let mut hasher = Sha512::new();
+                let mut buffer = vec![0; 1024 * 1024]; // 1MB buffer allocated on the heap
+                let mut reader = &file;
+
+                loop {
+                    let bytes_read = reader.read(&mut buffer)?;
+
+                    if bytes_read == 0 {
+                        break; // End of file
+                    }
+
+                    hasher.update(&buffer[..bytes_read]);
+                }
+
+                let hash = hasher.finalize();
+                Ok(hex_encode(hash))
+            }
+        })
+    }
+
     /// Gets the total size (in KB) of every post image to be downloaded.
     /// Includes validation to prevent unreasonable file sizes.
     fn get_total_file_size(&self) -> u64 {
@@ -1279,6 +1446,5 @@ impl E621WebConnector {
         // Convert bytes to KB before returning (as documented in function comment)
         total_size / 1024
     }
-
 }
 
