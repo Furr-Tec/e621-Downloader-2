@@ -118,16 +118,23 @@ impl E621WebConnector {
                 match term.read_line() {
                     Ok(input) => {
                         let input = input.trim().to_lowercase();
-                        match input.as_str() {
-                            "y" | "yes" => Ok(true),
-                            "n" | "no" => Ok(false),
-                            "" => Ok(default), // Empty input uses default
+                        let result = match input.as_str() {
+                            "y" | "yes" => true,
+                            "n" | "no" => false,
+                            "" => default, // Empty input uses default
                             _ => {
                                 // Invalid input, use default and inform user
                                 println!("Invalid input '{}', using default: {}", input, default);
-                                Ok(default)
+                                default
                             }
+                        };
+                        
+                        // Echo the result back to confirm
+                        if input.is_empty() {
+                            println!("{}", if result { "yes" } else { "no" });
                         }
+                        
+                        Ok(result)
                     },
                     Err(console_err) => {
                         // Both dialoguer and console failed, return the original dialoguer error
@@ -171,7 +178,8 @@ impl E621WebConnector {
                     Ok(input) => {
                         let input = input.trim();
                         if input.is_empty() {
-                            // Empty input uses default
+                            // Empty input uses default - echo the default value
+                            println!("{}", default);
                             Ok(default)
                         } else {
                             // Try to parse the input
@@ -644,7 +652,8 @@ impl E621WebConnector {
         );
 
         // Configure progress bar with proper styling and length
-        self.progress_bar = ProgressBar::new(new_files as u64);
+        self.progress_bar.set_length(new_files as u64);
+        self.progress_bar.set_position(0); // Reset position for new collection
         let progress_style = ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {prefix}: {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_bar())
