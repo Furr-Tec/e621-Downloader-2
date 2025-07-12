@@ -168,6 +168,8 @@ pub(crate) struct E621WebConnector {
     total_batches: usize,
     /// Memory manager for optimizing batch sizes and concurrency
     memory_manager: MemoryManager,
+    /// Global progress counter that tracks total files downloaded across all collections
+    global_progress_counter: Arc<AtomicUsize>,
 }
 
 impl E621WebConnector {
@@ -302,6 +304,7 @@ impl E621WebConnector {
             current_batch: 0,
             total_batches: 0,
             memory_manager: MemoryManager::new(),
+            global_progress_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -345,28 +348,108 @@ impl E621WebConnector {
                 self.batch_size
             });
         
-        // Configure download concurrency
-        let concurrency_prompt = "Enable high concurrency downloads? (5 vs default 3, may hit API limits)";
-        println!("\nℹ️  Concurrency controls how many files can be downloaded simultaneously.");
-        println!("⚠️  Higher concurrency (5) may improve download speed but risks hitting e621's API rate limits.");
-        println!("    This could result in temporary IP blocks or throttled connections.");
-        
-        let enable_high_concurrency = Self::robust_confirm_prompt(concurrency_prompt, false)
-            .unwrap_or_else(|err| {
-                warn!("Failed to get concurrency input: {}", err);
-                warn!("Using default concurrency (3 downloads)");
-                false
-            });
-
+        // Set the batch size (this was being overridden before)
         self.batch_size = batch_size.max(1); // Ensure at least 1
         info!("Batch size set to: {}", self.batch_size);
         
-        if enable_high_concurrency {
-            self.max_download_concurrency = 5;
-            info!("High concurrency enabled: {} simultaneous downloads", self.max_download_concurrency);
-        } else {
-            self.max_download_concurrency = 3;
-            info!("Using default concurrency: {} simultaneous downloads", self.max_download_concurrency);
+        // Configure download concurrency with more options
+        println!("\nℹ️  Concurrency controls how many files can be downloaded simultaneously.");
+        println!("📊 Available concurrency levels:");
+        println!("   • Conservative (3): Safe for most connections, minimal API stress");
+        println!("   • Standard (5): Good balance of speed and reliability");
+        println!("   • Aggressive (8): Fast downloads, moderate API stress");
+        println!("   • Maximum (12+): Fastest possible, high API stress risk");
+        println!("⚠️  Higher concurrency may improve download speed but risks hitting e621's API rate limits.");
+        println!("    This could result in temporary IP blocks or throttled connections.");
+        
+        let concurrency_options = &[
+            "Conservative (3 downloads)",
+            "Standard (5 downloads)", 
+            "Aggressive (8 downloads)",
+            "Maximum (12 downloads)",
+            "Ultra (16 downloads)",
+            "Custom (specify your own)",
+            "Override safeguards (20+ downloads)"
+        ];
+        
+        let selection = dialoguer::Select::new()
+            .with_prompt("Select concurrency level")
+            .default(1) // Default to Standard
+            .items(concurrency_options)
+            .interact()
+            .unwrap_or(1); // Fallback to Standard if dialog fails
+            
+        match selection {
+            0 => {
+                self.max_download_concurrency = 3;
+                info!("Conservative concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            },
+            1 => {
+                self.max_download_concurrency = 5;
+                info!("Standard concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            },
+            2 => {
+                self.max_download_concurrency = 8;
+                info!("Aggressive concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            },
+            3 => {
+                self.max_download_concurrency = 12;
+                info!("Maximum concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            },
+            4 => {
+                self.max_download_concurrency = 16;
+                info!("Ultra concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            },
+            5 => {
+                // Custom concurrency
+                let custom_concurrency_prompt = "Enter custom concurrency level (4-20)";
+                let custom_concurrency: usize = Self::robust_input_prompt(&custom_concurrency_prompt, 8)
+                    .unwrap_or_else(|err| {
+                        warn!("Failed to get custom concurrency input: {}", err);
+                        warn!("Using default custom concurrency: 8");
+                        8
+                    });
+                
+                self.max_download_concurrency = custom_concurrency.clamp(4, 20);
+                info!("Custom concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            },
+            6 => {
+                // Override safeguards
+                println!("\n⚠️  WARNING: You are about to override safety limits!");
+                println!("🚨 This may cause:");
+                println!("   • IP blocking from e621");
+                println!("   • Connection timeouts");
+                println!("   • Download failures");
+                println!("   • System instability");
+                
+                let confirm_override = Self::robust_confirm_prompt(
+                    "Are you sure you want to override safety limits?", 
+                    false
+                ).unwrap_or(false);
+                
+                if confirm_override {
+                    let extreme_concurrency_prompt = "Enter extreme concurrency level (WARNING: 20-50+)";
+                    let extreme_concurrency: usize = Self::robust_input_prompt(&extreme_concurrency_prompt, 20)
+                        .unwrap_or_else(|err| {
+                            warn!("Failed to get extreme concurrency input: {}", err);
+                            warn!("Using default extreme concurrency: 20");
+                            20
+                        });
+                    
+                    self.max_download_concurrency = extreme_concurrency.max(20); // No upper limit when overriding
+                    warn!("OVERRIDE: Extreme concurrency enabled: {} simultaneous downloads", self.max_download_concurrency);
+                    warn!("⚠️  You are responsible for any consequences of this setting!");
+                } else {
+                    // User cancelled override, use aggressive instead
+                    self.max_download_concurrency = 8;
+                    info!("Override cancelled. Using aggressive concurrency: {} simultaneous downloads", self.max_download_concurrency);
+                }
+            },
+            _ => {
+                // Fallback to standard
+                self.max_download_concurrency = 5;
+                info!("Fallback to standard concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            }
         }
     }
 
@@ -824,8 +907,8 @@ impl E621WebConnector {
         let posts: Vec<_> = posts.iter().filter(|post| post.is_new()).cloned().collect();
         let _new_files = posts.len();
 
-        // Atomic counter for thread-safe progress reporting
-        let download_counter = Arc::new(AtomicUsize::new(0));
+        // Use the global progress counter instead of a local one
+        let global_progress_counter = Arc::clone(&self.global_progress_counter);
 
         // Extract functions from self that we'll need in threads
         let request_sender = self.request_sender.clone();
@@ -892,21 +975,24 @@ impl E621WebConnector {
                 Ok(hex_encode(hash))
             }
         });
-        // Get optimal concurrency based on current system state
+        // Get optimal concurrency based on current system state for comparison
         let concurrency_recommendation = self.memory_manager.calculate_optimal_concurrency();
         let optimal_concurrency = concurrency_recommendation.concurrency;
         
-        // Use the recommended concurrency unless user explicitly set high concurrency
-        let final_concurrency = if self.max_download_concurrency > 5 {
-            // User explicitly chose high concurrency - respect their choice but warn if memory is low
-            if concurrency_recommendation.memory_info.is_warning() {
-                warn!("High concurrency selected but memory usage is high ({}%). Consider reducing concurrency if downloads fail.", 
-                      concurrency_recommendation.memory_info.usage_percentage);
-            }
-            self.max_download_concurrency
-        } else {
-            optimal_concurrency
-        };
+        // Always use the user's chosen concurrency level - they made the choice for a reason
+        let final_concurrency = self.max_download_concurrency;
+        
+        // Warn if the user's choice is significantly higher than recommended
+        if final_concurrency > optimal_concurrency * 2 {
+            warn!("User concurrency ({}) is much higher than recommended ({}). Memory usage: {:.1}%", 
+                  final_concurrency, optimal_concurrency, concurrency_recommendation.memory_info.usage_percentage);
+            warn!("This may cause performance issues or connection failures.");
+        }
+        
+        // Log memory allocation if high concurrency is being used
+        if final_concurrency > 8 {
+            info!("High concurrency mode: Allocating additional memory buffers for {} threads", final_concurrency);
+        }
         
         info!("Using concurrency level: {} (recommended: {}, memory usage: {:.1}%)", 
               final_concurrency, optimal_concurrency, concurrency_recommendation.memory_info.usage_percentage);
@@ -921,7 +1007,7 @@ impl E621WebConnector {
             for post in posts.into_iter() {
                 let dir_manager = Arc::clone(&dir_manager_arc);
                 let progress_bar = progress_bar.clone();
-                let download_counter = Arc::clone(&download_counter);
+                let global_counter = Arc::clone(&global_progress_counter);
                 let download_fn = Arc::clone(&download_fn);
                 let calculate_hash = Arc::clone(&calculate_hash);
                 s.spawn(move |_| {
@@ -929,16 +1015,16 @@ impl E621WebConnector {
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
                     
-                    // Helper closure for status updates (without incrementing)
+                    // Helper closure for status updates (without incrementing global counter)
                     let update_status = |status: &str| {
-                        let current = download_counter.load(Ordering::SeqCst);
+                        let current = global_counter.load(Ordering::SeqCst);
                         progress_bar.set_message(format!("{}: {}", status, filename));
                         progress_bar.set_position(current as u64);
                     };
                     
-                    // Helper closure for completing a file (with progress increment)
+                    // Helper closure for completing a file (with global progress increment)
                     let complete_file = |status: &str| {
-                        let current = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let current = global_counter.fetch_add(1, Ordering::SeqCst) + 1;
                         progress_bar.set_message(format!("{}: {}", status, filename));
                         progress_bar.set_position(current as u64);
                     };
