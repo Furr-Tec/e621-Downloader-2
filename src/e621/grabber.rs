@@ -13,8 +13,6 @@ use crate::e621::io::{emergency_exit, Config, Login};
 use crate::e621::sender::entries::{PoolEntry, PostEntry, SetEntry};
 use crate::e621::sender::RequestSender;
 
-const POST_SEARCH_LIMIT: u8 = 5;
-
 /// A trait for implementing a conversion function for turning a type into a [Vec] of the same type
 pub(crate) trait NewVec<T> {
     fn new_vec(value: T) -> Vec<Self> where Self: Sized;
@@ -32,6 +30,10 @@ pub(crate) struct GrabbedPost {
     /// SHA-512 hash of the file contents, used for verification
     /// This is populated after the file is downloaded
     sha512_hash: Option<String>,
+    /// Short URL for the post (e.g., "e621.net/posts/123456")
+    short_url: Option<String>,
+    /// Post ID from e621
+    post_id: i64,
 }
 
 impl GrabbedPost {
@@ -92,6 +94,65 @@ impl GrabbedPost {
     pub(crate) fn has_hash(&self) -> bool {
         self.sha512_hash.is_some()
     }
+    
+    /// Gets the short URL for the post
+    pub(crate) fn short_url(&self) -> Option<&str> {
+        self.short_url.as_deref()
+    }
+    
+    /// Sets the short URL for the post
+    pub(crate) fn set_short_url(&mut self, short_url: String) {
+        self.short_url = Some(short_url);
+    }
+    
+    /// Gets the post ID
+    pub(crate) fn post_id(&self) -> i64 {
+        self.post_id
+    }
+    
+    /// Sets the post ID
+    pub(crate) fn set_post_id(&mut self, post_id: i64) {
+        self.post_id = post_id;
+    }
+    
+    /// Generates an enhanced filename with artist name and ID information
+    pub(crate) fn generate_enhanced_filename(post: &PostEntry, name_convention: &str, request_sender: &RequestSender) -> String {
+        // Get the base filename
+        let base_name = match name_convention {
+            "md5" => format!("{}.{}", post.file.md5, post.file.ext),
+            "id" => format!("{}.{}", post.id, post.file.ext),
+            _ => format!("{}.{}", post.id, post.file.ext), // Default to ID
+        };
+        
+        // If no artists, return base name
+        if post.tags.artist.is_empty() {
+            return base_name;
+        }
+        
+        // Collect artist info (name + ID)
+        let mut artist_info = Vec::new();
+        for artist_name in &post.tags.artist {
+            // Look up the artist tag to get the ID
+            let tag_entries = request_sender.get_tags_by_name(artist_name);
+            if let Some(tag_entry) = tag_entries.first() {
+                // Format: artistname_ID
+                artist_info.push(format!("{}_{}", artist_name, tag_entry.id));
+            } else {
+                // Fallback: just use the name if ID lookup fails
+                artist_info.push(artist_name.clone());
+            }
+        }
+        
+        // Combine artists with "+" separator if multiple
+        let artist_string = artist_info.join("+");
+        
+        // Get filename without extension
+        let file_stem = base_name.rsplitn(2, '.').nth(1).unwrap_or(&base_name);
+        let extension = base_name.rsplitn(2, '.').next().unwrap_or("jpg");
+        
+        // Final format: [base_filename]_by_[artist1_id+artist2_id].ext
+        format!("{}_by_{}.{}", file_stem, artist_string, extension)
+    }
 }
 
 impl NewVec<Vec<PostEntry>> for GrabbedPost {
@@ -103,6 +164,7 @@ impl NewVec<Vec<PostEntry>> for GrabbedPost {
                 if let Some(artist_tag) = e.tags.artist.first() {
                     post.set_artist(artist_tag.clone());
                 }
+                // Short URL is already set in the From trait implementation
                 // Check if this file has been downloaded before
                 // Use hash-based duplicate detection when available
                 let relpath = if let Some(dir) = post.save_directory() {
@@ -128,6 +190,7 @@ impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
                 if let Some(artist_tag) = e.tags.artist.first() {
                     post.set_artist(artist_tag.clone());
                 }
+                // Short URL is already set in the From trait implementation
                 // Check if this file has been downloaded before
                 // Use hash-based duplicate detection when available
                 let relpath = if let Some(dir) = post.save_directory() {
@@ -145,6 +208,7 @@ impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
 
 impl From<(&PostEntry, &str, u16)> for GrabbedPost {
     fn from((post, name, current_page): (&PostEntry, &str, u16)) -> Self {
+        let short_url = format!("e621.net/posts/{}", post.id);
         GrabbedPost {
             url: post.file.url.clone().unwrap(),
             name: format!("{} Page_{:05}.{}", name, current_page, post.file.ext),
@@ -153,12 +217,15 @@ impl From<(&PostEntry, &str, u16)> for GrabbedPost {
             artist: None,
             is_new: true,
             sha512_hash: None,
+            short_url: Some(short_url),
+            post_id: post.id,
         }
     }
 }
 
 impl From<(PostEntry, &str)> for GrabbedPost {
     fn from((post, name_convention): (PostEntry, &str)) -> Self {
+        let short_url = format!("e621.net/posts/{}", post.id);
         match name_convention {
             "md5" => GrabbedPost {
                 url: post.file.url.clone().unwrap(),
@@ -168,6 +235,8 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                 artist: None,
                 is_new: true,
                 sha512_hash: None,
+                short_url: Some(short_url),
+                post_id: post.id,
             },
             "id" => GrabbedPost {
                 url: post.file.url.clone().unwrap(),
@@ -177,6 +246,8 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                 artist: None,
                 is_new: true,
                 sha512_hash: None,
+                short_url: Some(short_url.clone()),
+                post_id: post.id,
             },
             _ => {
                 // This will terminate the program, so no need for unreachable code after it
@@ -540,7 +611,8 @@ impl Grabber {
         let mut invalid_posts = 0;
         match tag_search_type {
             TagSearchType::General => {
-                posts = Vec::with_capacity(320 * POST_SEARCH_LIMIT as usize);
+                // Start with a reasonable initial capacity, vector will grow as needed
+                posts = Vec::with_capacity(320);
                 self.general_search(searching_tag, &mut posts, &mut filtered, &mut invalid_posts);
             }
             TagSearchType::Special => {
@@ -613,20 +685,20 @@ impl Grabber {
         filtered: &mut u16,
         invalid_posts: &mut u16,
     ) {
-        let progress_bar = ProgressBar::new(POST_SEARCH_LIMIT as u64 - 1);
+        let mut page = 1;
+        let progress_bar = ProgressBar::new_spinner();
         progress_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:25.cyan/blue}] {pos}/{len} pages - {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("#>-")
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} Searching {msg}...")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
         );
+        progress_bar.set_message(format!("page {}", page));
         
-        for page in 1..POST_SEARCH_LIMIT {
+        loop {
             let page_start = Instant::now();
-            let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page as u16).posts;
+            let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page).posts;
             
             if searched_posts.is_empty() {
-                progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), page - 1));
                 break;
             }
 
@@ -637,11 +709,11 @@ impl Grabber {
             posts.append(&mut searched_posts);
             
             trace!("Page {} completed in {:.2?} - found {} posts", page, page_start.elapsed(), searched_posts.len());
-            progress_bar.set_message(format!("found {} posts", posts.len()));
-            progress_bar.inc(1);
+            page += 1;
+            progress_bar.set_message(format!("page {}", page));
         }
         
-        progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), POST_SEARCH_LIMIT - 1));
+        progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), page - 1));
     }
 
     fn filter_posts_with_blacklist(&self, posts: &mut Vec<PostEntry>) -> u16 {

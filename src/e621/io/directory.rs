@@ -1,4 +1,4 @@
-﻿use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::fs::{self, File};
 use sha2::{Sha512, Digest};
 use std::io::Read;
@@ -13,6 +13,7 @@ use memmap2::Mmap;
 use hex::encode as hex_encode;
 use serde::{Serialize, Deserialize};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use chrono::Utc;
 use crate::e621::tui::{ProgressBarBuilder, ProgressStyleBuilder};
 use crate::e621::io::file_metadata::{get_file_metadata, file_metadata_changed, FileMeta};
 mod walk; // Declare the walk submodule
@@ -23,6 +24,13 @@ struct HashDatabaseEntry {
     filename: String,
     /// SHA-512 hash of the file (when available)
     hash: Option<String>,
+    /// Short URL for the post (e.g., "e621.net/posts/123456")
+    short_url: Option<String>,
+    /// Post ID from e621
+    post_id: Option<i64>,
+    /// The date the file was downloaded
+    #[serde(default)]
+    download_date: Option<String>,
 }
 
 /// Stores and manages file hashes in a persistent JSON file
@@ -77,10 +85,35 @@ impl HashDatabase {
             .map(|(filename, hash)| HashDatabaseEntry {
                 filename: filename.clone(),
                 hash: hash.clone(),
+                short_url: None, // Will be updated when available
+                post_id: None, // Will be updated when available
+                download_date: None, // Will be updated when available
             })
             .collect();
             
         HashDatabase { entries }
+    }
+    
+    /// Add or update an entry with full metadata
+    fn add_or_update_entry(&mut self, filename: String, hash: Option<String>, short_url: Option<String>, post_id: Option<i64>) {
+        // Check if entry already exists
+        if let Some(existing_entry) = self.entries.iter_mut().find(|e| e.filename == filename) {
+            // Update existing entry
+            existing_entry.hash = hash;
+            existing_entry.short_url = short_url;
+            existing_entry.post_id = post_id;
+            existing_entry.download_date = Some(chrono::Utc::now().to_rfc3339());
+        } else {
+            // Create new entry
+            let new_entry = HashDatabaseEntry {
+                filename,
+                hash,
+                short_url,
+                post_id,
+                download_date: Some(chrono::Utc::now().to_rfc3339()),
+            };
+            self.entries.push(new_entry);
+        }
     }
 }
 
@@ -1024,6 +1057,24 @@ impl DirectoryManager {
         let hash_db = HashDatabase::from_hash_set(&self.downloaded_files);
         if let Err(e) = hash_db.save(&self.hash_db_path) {
             warn!("Failed to update hash database after adding file: {}", e);
+        }
+    }
+    
+    /// Adds a file entry with full metadata (URL, post ID, etc.) to the tracking system
+    pub(crate) fn add_or_update_entry(&mut self, file_name: String, hash: Option<String>, short_url: Option<String>, post_id: Option<i64>) {
+        // Add to the tracking set for compatibility with existing duplicate checking
+        self.downloaded_files.insert((file_name.clone(), hash.clone()));
+        
+        // Load current database, update it, and save
+        let mut hash_db = match HashDatabase::load(&self.hash_db_path) {
+            Ok(db) => db,
+            Err(_) => HashDatabase { entries: Vec::new() }
+        };
+        
+        hash_db.add_or_update_entry(file_name, hash, short_url, post_id);
+        
+        if let Err(e) = hash_db.save(&self.hash_db_path) {
+            warn!("Failed to update hash database with metadata: {}", e);
         }
     }
     /// Checks if a file exists by name or hash

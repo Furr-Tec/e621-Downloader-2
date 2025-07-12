@@ -130,6 +130,10 @@ struct DownloadJob {
     file_size: i64,
     hash: Option<String>,
     save_directory: PathBuf,
+    /// Short URL for the post (e.g., "e621.net/posts/123456")
+    short_url: Option<String>,
+    /// Post ID from e621
+    post_id: i64,
 }
 
 /// Represents a completed download ready for hashing
@@ -141,6 +145,10 @@ struct DownloadedFile {
     hash: Option<String>,
     save_directory: PathBuf,
     download_duration: Duration,
+    /// Short URL for the post (e.g., "e621.net/posts/123456")
+    short_url: Option<String>,
+    /// Post ID from e621
+    post_id: i64,
 }
 
 /// Represents a hashing job
@@ -152,6 +160,10 @@ struct HashingJob {
     expected_hash: Option<String>,
     save_directory: PathBuf,
     download_duration: Duration,
+    /// Short URL for the post (e.g., "e621.net/posts/123456")
+    short_url: Option<String>,
+    /// Post ID from e621
+    post_id: i64,
 }
 
 /// Represents a completed file processing result
@@ -166,6 +178,10 @@ struct ProcessedFile {
     file_size: i64,
     success: bool,
     error_message: Option<String>,
+    /// Short URL for the post (e.g., "e621.net/posts/123456")
+    short_url: Option<String>,
+    /// Post ID from e621
+    post_id: i64,
 }
 
 /// Configuration for the multicore pipeline
@@ -1016,6 +1032,8 @@ impl E621WebConnector {
                                         hash: job.hash.clone(),
                                         save_directory: job.save_directory.clone(),
                                         download_duration: duration,
+                                        short_url: job.short_url,
+                                        post_id: job.post_id,
                                     };
                                     let _ = completed_tx.send(completed_file);
                                 },
@@ -1063,6 +1081,8 @@ impl E621WebConnector {
                                     file_size: job.file_size,
                                     success: true,
                                     error_message: None,
+                                    short_url: job.short_url,
+                                    post_id: job.post_id,
                                 },
                                 Err(err) => ProcessedFile {
                                     post_name: job.post_name,
@@ -1074,6 +1094,8 @@ impl E621WebConnector {
                                     file_size: job.file_size,
                                     success: false,
                                     error_message: Some(err.to_string()),
+                                    short_url: job.short_url,
+                                    post_id: job.post_id,
                                 },
                             };
 
@@ -1143,6 +1165,8 @@ impl E621WebConnector {
                 file_size: post.file_size_bytes(),
                 hash: post.sha512_hash().map(|s| s.to_string()),
                 save_directory: save_dir.clone(),
+                short_url: post.short_url().map(|s| s.to_string()),
+                post_id: post.post_id(),
             };
             
             download_queue.push_back(download_job);
@@ -1175,6 +1199,8 @@ impl E621WebConnector {
                     expected_hash: downloaded_file.hash,
                     save_directory: downloaded_file.save_directory,
                     download_duration: downloaded_file.download_duration,
+                    short_url: downloaded_file.short_url,
+                    post_id: downloaded_file.post_id,
                 };
                 
                 // Send to hash queue
@@ -1197,17 +1223,23 @@ impl E621WebConnector {
                 if processed_file.success {
                     let speed_kbps = processed_file.file_size as f64 / 1024.0 / processed_file.download_duration.as_secs_f64();
                     
-                    // Store hash with the downloaded file for future verification
+                    // Store hash with the downloaded file for future verification including URL metadata
                     let relpath = processed_file.save_directory.join(&processed_file.post_name);
                     let relpath_str = relpath
                         .strip_prefix(Config::get().download_directory())
                         .unwrap_or(&relpath)
                         .to_string_lossy();
                     let mut dm = dir_manager.lock().unwrap();
-                    dm.mark_file_downloaded_with_hash_simple(&relpath_str, processed_file.calculated_hash.clone());
+                    dm.add_or_update_entry(
+                        relpath_str.to_string(),
+                        Some(processed_file.calculated_hash.clone()),
+                        processed_file.short_url.clone(),
+                        Some(processed_file.post_id),
+                    );
                     
                     progress_bar.set_message(format!("Downloaded & verified: {} ({:.2} KB/s)", processed_file.post_name, speed_kbps));
-                    trace!("Stored hash {} for post {}", processed_file.calculated_hash, processed_file.post_name);
+                    trace!("Stored hash {} and URL {} for post ID {}", processed_file.calculated_hash, 
+                           processed_file.short_url.as_deref().unwrap_or("N/A"), processed_file.post_id);
                 } else {
                     warn!("Failed to process {}: {}", processed_file.post_name, processed_file.error_message.unwrap_or_else(|| "Unknown error".to_string()));
                     progress_bar.set_message(format!("Error processing: {}", processed_file.post_name));

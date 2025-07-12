@@ -139,7 +139,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             download_directory: String::from("downloads/"),
-            naming_convention: String::from("md5"),
+            naming_convention: String::from("id"),
             batch_size: default_batch_size(),
             download_concurrency: default_download_concurrency(),
             simplified_folders: default_simplified_folders(),
