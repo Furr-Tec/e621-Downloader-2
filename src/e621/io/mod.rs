@@ -31,9 +31,22 @@ pub(crate) struct Config {
     /// The file naming convention (e.g "md5", "id").
     #[serde(rename = "fileNamingConvention")]
     naming_convention: String,
+    /// Batch size for processing collections (default: 4)
+    #[serde(rename = "batchSize", default = "default_batch_size")]
+    batch_size: usize,
+    /// Concurrency level for downloads (default: 3)
+    #[serde(rename = "downloadConcurrency", default = "default_download_concurrency")]
+    download_concurrency: usize,
+    /// Whether to use simplified folder structure (only Tags, no Artists/Pools)
+    #[serde(rename = "simplifiedFolders", default = "default_simplified_folders")]
+    simplified_folders: bool,
     #[serde(skip)]
     directory_manager: Option<DirectoryManager>,
 }
+
+fn default_batch_size() -> usize { 4 }
+fn default_download_concurrency() -> usize { 3 }
+fn default_simplified_folders() -> bool { true }
 
 static CONFIG: OnceCell<Config> = OnceCell::new();
 
@@ -46,6 +59,21 @@ impl Config {
     /// The file naming convention (e.g "md5", "id").
     pub(crate) fn naming_convention(&self) -> &str {
         &self.naming_convention
+    }
+
+    /// Batch size for processing collections
+    pub(crate) fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Concurrency level for downloads
+    pub(crate) fn download_concurrency(&self) -> usize {
+        self.download_concurrency
+    }
+
+    /// Whether to use simplified folder structure
+    pub(crate) fn simplified_folders(&self) -> bool {
+        self.simplified_folders
     }
 
     /// Get the directory manager instance
@@ -112,6 +140,9 @@ impl Default for Config {
         Config {
             download_directory: String::from("downloads/"),
             naming_convention: String::from("md5"),
+            batch_size: default_batch_size(),
+            download_concurrency: default_download_concurrency(),
+            simplified_folders: default_simplified_folders(),
             directory_manager: None,
         }
     }

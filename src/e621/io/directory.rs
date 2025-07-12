@@ -102,16 +102,21 @@ pub(crate) struct DirectoryManager {
     use_strict_verification: bool,
     /// Path to the hash database file
     hash_db_path: PathBuf,
+    /// Whether to use simplified folder structure (only Tags)
+    simplified_folders: bool,
 }
 
 impl DirectoryManager {
-    /// Creates a new DirectoryManager with the specified root directory
+    /// Creates a new DirectoryManager with the specified root directory and folder preferences
     pub(crate) fn new(root_dir: &str) -> Result<Self> {
         let root = PathBuf::from(root_dir);
         let artists = root.join("Artists");
         let tags = root.join("Tags");
         let pools = root.join("Pools");
         let hash_db_path = root.join("hash_database.json");
+        
+        // Use simplified folders by default (only Tags folder)
+        let simplified_folders = true;
         
         // Create a manager with empty downloaded files initially
         let mut manager = DirectoryManager {
@@ -122,6 +127,7 @@ impl DirectoryManager {
             downloaded_files: HashSet::new(),
             use_strict_verification: true, // Enable strict verification by default
             hash_db_path: hash_db_path.clone(),
+            simplified_folders,
         };
         
         // Create directory structure first
@@ -517,12 +523,22 @@ impl DirectoryManager {
     fn create_directory_structure(&self) -> Result<()> {
         fs::create_dir_all(&self.root_dir)
             .with_context(|| format!("Failed to create root directory at {:?}", self.root_dir))?;
-        fs::create_dir_all(&self.artists_dir)
-            .with_context(|| format!("Failed to create artists directory at {:?}", self.artists_dir))?;
-        fs::create_dir_all(&self.tags_dir)
-            .with_context(|| format!("Failed to create tags directory at {:?}", self.tags_dir))?;
-        fs::create_dir_all(&self.pools_dir)
-            .with_context(|| format!("Failed to create pools directory at {:?}", self.pools_dir))?;
+        
+        if self.simplified_folders {
+            // Only create Tags directory for simplified structure
+            fs::create_dir_all(&self.tags_dir)
+                .with_context(|| format!("Failed to create tags directory at {:?}", self.tags_dir))?;
+            info!("Using simplified folder structure - only Tags directory will be created");
+        } else {
+            // Create all directories for legacy structure
+            fs::create_dir_all(&self.artists_dir)
+                .with_context(|| format!("Failed to create artists directory at {:?}", self.artists_dir))?;
+            fs::create_dir_all(&self.tags_dir)
+                .with_context(|| format!("Failed to create tags directory at {:?}", self.tags_dir))?;
+            fs::create_dir_all(&self.pools_dir)
+                .with_context(|| format!("Failed to create pools directory at {:?}", self.pools_dir))?;
+            info!("Using full folder structure - Artists, Tags, and Pools directories will be created");
+        }
         Ok(())
     }
     /// Enable or disable strict SHA-512 verification

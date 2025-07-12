@@ -217,37 +217,35 @@ impl PostCollection {
         // Track how many posts were assigned directories
         let mut assigned_count = 0;
         
-        // Step 1: Set up base directory based on category
+        // Step 1: Set up base directory based on category (simplified structure)
+        // All content goes into Tags directory with appropriate subdirectories
         match self.category.as_str() {
             "Pools" => {
-                trace!("Setting up pool directory for '{}'", self.name);
-                self.base_directory = Some(dir_manager.get_pool_directory(&self.name)?);
+                trace!("Setting up tag directory for pool '{}'", self.name);
+                // Use Tags directory instead of separate Pools directory
+                self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
             }
             "Sets" => {
-                trace!("Setting up set directory for '{}'", self.name);
+                trace!("Setting up tag directory for set '{}'", self.name);
                 self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
             }
             "General Searches" => {
                 trace!("Setting up tag directory for general search '{}'", self.name);
-                // For general searches, create a tag directory as the base
                 self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
             }
             _ => {
-                // For single posts or other categories, handle individually
-                trace!("Processing individual posts for '{}'", self.name);
+                // For single posts or other categories, put them in Tags directory
+                trace!("Processing individual posts for '{}' in Tags directory", self.name);
                 for post in &mut self.posts {
-                    if let Some(artist) = post.artist() {
-                        let artist_dir = dir_manager.get_artist_directory(artist)?;
-                        trace!("Assigned artist directory for post '{}' to artist '{}'", post.name(), artist);
-                        post.set_save_directory(artist_dir);
-                        assigned_count += 1;
+                    // All posts go into Tags directory, optionally with artist subdirectory
+                    let base_dir = if post.artist().is_some() {
+                        dir_manager.get_tag_directory(&format!("artist_{}", post.artist().unwrap()))
                     } else {
-                        // Fallback for posts without artist
-                        let fallback_dir = dir_manager.get_tag_directory("unknown_artist")?;
-                        trace!("Assigned fallback directory for post '{}' with no artist", post.name());
-                        post.set_save_directory(fallback_dir);
-                        assigned_count += 1;
-                    }
+                        dir_manager.get_tag_directory("unknown_artist")
+                    }?;
+                    trace!("Assigned tag directory for post '{}'", post.name());
+                    post.set_save_directory(base_dir);
+                    assigned_count += 1;
                 }
             }
         }

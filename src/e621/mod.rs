@@ -13,12 +13,15 @@ use crate::e621::blacklist::Blacklist;
 use crate::e621::grabber::{Grabber, Shorten};
 use crate::e621::io::tag::Group;
 use crate::e621::io::{Config, Login};
+use crate::e621::memory::{MemoryManager, estimate_collection_memory_usage};
+use smallvec::SmallVec;
 use crate::e621::sender::entries::UserEntry;
 use crate::e621::sender::RequestSender;
 
 pub(crate) mod blacklist;
 pub(crate) mod grabber;
 pub(crate) mod io;
+pub(crate) mod memory;
 pub(crate) mod sender;
 pub(crate) mod tui;
 
@@ -36,8 +39,83 @@ struct CollectionInfo {
     posts: Box<Vec<grabber::GrabbedPost>>,
 }
 
-use rayon::ThreadPoolBuilder;
+/// Memory-efficient lazy iterator for processing large collections
+struct LazyCollectionProcessor<'a> {
+    /// Reference to the grabber
+    grabber: &'a Grabber,
+    /// Collection indices to process
+    collection_indices: SmallVec<usize, 8>,
+    /// Current collection being processed
+    current_collection_idx: usize,
+    /// Current post index within the current collection
+    current_post_idx: usize,
+}
 
+impl<'a> LazyCollectionProcessor<'a> {
+    /// Creates a new lazy processor for the given collection indices
+    fn new(grabber: &'a Grabber, indices: SmallVec<usize, 8>) -> Self {
+        LazyCollectionProcessor {
+            grabber,
+            collection_indices: indices,
+            current_collection_idx: 0,
+            current_post_idx: 0,
+        }
+    }
+    
+    /// Gets the next batch of posts for processing, limiting memory usage
+    fn next_batch(&mut self, batch_size: usize) -> Option<(String, SmallVec<&grabber::GrabbedPost, 32>)> {
+        if self.current_collection_idx >= self.collection_indices.len() {
+            return None;
+        }
+        
+        let collection_idx = self.collection_indices[self.current_collection_idx];
+        let collection = &self.grabber.posts()[collection_idx];
+        let posts = collection.posts();
+        
+        if self.current_post_idx >= posts.len() {
+            // Move to next collection
+            self.current_collection_idx += 1;
+            self.current_post_idx = 0;
+            return self.next_batch(batch_size);
+        }
+        
+        // Collect up to batch_size new posts
+        let mut batch: SmallVec<&grabber::GrabbedPost, 32> = SmallVec::new();
+        let start_idx = self.current_post_idx;
+        
+        for (idx, post) in posts[start_idx..].iter().enumerate() {
+            if batch.len() >= batch_size {
+                break;
+            }
+            if post.is_new() {
+                batch.push(post);
+            }
+            self.current_post_idx = start_idx + idx + 1;
+        }
+        
+        if batch.is_empty() {
+            // No new posts in this collection, move to next
+            self.current_collection_idx += 1;
+            self.current_post_idx = 0;
+            return self.next_batch(batch_size);
+        }
+        
+        Some((collection.name().to_string(), batch))
+    }
+    
+    /// Estimates the total number of new posts across all collections
+    fn estimate_total_new_posts(&self) -> usize {
+        self.collection_indices.iter()
+            .map(|&idx| {
+                self.grabber.posts()[idx].posts().iter()
+                    .filter(|post| post.is_new())
+                    .count()
+            })
+            .sum()
+    }
+}
+
+use rayon::ThreadPoolBuilder;
 impl CollectionInfo {
     /// Creates a new CollectionInfo from a PostCollection
     fn from_collection(collection: &grabber::PostCollection) -> Self {
@@ -88,6 +166,8 @@ pub(crate) struct E621WebConnector {
     current_batch: usize,
     /// Total number of batches
     total_batches: usize,
+    /// Memory manager for optimizing batch sizes and concurrency
+    memory_manager: MemoryManager,
 }
 
 impl E621WebConnector {
@@ -221,6 +301,7 @@ impl E621WebConnector {
             max_download_concurrency: 3, // Default concurrency level
             current_batch: 0,
             total_batches: 0,
+            memory_manager: MemoryManager::new(),
         }
     }
 
@@ -496,10 +577,38 @@ impl E621WebConnector {
         self.total_batches = (total_collections + self.batch_size - 1) / self.batch_size;
 
         // Check if we should use memory-efficient mode
-        const MAX_POSTS_PER_BATCH: usize = 1000; // Keep the same threshold
-
+        
+        let estimated_memory_per_post = estimate_collection_memory_usage(1, 1024 * 1024);  // Average 1MB per post
+        
+        let avg_posts_per_collection = if total_collections > 0 {
+            approx_total_posts / total_collections
+        } else {
+            1
+        };
+        
+        let batch_size_recommendation = self.memory_manager.calculate_optimal_batch_size(
+            total_collections,
+            avg_posts_per_collection,
+            estimated_memory_per_post,
+        );
+        
+        self.batch_size = batch_size_recommendation.batch_size;
+        
+        // Provide feedback about memory optimization
+        if batch_size_recommendation.memory_info.is_warning() {
+            warn!("High memory usage detected ({}). Using smaller batch sizes for safety.", 
+                  batch_size_recommendation.memory_info.format_usage());
+        }
+        
+        info!("Optimized batch size: {} collections per batch (reasoning: {})", 
+              self.batch_size, 
+              match batch_size_recommendation.reasoning {
+                  crate::e621::memory::BatchSizeReasoning::MemoryLimited => "memory limited",
+                  crate::e621::memory::BatchSizeReasoning::CpuLimited => "CPU limited",
+              });
+        
         // Process collections
-        if approx_total_posts > MAX_POSTS_PER_BATCH * 2 {
+        if approx_total_posts > self.batch_size * 2 {
             // For very large downloads, we'll process one collection at a time
             // Get the actual total post count we calculated earlier
             let post_count = total_post_count;
@@ -559,8 +668,15 @@ impl E621WebConnector {
                 .map(|info| info.new_files_count())
                 .sum();
 
-            // Set progress bar total to exact number of files to be downloaded (never over- or under-count)
-            self.progress_bar = ProgressBar::new(new_post_count as u64);
+        // Set progress bar total to exact number of files to be downloaded (never over- or under-count)
+        self.progress_bar = ProgressBar::new(new_post_count as u64);
+        
+        // Configure progress bar to show file counts instead of file sizes
+        let progress_style = ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("#>-");
+        self.progress_bar.set_style(progress_style);
 
             // Confirm with user if download size is large
             if !self.confirm_large_download(length, new_post_count) {
@@ -651,11 +767,11 @@ impl E621WebConnector {
             console::style(format!("\"{}\"", collection_info.name)).color256(39).italic()
         );
 
-        // Configure progress bar with proper styling and length
+        // Configure progress bar with proper styling and length - track file counts
         self.progress_bar.set_length(new_files as u64);
         self.progress_bar.set_position(0); // Reset position for new collection
         let progress_style = ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {prefix}: {msg}")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files - {prefix}: {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-");
         self.progress_bar.set_style(progress_style);
@@ -697,7 +813,7 @@ impl E621WebConnector {
         let dir_manager_arc = Arc::clone(&dir_manager);
         let progress_bar = progress_bar.clone();
         let posts: Vec<_> = posts.iter().filter(|post| post.is_new()).cloned().collect();
-        let new_files = posts.len();
+        let _new_files = posts.len();
 
         // Atomic counter for thread-safe progress reporting
         let download_counter = Arc::new(AtomicUsize::new(0));
@@ -767,10 +883,28 @@ impl E621WebConnector {
                 Ok(hex_encode(hash))
             }
         });
-        // Declare the rayon thread pool with configured concurrency
-        // Declare the rayon thread pool with configured concurrency
+        // Get optimal concurrency based on current system state
+        let concurrency_recommendation = self.memory_manager.calculate_optimal_concurrency();
+        let optimal_concurrency = concurrency_recommendation.concurrency;
+        
+        // Use the recommended concurrency unless user explicitly set high concurrency
+        let final_concurrency = if self.max_download_concurrency > 5 {
+            // User explicitly chose high concurrency - respect their choice but warn if memory is low
+            if concurrency_recommendation.memory_info.is_warning() {
+                warn!("High concurrency selected but memory usage is high ({}%). Consider reducing concurrency if downloads fail.", 
+                      concurrency_recommendation.memory_info.usage_percentage);
+            }
+            self.max_download_concurrency
+        } else {
+            optimal_concurrency
+        };
+        
+        info!("Using concurrency level: {} (recommended: {}, memory usage: {:.1}%)", 
+              final_concurrency, optimal_concurrency, concurrency_recommendation.memory_info.usage_percentage);
+        
+        // Declare the rayon thread pool with optimized concurrency
         let pool = ThreadPoolBuilder::new()
-            .num_threads(self.max_download_concurrency)
+            .num_threads(final_concurrency)
             .build()
             .expect("Failed to create download thread pool");
         pool.scope(|s| {
@@ -785,12 +919,16 @@ impl E621WebConnector {
                     let hash = post.sha512_hash();
                     let hash_ref = hash.as_deref();
                     
-                    // Helper closure for progress updates and increments
-                    let update_progress = |status: &str| {
-                        let current = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        let display_count = std::cmp::min(current, new_files);
-                        progress_bar.set_message(format!("[{}/{}] {}: {}", display_count, new_files, status, filename));
-                        progress_bar.inc(post.file_size() as u64);
+                    // Helper closure for status updates (without incrementing)
+                    let update_status = |status: &str| {
+                        progress_bar.set_message(format!("{}: {}", status, filename));
+                    };
+                    
+                    // Helper closure for completing a file (with progress increment)
+                    let complete_file = |status: &str| {
+                        let _current = download_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        progress_bar.set_message(format!("{}: {}", status, filename));
+                        progress_bar.inc(1); // Increment by 1 file, not file size
                     };
                     
                     // Check for duplicates
@@ -799,11 +937,11 @@ impl E621WebConnector {
                         dm.is_duplicate_iterative(filename, hash_ref)
                     };
                     if is_dup {
-                        update_progress("Duplicate");
+                        complete_file("Duplicate");
                         drop(progress_bar);
                         return;
                     }
-                    update_progress("Downloading");
+                    update_status("Downloading");
 
                     let save_dir = match post.save_directory() {
                         Some(dir) => dir,
@@ -812,7 +950,7 @@ impl E621WebConnector {
                                 "Post does not have a save directory assigned: {}",
                                 post.name()
                             );
-                            update_progress("Error: No directory");
+                            complete_file("Error: No directory");
                             drop(progress_bar);
                             return;
                         }
@@ -823,7 +961,7 @@ impl E621WebConnector {
                         let path_str = save_dir.to_string_lossy();
                         error!("Could not create directory for images: {}", err);
                         error!("Path: {}", path_str);
-                        update_progress("Error: Bad directory path");
+                        complete_file("Error: Bad directory path");
                         drop(progress_bar);
                         return;
                     }
@@ -847,7 +985,7 @@ impl E621WebConnector {
                                     dm.mark_file_downloaded_with_hash_simple(&relpath_str, hash.clone());
                                     trace!("Stored hash {} for post {}", hash, post.name());
                                     // Show success message with file counts
-                                    update_progress("Downloaded & verified");
+                                    complete_file("Downloaded & verified");
                                 },
                                 Err(e) => {
                                     warn!("Failed to calculate hash for {}: {}", file_path_str, e);
@@ -858,14 +996,14 @@ impl E621WebConnector {
                                         .to_string_lossy();
                                     let mut dm = dir_manager.lock().unwrap();
                                     dm.mark_file_downloaded(&relpath_str);
-                                    update_progress("Saved but not verified");
+                                    complete_file("Saved but not verified");
                                 }
                             }
                         }
                         Err(err) => {
                             error!("Failed to download/save image {}: {}", file_path_str, err);
                             // Show error message with file counts
-                            update_progress("Error: Download failed");
+                            complete_file("Error: Download failed");
                         }
                     }
                     // Explicitly drop the progress bar clone so thread does not outlive intended scope
