@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::thread;
+use std::sync::mpsc;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, trace, warn};
@@ -115,43 +117,28 @@ impl GrabbedPost {
         self.post_id = post_id;
     }
     
-    /// Generates an enhanced filename with artist name and ID information
-    pub(crate) fn generate_enhanced_filename(post: &PostEntry, name_convention: &str, request_sender: &RequestSender) -> String {
-        // Get the base filename
-        let base_name = match name_convention {
-            "md5" => format!("{}.{}", post.file.md5, post.file.ext),
-            "id" => format!("{}.{}", post.id, post.file.ext),
-            _ => format!("{}.{}", post.id, post.file.ext), // Default to ID
-        };
-        
-        // If no artists, return base name
+    /// Generates an enhanced filename with artist name and post ID
+    pub(crate) fn generate_enhanced_filename(post: &PostEntry, _name_convention: &str, _request_sender: &RequestSender) -> String {
+        // If no artists, use post ID only
         if post.tags.artist.is_empty() {
-            return base_name;
+            return format!("{}.{}", post.id, post.file.ext);
         }
         
-        // Collect artist info (name + ID)
-        let mut artist_info = Vec::new();
+        // Collect and sanitize artist names
+        let mut artist_names = Vec::new();
         for artist_name in &post.tags.artist {
-            // Look up the artist tag to get the ID
-            let tag_entries = request_sender.get_tags_by_name(artist_name);
-            if let Some(tag_entry) = tag_entries.first() {
-                // Format: artistname_ID
-                artist_info.push(format!("{}_{}", artist_name, tag_entry.id));
-            } else {
-                // Fallback: just use the name if ID lookup fails
-                artist_info.push(artist_name.clone());
-            }
+            // Sanitize artist name for filename (replace invalid characters)
+            let sanitized_name = artist_name
+                .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+                .replace(' ', "_");
+            artist_names.push(sanitized_name);
         }
         
         // Combine artists with "+" separator if multiple
-        let artist_string = artist_info.join("+");
+        let artist_string = artist_names.join("+");
         
-        // Get filename without extension
-        let file_stem = base_name.rsplitn(2, '.').nth(1).unwrap_or(&base_name);
-        let extension = base_name.rsplitn(2, '.').next().unwrap_or("jpg");
-        
-        // Final format: [base_filename]_by_[artist1_id+artist2_id].ext
-        format!("{}_by_{}.{}", file_stem, artist_string, extension)
+        // Final format: [ArtistName(s)]_[PostID].ext
+        format!("{}_{}.{}", artist_string, post.id, post.file.ext)
     }
 }
 
@@ -165,6 +152,47 @@ impl NewVec<Vec<PostEntry>> for GrabbedPost {
                     post.set_artist(artist_tag.clone());
                 }
                 // Short URL is already set in the From trait implementation
+                // Check if this file has been downloaded before
+                // Use hash-based duplicate detection when available
+                let relpath = if let Some(dir) = post.save_directory() {
+                    let file_path = dir.join(post.name());
+                    file_path.strip_prefix(&Config::get().download_directory()).unwrap_or(&file_path).to_string_lossy().to_string()
+                } else {
+                    post.name.clone()
+                };
+                post.set_is_new(!dir_manager.is_duplicate(&relpath, post.sha512_hash()));
+                post
+            })
+            .collect()
+    }
+}
+
+impl GrabbedPost {
+    /// Enhanced new_vec that includes artist ID information in filenames
+    pub(crate) fn new_vec_with_artist_ids(vec: Vec<PostEntry>, request_sender: &RequestSender) -> Vec<Self> {
+        let dir_manager = Config::get().directory_manager().unwrap();
+        vec.into_iter()
+            .map(|e| {
+                // Generate enhanced filename with artist names and IDs
+                let enhanced_name = GrabbedPost::generate_enhanced_filename(&e, Config::get().naming_convention(), request_sender);
+                
+                let short_url = format!("e621.net/posts/{}", e.id);
+                let mut post = GrabbedPost {
+                    url: e.file.url.clone().unwrap(),
+                    name: enhanced_name,
+                    file_size: e.file.size,
+                    save_directory: None,
+                    artist: None,
+                    is_new: true,
+                    sha512_hash: None,
+                    short_url: Some(short_url),
+                    post_id: e.id,
+                };
+                
+                if let Some(artist_tag) = e.tags.artist.first() {
+                    post.set_artist(artist_tag.clone());
+                }
+                
                 // Check if this file has been downloaded before
                 // Use hash-based duplicate detection when available
                 let relpath = if let Some(dir) = post.save_directory() {
@@ -441,7 +469,7 @@ impl Grabber {
         if !login.username().is_empty() && login.download_favorites() {
             let tag = format!("fav:{}", login.username());
             let posts = self.search(&tag, &TagSearchType::Special);
-            let mut collection = PostCollection::new(&tag, "", GrabbedPost::new_vec(posts));
+            let mut collection = PostCollection::new(&tag, "", GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender));
             if let Err(e) = collection.initialize_directories() {
                 error!("Failed to initialize directories for favorites: {}", e);
                 emergency_exit("Directory initialization failed");
@@ -485,7 +513,7 @@ impl Grabber {
         let mut collection = PostCollection::new(
             tag.name(),
             "General Searches",
-            GrabbedPost::new_vec(posts),
+            GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
         );
         if let Err(e) = collection.initialize_directories() {
             error!("Failed to initialize directories for general search: {}", e);
@@ -522,7 +550,7 @@ impl Grabber {
     fn grab_set(&mut self, tag: &Tag) {
         let entry: SetEntry = self.request_sender.get_entry_from_appended_id(tag.name(), "set");
         let posts = self.search(&format!("set:{}", entry.shortname), &TagSearchType::Special);
-        let mut collection = PostCollection::from((&entry, GrabbedPost::new_vec(posts)));
+        let mut collection = PostCollection::from((&entry, GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender)));
         if let Err(e) = collection.initialize_directories() {
             error!("Failed to initialize directories for set: {}", e);
             emergency_exit("Directory initialization failed");
@@ -546,7 +574,7 @@ impl Grabber {
         let mut collection = PostCollection::new(
             name,
             "Pools",
-            GrabbedPost::new_vec((posts, name.as_ref())),
+            GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
         );
         if let Err(e) = collection.initialize_directories() {
             error!("Failed to initialize directories for pool: {}", e);
@@ -584,7 +612,20 @@ impl Grabber {
                 console::style(format!("\"{id}\"")).color256(39).italic()
             ),
             Some(_) => {
-                let mut grabbed_post = GrabbedPost::from((entry.clone(), Config::get().naming_convention()));
+                // Generate enhanced filename with artist names and IDs
+                let enhanced_name = GrabbedPost::generate_enhanced_filename(&entry, Config::get().naming_convention(), &self.request_sender);
+                let short_url = format!("e621.net/posts/{}", entry.id);
+                let mut grabbed_post = GrabbedPost {
+                    url: entry.file.url.clone().unwrap(),
+                    name: enhanced_name,
+                    file_size: entry.file.size,
+                    save_directory: None,
+                    artist: None,
+                    is_new: true,
+                    sha512_hash: None,
+                    short_url: Some(short_url),
+                    post_id: entry.id,
+                };
                 if let Some(artist_tag) = entry.tags.artist.first() {
                     grabbed_post.set_artist(artist_tag.clone());
                 }
