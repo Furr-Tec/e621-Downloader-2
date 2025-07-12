@@ -1,6 +1,11 @@
-﻿use std::cmp::Ordering;
+use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::time::Instant;
+
+use indicatif::{ProgressBar, ProgressStyle};
+use log::{error, info, trace, warn};
+use console;
 
 use crate::e621::blacklist::Blacklist;
 use crate::e621::io::tag::{Group, Tag, TagSearchType, TagType};
@@ -377,9 +382,21 @@ impl Grabber {
 
     pub(crate) fn grab_posts_by_tags(&mut self, groups: &[Group]) {
         let tags: Vec<&Tag> = groups.iter().flat_map(|e| e.tags()).collect();
-        for tag in tags {
+        let total_tags = tags.len();
+        let progress_bar = ProgressBar::new(total_tags as u64);
+        progress_bar.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} tags")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("#>-"));
+
+        for tag in tags.iter() {
+            let start_time = Instant::now();
             self.grab_by_tag_type(tag);
+            progress_bar.inc(1);
+            let duration = start_time.elapsed();
+            info!("Finished processing tag {} in {:.2?}", tag.name(), duration);
         }
+        progress_bar.finish_with_message("All tags processed");
     }
 
     fn grab_by_tag_type(&mut self, tag: &Tag) {
@@ -515,6 +532,9 @@ impl Grabber {
     }
 
     fn search(&self, searching_tag: &str, tag_search_type: &TagSearchType) -> Vec<PostEntry> {
+        let search_start = Instant::now();
+        info!("Starting search for tag: {}", searching_tag);
+        
         let mut posts: Vec<PostEntry> = Vec::new();
         let mut filtered = 0;
         let mut invalid_posts = 0;
@@ -543,6 +563,8 @@ impl Grabber {
             );
         }
 
+        info!("Completed search for tag: {} in {:.2?}", searching_tag, search_start.elapsed());
+
         posts
     }
 
@@ -554,9 +576,18 @@ impl Grabber {
         invalid_posts: &mut u16,
     ) {
         let mut page = 1;
+        let progress_bar = ProgressBar::new_spinner();
+        progress_bar.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} Searching {msg}...")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
+        );
+        progress_bar.set_message(format!("page {}", page));
 
         loop {
-             let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page).posts;
+            let page_start = Instant::now();
+            let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page).posts;
+            
             if searched_posts.is_empty() {
                 break;
             }
@@ -566,8 +597,13 @@ impl Grabber {
 
             searched_posts.reverse();
             posts.append(&mut searched_posts);
+            
+            trace!("Page {} completed in {:.2?} - found {} posts", page, page_start.elapsed(), searched_posts.len());
             page += 1;
+            progress_bar.set_message(format!("page {}", page));
         }
+        
+        progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), page - 1));
     }
 
     fn general_search(
@@ -577,9 +613,20 @@ impl Grabber {
         filtered: &mut u16,
         invalid_posts: &mut u16,
     ) {
+        let progress_bar = ProgressBar::new(POST_SEARCH_LIMIT as u64 - 1);
+        progress_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:25.cyan/blue}] {pos}/{len} pages - {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-")
+        );
+        
         for page in 1..POST_SEARCH_LIMIT {
-             let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page as u16).posts;
+            let page_start = Instant::now();
+            let mut searched_posts = self.request_sender.safe_bulk_post_search(searching_tag, page as u16).posts;
+            
             if searched_posts.is_empty() {
+                progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), page - 1));
                 break;
             }
 
@@ -588,7 +635,13 @@ impl Grabber {
 
             searched_posts.reverse();
             posts.append(&mut searched_posts);
+            
+            trace!("Page {} completed in {:.2?} - found {} posts", page, page_start.elapsed(), searched_posts.len());
+            progress_bar.set_message(format!("found {} posts", posts.len()));
+            progress_bar.inc(1);
         }
+        
+        progress_bar.finish_with_message(format!("Found {} posts across {} pages", posts.len(), POST_SEARCH_LIMIT - 1));
     }
 
     fn filter_posts_with_blacklist(&self, posts: &mut Vec<PostEntry>) -> u16 {

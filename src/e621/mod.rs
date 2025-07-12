@@ -671,9 +671,10 @@ impl E621WebConnector {
         // Set progress bar total to exact number of files to be downloaded (never over- or under-count)
         self.progress_bar = ProgressBar::new(new_post_count as u64);
         
-        // Configure progress bar to show file counts instead of file sizes
+        // Configure progress bar to show file counts and download size
+        let total_size_formatted = self.format_file_size(length * 1024); // Convert KB to bytes for formatting
         let progress_style = ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files {msg}")
+            .template(&format!("{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} files ({}) - {{msg}}", total_size_formatted))
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-");
         self.progress_bar.set_style(progress_style);
@@ -1030,14 +1031,14 @@ impl E621WebConnector {
             return true;
         }
 
-        // Format size for display
-        let formatted_size = self.format_file_size(total_size_kb);
+        // Format size for display (convert KB to bytes for formatting)
+        let formatted_size = self.format_file_size(total_size_kb * 1024);
         
 
         // Display warning and options
         println!("\n⚠️  WARNING: Large download detected!");
         println!("You are about to download {} files totaling {}.", post_count, formatted_size);
-        println!("This exceeds the recommended size of 20GB.\n");
+        println!("This exceeds the recommended size of {}.\n", self.format_file_size(THRESHOLD_KB * 1024));
 
         // Create selection menu for the user
         let options = &[
@@ -1160,7 +1161,8 @@ impl E621WebConnector {
             info!("Preparing to download {} new files totaling {}", post_count, formatted_size);
         }
 
-        total_size
+        // Convert bytes to KB before returning (as documented in function comment)
+        total_size / 1024
     }
 
 }

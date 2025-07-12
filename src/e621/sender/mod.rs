@@ -456,13 +456,22 @@ impl RequestSender {
     /// Handles a bulk post search with error propagation.
     /// Returns an empty vector if the API response is empty or invalid, but never panics.
     pub(crate) fn safe_bulk_post_search(&self, searching_tag: &str, page: u16) -> BulkPostEntry {
-        match self.bulk_search(searching_tag, page) {
-            Ok(entry) => entry,
+        let start_time = std::time::Instant::now();
+        let result = match self.bulk_search(searching_tag, page) {
+            Ok(entry) => {
+                let duration = start_time.elapsed();
+                trace!("API request for tag '{}' page {} completed in {:.2?}", searching_tag, page, duration);
+                if duration.as_secs() > 2 {
+                    warn!("Slow API request detected: tag '{}' page {} took {:.2?}", searching_tag, page, duration);
+                }
+                entry
+            }
             Err(e) => {
-                error!("Bulk post search failed: {}", e);
+                error!("Bulk post search failed after {:.2?}: {}", start_time.elapsed(), e);
                 BulkPostEntry::default()
             }
-        }
+        };
+        result
     }
 
     /// Gets tags by their name.
