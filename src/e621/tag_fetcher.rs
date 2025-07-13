@@ -253,19 +253,38 @@ impl TagFetcher {
         }
         
         let content = read_to_string(TAG_CACHE_FILE)?;
-        let tags: Vec<String> = content
-            .lines()
-            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
-            .map(|line| {
+        let mut tags = Vec::new();
+        let mut in_section = false;
+        
+        for line in content.lines() {
+            let line = line.trim();
+            
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            
+            // Check for section headers
+            if line.starts_with('[') && line.ends_with(']') {
+                // Only collect tags from artists, general sections (where actual tags are)
+                in_section = matches!(line, "[artists]" | "[general]");
+                continue;
+            }
+            
+            // Only collect tags from relevant sections
+            if in_section {
                 // Extract tag name (before any comments)
-                if let Some(pos) = line.find('#') {
+                let tag_name = if let Some(pos) = line.find('#') {
                     line[..pos].trim().to_string()
                 } else {
                     line.trim().to_string()
+                };
+                
+                if !tag_name.is_empty() {
+                    tags.push(tag_name);
                 }
-            })
-            .filter(|tag| !tag.is_empty())
-            .collect();
+            }
+        }
         
         Ok(tags)
     }
@@ -403,12 +422,22 @@ impl TagFetcher {
     
     /// Interactive tag management workflow
     pub fn interactive_tag_management(&mut self) -> Result<()> {
-        println!("\n🎯 Interactive Tag Management");
+        println!("\n--- Interactive Tag Management ---");
         println!("This will help you discover and manage tags for your downloads.");
         println!("You can search for tags, then choose to whitelist or blacklist them.");
         
         // First fetch the user's blacklist
         self.fetch_user_blacklist()?;
+        
+        // Load existing saved tags to avoid showing them again
+        let mut existing_saved_tags = Self::load_existing_tags().unwrap_or_else(|e| {
+            warn!("Could not load existing tags: {}", e);
+            Vec::new()
+        });
+        
+        if !existing_saved_tags.is_empty() {
+            println!("Loaded {} already saved tags (will be filtered from search results)", existing_saved_tags.len());
+        }
         
         let mut whitelisted_tags = Vec::new();
         let mut blacklisted_tags = Vec::new();
@@ -428,14 +457,27 @@ impl TagFetcher {
             
             // Search for matching tags
             match self.search_tags(&query, 20) {
-                Ok(tags) => {
+                Ok(mut tags) => {
+                    // Filter out already saved tags
+                    let initial_count = tags.len();
+                    tags.retain(|tag| !existing_saved_tags.contains(&tag.name));
+                    
+                    if initial_count > tags.len() {
+                        let filtered_count = initial_count - tags.len();
+                        println!("Filtered out {} already saved tags", filtered_count);
+                    }
+                    
                     if tags.is_empty() {
-                        println!("❌ No tags found matching '{}'", query);
+                        if initial_count > 0 {
+                            println!("All {} tags matching '{}' are already saved", initial_count, query);
+                        } else {
+                            println!("No tags found matching '{}'", query);
+                        }
                         continue;
                     }
                     
                     // Show tags to user
-                    println!("\n🔍 Found {} tags matching '{}':", tags.len(), query);
+                    println!("\nFound {} tags matching '{}':", tags.len(), query);
                     
                     let mut tag_options = Vec::new();
                     for (i, tag) in tags.iter().enumerate() {
@@ -549,9 +591,10 @@ impl TagFetcher {
                             for selected_tag in selected_tags {
                                 if !whitelisted_tags.iter().any(|t: &ApiTag| t.name == selected_tag.name) {
                                     whitelisted_tags.push(selected_tag.clone());
-                                    println!("✅ Added '{}' to whitelist", selected_tag.name);
+                                    existing_saved_tags.push(selected_tag.name.clone()); // Add to filter list
+                                    println!("Added '{}' to whitelist", selected_tag.name);
                                 } else {
-                                    println!("ℹ️  '{}' is already whitelisted", selected_tag.name);
+                                    println!("'{}' is already whitelisted", selected_tag.name);
                                 }
                             }
                         },
@@ -561,7 +604,7 @@ impl TagFetcher {
                                 match self.add_to_remote_blacklist(&selected_tag.name) {
                                     Ok(()) => {
                                         blacklisted_tags.push(selected_tag.clone());
-                                        println!("❌ Added '{}' to blacklist", selected_tag.name);
+                                        println!("Added '{}' to blacklist", selected_tag.name);
                                     },
                                     Err(e) => {
                                         warn!("Failed to add '{}' to blacklist: {}", selected_tag.name, e);
@@ -603,9 +646,10 @@ impl TagFetcher {
                                         // Whitelist
                                         if !whitelisted_tags.iter().any(|t: &ApiTag| t.name == selected_tag.name) {
                                             whitelisted_tags.push(selected_tag.clone());
-                                            println!("✅ Added '{}' to whitelist", selected_tag.name);
+                                            existing_saved_tags.push(selected_tag.name.clone()); // Add to filter list
+                                            println!("Added '{}' to whitelist", selected_tag.name);
                                         } else {
-                                            println!("ℹ️  '{}' is already whitelisted", selected_tag.name);
+                                            println!("'{}' is already whitelisted", selected_tag.name);
                                         }
                                     },
                                     1 => {
@@ -613,7 +657,7 @@ impl TagFetcher {
                                         match self.add_to_remote_blacklist(&selected_tag.name) {
                                             Ok(()) => {
                                                 blacklisted_tags.push(selected_tag.clone());
-                                                println!("❌ Added '{}' to blacklist", selected_tag.name);
+                                                println!("Added '{}' to blacklist", selected_tag.name);
                                             },
                                             Err(e) => {
                                                 warn!("Failed to add to blacklist: {}", e);
@@ -622,7 +666,7 @@ impl TagFetcher {
                                     },
                                     2 => {
                                         // Show info
-                                        println!("\n📊 Tag Information:");
+                                        println!("\nTag Information:");
                                         println!("   Name: {}", selected_tag.name);
                                         println!("   Posts: {}", selected_tag.post_count);
                                         println!("   Category: {}", match TagCategory::from_i32(selected_tag.category) {
@@ -633,7 +677,7 @@ impl TagFetcher {
                                     },
                                     _ => {
                                         // Skip this tag
-                                        println!("⏭️ Skipped '{}'", selected_tag.name);
+                                        println!("Skipped '{}'", selected_tag.name);
                                     }
                                 }
                             }
@@ -671,12 +715,12 @@ impl TagFetcher {
             
             if confirm_save {
                 self.save_tags_to_file(&whitelisted_tags)?;
-                println!("✅ Saved {} tags to tags.txt", whitelisted_tags.len());
+                println!("Saved {} tags to tags.txt", whitelisted_tags.len());
             }
         }
         
         // Summary
-        println!("\n📋 Session Summary:");
+        println!("\nSession Summary:");
         println!("   Whitelisted: {} tags", whitelisted_tags.len());
         println!("   Blacklisted: {} tags", blacklisted_tags.len());
         

@@ -502,7 +502,7 @@ impl E621WebConnector {
     
     /// Asks the user about tag fetching and manages tags.txt file
     pub(crate) fn configure_tag_fetching(&self) {
-        println!("\n🏷️  Tag Management Options");
+        println!("\nTag Management Options");
         
         let tag_options = vec![
             "Interactive Tag Management (Search, discover, and curate tags)",
@@ -535,11 +535,11 @@ impl E621WebConnector {
                 let mut tag_fetcher = TagFetcher::new(self.request_sender.clone());
                 match tag_fetcher.interactive_tag_management() {
                     Ok(()) => {
-                        println!("✅ Interactive tag management completed successfully.");
+                        println!("Interactive tag management completed successfully.");
                     },
                     Err(e) => {
                         warn!("Failed during interactive tag management: {}", e);
-                        println!("❌ Interactive tag management failed. You can try again later or create tags.txt manually.");
+                        println!("Interactive tag management failed. You can try again later or create tags.txt manually.");
                     }
                 }
                 return;
@@ -548,7 +548,7 @@ impl E621WebConnector {
                 // Auto-fetch mode (existing logic)
                 // Check if tags.txt already exists
                 if TagFetcher::tags_file_exists() {
-                    println!("\n📋 Found existing tags.txt file.");
+                    println!("\nFound existing tags.txt file.");
                     
                     let refresh_tags = Self::robust_confirm_prompt(
                         "Would you like to refresh tags.txt with popular non-blacklisted tags from e621?",
@@ -560,7 +560,7 @@ impl E621WebConnector {
                         return;
                     }
                 } else {
-                    println!("\n📋 No tags.txt file found.");
+                    println!("\nNo tags.txt file found.");
                     
                     let create_tags = Self::robust_confirm_prompt(
                         "Would you like to fetch popular non-blacklisted tags from e621 and create tags.txt?",
@@ -581,7 +581,7 @@ impl E621WebConnector {
         }
         
         // Get user preferences for tag fetching
-        println!("\n🔍 Tag fetching options:");
+        println!("\nTag fetching options:");
         
         let tag_count_prompt = "Number of popular tags to fetch (default: 100)";
         let tag_count: usize = Self::robust_input_prompt(&tag_count_prompt, 100)
@@ -605,12 +605,12 @@ impl E621WebConnector {
         // Fetch and save tags
         match tag_fetcher.refresh_tags(tag_count, min_posts) {
             Ok(()) => {
-                println!("✅ Successfully fetched and saved {} popular tags to tags.txt", tag_count);
+                println!("Successfully fetched and saved {} popular tags to tags.txt", tag_count);
                 info!("Tag fetching completed successfully.");
             },
             Err(e) => {
                 warn!("Failed to fetch tags: {}", e);
-                println!("❌ Failed to fetch tags. You can manually create tags.txt or try again later.");
+                println!("Failed to fetch tags. You can manually create tags.txt or try again later.");
             }
         }
     }
@@ -642,13 +642,13 @@ impl E621WebConnector {
         info!("Batch size set to: {}", self.batch_size);
 
         // Configure download concurrency with more options
-        println!("\nℹ️  Concurrency controls how many files can be downloaded simultaneously.");
-        println!("📊 Available concurrency levels:");
-        println!("   • Conservative (3): Safe for most connections, minimal API stress");
-        println!("   • Standard (5): Good balance of speed and reliability");
-        println!("   • Aggressive (8): Fast downloads, moderate API stress");
-        println!("   • Maximum (12+): Fastest possible, high API stress risk");
-        println!("⚠️  Higher concurrency may improve download speed but risks hitting e621's API rate limits.");
+        println!("\nConcurrency controls how many files can be downloaded simultaneously.");
+        println!("Available concurrency levels:");
+        println!("   - Conservative (3): Safe for most connections, minimal API stress");
+        println!("   - Standard (5): Good balance of speed and reliability");
+        println!("   - Aggressive (8): Fast downloads, moderate API stress");
+        println!("   - Maximum (12+): Fastest possible, high API stress risk");
+        println!("WARNING: Higher concurrency may improve download speed but risks hitting e621's API rate limits.");
         println!("    This could result in temporary IP blocks or throttled connections.");
 
         let concurrency_options = &[
@@ -704,12 +704,12 @@ impl E621WebConnector {
             },
             6 => {
                 // Override safeguards
-                println!("\n⚠️  WARNING: You are about to override safety limits!");
-                println!("🚨 This may cause:");
-                println!("   • IP blocking from e621");
-                println!("   • Connection timeouts");
-                println!("   • Download failures");
-                println!("   • System instability");
+                println!("\nWARNING: You are about to override safety limits!");
+                println!("This may cause:");
+                println!("   - IP blocking from e621");
+                println!("   - Connection timeouts");
+                println!("   - Download failures");
+                println!("   - System instability");
 
                 let confirm_override = Self::robust_confirm_prompt(
                     "Are you sure you want to override safety limits?",
@@ -727,7 +727,7 @@ impl E621WebConnector {
 
                     self.max_download_concurrency = extreme_concurrency.max(20); // No upper limit when overriding
                     warn!("OVERRIDE: Extreme concurrency enabled: {} simultaneous downloads", self.max_download_concurrency);
-                    warn!("⚠️  You are responsible for any consequences of this setting!");
+                    warn!("WARNING: You are responsible for any consequences of this setting!");
                 } else {
                     // User cancelled override, use aggressive instead
                     self.max_download_concurrency = 8;
@@ -1121,7 +1121,7 @@ impl E621WebConnector {
         // Get pipeline configuration
         let pipeline_config = PipelineConfig::new().with_user_concurrency(self.max_download_concurrency);
         
-        info!("🚀 Multicore pipeline configured: {} download threads, {} hash threads (total: {} cores)", 
+        info!("Multicore pipeline configured: {} download threads, {} hash threads (total: {} cores)", 
               pipeline_config.download_threads, pipeline_config.hash_threads, pipeline_config.total_cores);
         
         // Use multicore pipeline for this collection
