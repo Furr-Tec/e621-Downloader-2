@@ -111,6 +111,8 @@ impl Program {
         let mut connector = E621WebConnector::new(&request_sender);
         connector.should_enter_safe_mode();
         connector.configure_size_limits();
+        connector.configure_max_pages_to_search();
+        connector.configure_tag_fetching();
         connector.configure_batch_size();
 
         // Parses tag file.

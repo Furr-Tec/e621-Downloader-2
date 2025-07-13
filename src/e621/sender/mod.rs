@@ -348,6 +348,32 @@ impl RequestSender {
         Ok(bytes)
     }
 
+    /// Downloads string content from a URL, handling errors properly
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: The URL to download string content from
+    ///
+    /// returns: Result<String, anyhow::Error>
+    pub(crate) fn get_string(&self, url: &str) -> Result<String> {
+        trace!("Downloading string from URL: {}", url);
+        
+        // Send the request and check response
+        let response = match self.client.get(url).send() {
+            Ok(response) => response,
+            Err(ref error) => {
+                error!("Failed to download from URL {}: {}", url, error);
+                return Err(anyhow::anyhow!("Failed to download from URL: {}", error));
+            }
+        };
+        
+        // Get text content from response
+        let text = response.text()
+            .with_context(|| format!("Failed to read text from response for URL: {}", url))?;
+            
+        Ok(text)
+    }
+
     /// Appends base url with id/name before ending with `.json`.
     ///
     /// # Arguments

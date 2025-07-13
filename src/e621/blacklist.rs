@@ -24,14 +24,14 @@ use crate::e621::sender::entries::{PostEntry, UserEntry};
 use crate::e621::sender::RequestSender;
 
 /// Root token which contains all the tokens of the blacklist.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct RootToken {
     /// The total [LineToken]s from the root.
     lines: Vec<LineToken>,
 }
 
 /// A line token that contains all collected [`TagToken`]s from a parsed line.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct LineToken {
     /// Total [TagToken] in the line.
     tags: Vec<TagToken>,
@@ -44,7 +44,7 @@ impl LineToken {
 }
 
 /// Enum that contains each possible option from `rating:` being in blacklist.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum Rating {
     /// No rating.
     None,
@@ -60,7 +60,7 @@ enum Rating {
 ///
 /// The tag can be seen as four types: [Rating](TagType::Rating), [Id](TagType::Id), [User](TagType::User), and
 /// [None](TagType::None).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TagType {
     /// A post rating type.
     Rating(Rating),
@@ -75,7 +75,7 @@ enum TagType {
 }
 
 /// Tag token that contains essential information about what is blacklisted.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TagToken {
     /// If the tag is negated or not
     negated: bool,
@@ -96,7 +96,7 @@ impl Default for TagToken {
 }
 
 /// Parser that reads a tag file and parses the tags.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct BlacklistParser {
     /// The base parser which parses the blacklist character by character.
     base_parser: BaseParser,
@@ -517,6 +517,7 @@ impl FlagWorker {
 
 /// Blacklist that holds all of the blacklist entries.
 /// These entries will be looped through a parsed before being used for filtering posts that are blacklisted.
+#[derive(Clone)]
 pub(crate) struct Blacklist {
     /// The blacklist parser which parses the blacklist and tokenizes it.
     blacklist_parser: BlacklistParser,
@@ -602,5 +603,25 @@ impl Blacklist {
         }
 
         filtered
+    }
+
+    /// Checks if a specific tag is blacklisted
+    ///
+    /// # Arguments
+    ///
+    /// * `tag_name`: The tag name to check
+    ///
+    /// returns: bool
+    pub(crate) fn is_tag_blacklisted(&self, tag_name: &str) -> bool {
+        // Check if the tag appears in any blacklist line as a regular tag (not special)
+        for blacklist_line in &self.blacklist_tokens.lines {
+            for tag in &blacklist_line.tags {
+                // Only check regular tags (TagType::None) and non-negated tags
+                if matches!(tag.tag_type, TagType::None) && !tag.negated && tag.name == tag_name {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }

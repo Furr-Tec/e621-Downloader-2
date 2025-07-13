@@ -14,6 +14,7 @@ use crate::e621::grabber::{Grabber, Shorten};
 use crate::e621::io::tag::Group;
 use crate::e621::io::{Config, Login};
 use crate::e621::memory::{MemoryManager, estimate_collection_memory_usage};
+use crate::e621::tag_fetcher::TagFetcher;
 use smallvec::SmallVec;
 use crate::e621::sender::entries::UserEntry;
 use crate::e621::sender::RequestSender;
@@ -21,8 +22,9 @@ use crate::e621::sender::RequestSender;
 pub(crate) mod blacklist;
 pub(crate) mod grabber;
 pub(crate) mod io;
-pub(crate) mod memory;
+mod memory;
 pub(crate) mod sender;
+pub(crate) mod tag_fetcher;
 pub(crate) mod tui;
 
 /// Helper struct to hold collection information for downloading
@@ -451,6 +453,141 @@ impl E621WebConnector {
         info!("File size limits set: {}GB per file, {}GB total", file_size_gb, total_size_gb);
     }
 
+    /// Asks the user to configure max pages to search and saves to config file
+    pub(crate) fn configure_max_pages_to_search(&self) {
+        let current_max_pages = Config::get().max_pages_to_search();
+        
+        // Provide information about max pages to search
+        println!("\nMaximum pages to search controls how deep the search goes for each tag.");
+        println!("Recommended page limits:");
+        println!("   - Quick (1-3 pages): Fast search, only most recent/popular posts");
+        println!("   - Standard (5-10 pages): Good balance, finds most relevant content");
+        println!("   - Deep (15-25 pages): Thorough search, finds older content");
+        println!("   - Exhaustive (50+ pages): Complete search, may take a long time");
+        println!("The system will automatically choose optimal thread count based on pages.");
+        
+        let pages_prompt = format!("Maximum pages to search per tag (default: {})", current_max_pages);
+
+        let new_max_pages: usize = Self::robust_input_prompt(&pages_prompt, current_max_pages)
+            .unwrap_or_else(|err| {
+                warn!("Failed to get max pages input: {}", err);
+                warn!("Using default max pages: {}", current_max_pages);
+                current_max_pages
+            });
+
+        // Ensure minimum of 1
+        let new_max_pages = new_max_pages.max(1);
+
+        Config::update_max_pages_to_search(new_max_pages)
+            .unwrap_or_else(|err| {
+                warn!("Failed to update config with new max pages: {}", err);
+            });
+
+        info!("Max pages to search configuration complete.");
+
+        // Calculate and show the optimal thread count that will be used
+        let optimal_threads = Self::calculate_optimal_thread_count(new_max_pages);
+        
+        // Inform the user with appropriate messaging
+        if new_max_pages <= 5 {
+            println!("Max pages set to: {} (Quick search - {} threads)", new_max_pages, optimal_threads);
+        } else if new_max_pages <= 15 {
+            println!("Max pages set to: {} (Standard search - {} threads)", new_max_pages, optimal_threads);
+        } else if new_max_pages <= 30 {
+            println!("WARNING: Max pages set to: {} (Deep search - {} threads)", new_max_pages, optimal_threads);
+        } else {
+            println!("CAUTION: Max pages set to: {} (Exhaustive search - {} threads)", new_max_pages, optimal_threads);
+        }
+    }
+    
+    /// Asks the user about tag fetching and manages tags.txt file
+    pub(crate) fn configure_tag_fetching(&self) {
+        // Check if tags.txt already exists
+        if TagFetcher::tags_file_exists() {
+            println!("\n📋 Found existing tags.txt file.");
+            
+            let refresh_tags = Self::robust_confirm_prompt(
+                "Would you like to refresh tags.txt with popular non-blacklisted tags from e621?",
+                false
+            ).unwrap_or(false);
+            
+            if !refresh_tags {
+                info!("Using existing tags.txt file.");
+                return;
+            }
+        } else {
+            println!("\n📋 No tags.txt file found.");
+            
+            let create_tags = Self::robust_confirm_prompt(
+                "Would you like to fetch popular non-blacklisted tags from e621 and create tags.txt?",
+                true
+            ).unwrap_or(true);
+            
+            if !create_tags {
+                info!("Skipping tag fetching. You can manually create tags.txt with your desired tags.");
+                return;
+            }
+        }
+        
+        // Get user preferences for tag fetching
+        println!("\n🔍 Tag fetching options:");
+        
+        let tag_count_prompt = "Number of popular tags to fetch (default: 100)";
+        let tag_count: usize = Self::robust_input_prompt(&tag_count_prompt, 100)
+            .unwrap_or_else(|err| {
+                warn!("Failed to get tag count input: {}", err);
+                warn!("Using default tag count: 100");
+                100
+            });
+        
+        let min_posts_prompt = "Minimum post count per tag (default: 1000)";
+        let min_posts: i32 = Self::robust_input_prompt(&min_posts_prompt, 1000)
+            .unwrap_or_else(|err| {
+                warn!("Failed to get min posts input: {}", err);
+                warn!("Using default min posts: 1000");
+                1000
+            });
+        
+        // Create tag fetcher with blacklist if available
+        let blacklist = if !Login::get().is_empty() {
+            match self.blacklist.lock() {
+                Ok(bl) => Some(bl.clone()),
+                Err(e) => {
+                    warn!("Failed to get blacklist for tag filtering: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
+        let tag_fetcher = TagFetcher::new(self.request_sender.clone(), blacklist);
+        
+        // Fetch and save tags
+        match tag_fetcher.refresh_tags(tag_count, min_posts) {
+            Ok(()) => {
+                println!("✅ Successfully fetched and saved {} popular tags to tags.txt", tag_count);
+                info!("Tag fetching completed successfully.");
+            },
+            Err(e) => {
+                warn!("Failed to fetch tags: {}", e);
+                println!("❌ Failed to fetch tags. You can manually create tags.txt or try again later.");
+            }
+        }
+    }
+    
+    /// Calculate optimal thread count based on the number of pages to search
+    fn calculate_optimal_thread_count(max_pages: usize) -> usize {
+        match max_pages {
+            1..=2 => 1,          // Single page searches don't need parallelism
+            3..=5 => 2,          // Small searches use minimal threads
+            6..=10 => 3,         // Standard searches use conservative threading
+            11..=20 => 4,        // Medium searches use moderate threading
+            21..=50 => 5,        // Large searches use higher threading
+            _ => 6,              // Very large searches max out at 6 threads
+        }
+    }
+    
     /// Asks the user to configure the batch size for downloads.
     pub(crate) fn configure_batch_size(&mut self) {
         let batch_size_prompt = format!("Number of collections to download simultaneously (default: {})", self.batch_size);
@@ -460,11 +597,11 @@ impl E621WebConnector {
                 warn!("Using default batch size: {}", self.batch_size);
                 self.batch_size
             });
-        
+
         // Set the batch size (this was being overridden before)
         self.batch_size = batch_size.max(1); // Ensure at least 1
         info!("Batch size set to: {}", self.batch_size);
-        
+
         // Configure download concurrency with more options
         println!("\nℹ️  Concurrency controls how many files can be downloaded simultaneously.");
         println!("📊 Available concurrency levels:");
@@ -474,24 +611,24 @@ impl E621WebConnector {
         println!("   • Maximum (12+): Fastest possible, high API stress risk");
         println!("⚠️  Higher concurrency may improve download speed but risks hitting e621's API rate limits.");
         println!("    This could result in temporary IP blocks or throttled connections.");
-        
+
         let concurrency_options = &[
             "Conservative (3 downloads)",
-            "Standard (5 downloads)", 
+            "Standard (5 downloads)",
             "Aggressive (8 downloads)",
             "Maximum (12 downloads)",
             "Ultra (16 downloads)",
             "Custom (specify your own)",
             "Override safeguards (20+ downloads)"
         ];
-        
+
         let selection = dialoguer::Select::new()
             .with_prompt("Select concurrency level")
             .default(1) // Default to Standard
             .items(concurrency_options)
             .interact()
             .unwrap_or(1); // Fallback to Standard if dialog fails
-            
+
         match selection {
             0 => {
                 self.max_download_concurrency = 3;
@@ -522,7 +659,7 @@ impl E621WebConnector {
                         warn!("Using default custom concurrency: 8");
                         8
                     });
-                
+
                 self.max_download_concurrency = custom_concurrency.clamp(4, 20);
                 info!("Custom concurrency: {} simultaneous downloads", self.max_download_concurrency);
             },
@@ -534,12 +671,12 @@ impl E621WebConnector {
                 println!("   • Connection timeouts");
                 println!("   • Download failures");
                 println!("   • System instability");
-                
+
                 let confirm_override = Self::robust_confirm_prompt(
-                    "Are you sure you want to override safety limits?", 
+                    "Are you sure you want to override safety limits?",
                     false
                 ).unwrap_or(false);
-                
+
                 if confirm_override {
                     let extreme_concurrency_prompt = "Enter extreme concurrency level (WARNING: 20-50+)";
                     let extreme_concurrency: usize = Self::robust_input_prompt(&extreme_concurrency_prompt, 20)
@@ -548,7 +685,7 @@ impl E621WebConnector {
                             warn!("Using default extreme concurrency: 20");
                             20
                         });
-                    
+
                     self.max_download_concurrency = extreme_concurrency.max(20); // No upper limit when overriding
                     warn!("OVERRIDE: Extreme concurrency enabled: {} simultaneous downloads", self.max_download_concurrency);
                     warn!("⚠️  You are responsible for any consequences of this setting!");

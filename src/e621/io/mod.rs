@@ -40,9 +40,9 @@ pub(crate) struct Config {
     /// Whether to use simplified folder structure (only Tags, no Artists/Pools)
     #[serde(rename = "simplifiedFolders", default = "default_simplified_folders")]
     simplified_folders: bool,
-    /// Number of parallel threads for searching pages (default: 4)
-    #[serde(rename = "parallelSearchThreads", default = "default_parallel_search_threads")]
-    parallel_search_threads: usize,
+    /// Maximum number of pages to search per tag (default: 10)
+    #[serde(rename = "maxPagesToSearch", default = "default_max_pages_to_search")]
+    max_pages_to_search: usize,
     #[serde(skip)]
     directory_manager: Option<DirectoryManager>,
 }
@@ -50,7 +50,7 @@ pub(crate) struct Config {
 fn default_batch_size() -> usize { 4 }
 fn default_download_concurrency() -> usize { 3 }
 fn default_simplified_folders() -> bool { true }
-fn default_parallel_search_threads() -> usize { 4 }
+fn default_max_pages_to_search() -> usize { 10 }
 
 static CONFIG: OnceCell<Config> = OnceCell::new();
 
@@ -80,9 +80,9 @@ impl Config {
         self.simplified_folders
     }
 
-    /// Number of parallel threads for searching pages
-    pub(crate) fn parallel_search_threads(&self) -> usize {
-        self.parallel_search_threads
+    /// Maximum number of pages to search per tag
+    pub(crate) fn max_pages_to_search(&self) -> usize {
+        self.max_pages_to_search
     }
 
     /// Get the directory manager instance
@@ -120,6 +120,54 @@ impl Config {
         CONFIG.get_or_init(|| Self::get_config().unwrap())
     }
 
+    /// Updates the maximum pages to search and saves to config file
+    pub(crate) fn update_max_pages_to_search(new_max_pages: usize) -> Result<(), Error> {
+        // Load current config from file
+        let mut config: Config = from_str(&read_to_string(CONFIG_NAME)?)?;
+        
+        // Update the field
+        config.max_pages_to_search = new_max_pages;
+        
+        // Save back to file
+        let json = to_string_pretty(&config)?;
+        write(Path::new(CONFIG_NAME), json)?;
+        
+        info!("Max pages to search updated to: {}", new_max_pages);
+        Ok(())
+    }
+
+    /// Updates the batch size and saves to config file
+    pub(crate) fn update_batch_size(new_batch_size: usize) -> Result<(), Error> {
+        // Load current config from file
+        let mut config: Config = from_str(&read_to_string(CONFIG_NAME)?)?;
+        
+        // Update the field
+        config.batch_size = new_batch_size;
+        
+        // Save back to file
+        let json = to_string_pretty(&config)?;
+        write(Path::new(CONFIG_NAME), json)?;
+        
+        info!("Batch size updated to: {}", new_batch_size);
+        Ok(())
+    }
+
+    /// Updates the download concurrency and saves to config file
+    pub(crate) fn update_download_concurrency(new_concurrency: usize) -> Result<(), Error> {
+        // Load current config from file
+        let mut config: Config = from_str(&read_to_string(CONFIG_NAME)?)?;
+        
+        // Update the field
+        config.download_concurrency = new_concurrency;
+        
+        // Save back to file
+        let json = to_string_pretty(&config)?;
+        write(Path::new(CONFIG_NAME), json)?;
+        
+        info!("Download concurrency updated to: {}", new_concurrency);
+        Ok(())
+    }
+
     /// Loads and returns `config` for quick management and settings.
     fn get_config() -> Result<Self, Error> {
         let mut config: Config = from_str(&read_to_string(CONFIG_NAME).unwrap())?;
@@ -152,7 +200,7 @@ impl Default for Config {
             batch_size: default_batch_size(),
             download_concurrency: default_download_concurrency(),
             simplified_folders: default_simplified_folders(),
-            parallel_search_threads: default_parallel_search_threads(),
+            max_pages_to_search: default_max_pages_to_search(),
             directory_manager: None,
         }
     }

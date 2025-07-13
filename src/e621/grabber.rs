@@ -681,6 +681,18 @@ impl Grabber {
         posts
     }
 
+    /// Calculate optimal thread count based on the number of pages to search
+    fn calculate_optimal_thread_count(&self, max_pages: usize) -> usize {
+        match max_pages {
+            1..=2 => 1,          // Single page searches don't need parallelism
+            3..=5 => 2,          // Small searches use minimal threads
+            6..=10 => 3,         // Standard searches use conservative threading
+            11..=20 => 4,        // Medium searches use moderate threading
+            21..=50 => 5,        // Large searches use higher threading
+            _ => 6,              // Very large searches max out at 6 threads
+        }
+    }
+
     fn special_search(
         &self,
         searching_tag: &str,
@@ -688,8 +700,23 @@ impl Grabber {
         filtered: &mut u16,
         invalid_posts: &mut u16,
     ) {
-        let thread_count = Config::get().parallel_search_threads();
-        const RATE_LIMIT_DELAY: Duration = Duration::from_millis(250); // 250ms between requests per thread
+        let max_pages = Config::get().max_pages_to_search();
+        
+        // Calculate optimal thread count based on max pages
+        let thread_count = self.calculate_optimal_thread_count(max_pages);
+        
+        // Dynamic rate limiting based on thread count to prevent API overload
+        let rate_limit_delay = match thread_count {
+            1 => Duration::from_millis(100),       // Single thread - minimal delay
+            2 => Duration::from_millis(200),       // Dual thread - conservative
+            3 => Duration::from_millis(300),       // Triple thread - balanced
+            4 => Duration::from_millis(400),       // Quad thread - moderate
+            5 => Duration::from_millis(500),       // Penta thread - higher
+            _ => Duration::from_millis(600),       // Max thread - highest delay
+        };
+        
+        info!("Searching max {} pages using {} threads with {}ms rate limiting", 
+              max_pages, thread_count, rate_limit_delay.as_millis());
         
         let progress_bar = ProgressBar::new_spinner();
         progress_bar.set_style(
@@ -701,31 +728,55 @@ impl Grabber {
         
         let mut batch_start = 1u16;
         let mut total_pages = 0;
+        let max_pages_u16 = max_pages as u16;
         
         loop {
+            // Check if we've already searched the maximum number of pages
+            if batch_start > max_pages_u16 {
+                info!("Reached maximum page limit ({}), stopping search", max_pages);
+                break;
+            }
+            
             // Channel for this batch
             let (result_tx, result_rx) = mpsc::channel::<(u16, Vec<PostEntry>)>();
             
-            // Spawn threads for this batch
+            // Spawn threads for this batch, but don't exceed max pages
             let mut handles = Vec::new();
             for thread_id in 0..thread_count {
                 let page_to_search = batch_start + thread_id as u16;
+                
+                // Don't search beyond max pages
+                if page_to_search > max_pages_u16 {
+                    break;
+                }
+                
                 let request_sender = self.request_sender.clone();
                 let searching_tag = searching_tag.to_string();
                 let result_tx = result_tx.clone();
                 
                 let handle = thread::spawn(move || {
+                    // Stagger thread starts to avoid simultaneous API hits
+                    let stagger_delay_ms = 50 * thread_id as u64;
+                    thread::sleep(Duration::from_millis(stagger_delay_ms));
+                    
                     let page_start = Instant::now();
                     let searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
+                    let request_duration = page_start.elapsed();
                     
-                    trace!("Thread {} - Page {} completed in {:.2?} - found {} posts", 
-                           thread_id, page_to_search, page_start.elapsed(), searched_posts.len());
+                    // Log slow requests as warnings
+                    if request_duration > Duration::from_secs(3) {
+                        warn!("Slow API request detected: tag '{}' page {} took {:.2?}", 
+                              searching_tag, page_to_search, request_duration);
+                    } else {
+                        trace!("Thread {} - Page {} completed in {:.2?} - found {} posts", 
+                               thread_id, page_to_search, request_duration, searched_posts.len());
+                    }
                     
                     // Send results back
                     let _ = result_tx.send((page_to_search, searched_posts));
                     
-                    // Rate limiting - wait between requests
-                    thread::sleep(RATE_LIMIT_DELAY);
+                    // Dynamic rate limiting - wait between requests
+                    thread::sleep(rate_limit_delay);
                 });
                 handles.push(handle);
             }
@@ -735,11 +786,27 @@ impl Grabber {
             
             // Collect results from this batch
             let mut batch_results = Vec::new();
-            for _ in 0..thread_count {
+            let batch_start_time = Instant::now();
+            let threads_spawned = handles.len();
+            
+            for _ in 0..threads_spawned {
                 if let Ok((page, searched_posts)) = result_rx.recv() {
                     batch_results.push((page, searched_posts));
                     total_pages += 1;
                 }
+            }
+            
+            let batch_duration = batch_start_time.elapsed();
+            
+            // Check if this batch took too long (indication of API overload)
+            if batch_duration > Duration::from_secs(15) && thread_count > 6 {
+                warn!("Batch of {} pages took {:.2?} - API may be overloaded!", thread_count, batch_duration);
+                warn!("Consider reducing parallel search threads in config.json for better performance.");
+                
+                // Add extra delay between batches when API is slow
+                let extra_delay = Duration::from_millis(1000 + (thread_count * 100) as u64);
+                info!("Adding {:.2?} delay before next batch to reduce API load...", extra_delay);
+                thread::sleep(extra_delay);
             }
             
             // Wait for all threads in this batch to complete

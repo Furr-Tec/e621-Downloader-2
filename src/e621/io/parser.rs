@@ -20,7 +20,7 @@ use crate::e621::io::emergency_exit;
 ///
 /// This is a thin blanket for other parsers to use and build rules, allowing for quick and easy
 /// parsing for any file.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct BaseParser {
     /// Current cursor position in the array of characters.
     pos: usize,
