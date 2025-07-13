@@ -15,14 +15,16 @@ use crate::e621::io::tag::Group;
 use crate::e621::io::{Config, Login};
 use crate::e621::memory::{MemoryManager, estimate_collection_memory_usage};
 use crate::e621::tag_fetcher::TagFetcher;
+use crate::e621::artist_fetcher::ArtistFetcher;
 use smallvec::SmallVec;
 use crate::e621::sender::entries::UserEntry;
 use crate::e621::sender::RequestSender;
 
+pub(crate) mod artist_fetcher;
 pub(crate) mod blacklist;
 pub(crate) mod grabber;
 pub(crate) mod io;
-mod memory;
+pub(crate) mod memory;
 pub(crate) mod sender;
 pub(crate) mod tag_fetcher;
 pub(crate) mod tui;
@@ -500,6 +502,53 @@ impl E621WebConnector {
         }
     }
     
+    /// Asks the user to select download mode and manage tags or artists accordingly
+    pub(crate) fn configure_download_mode(&self) {
+        println!("\nDownload Mode Selection");
+        println!("Choose how you want to download content:");
+        println!("1. Download by Tags (Search by tags, pools, sets, and individual posts)");
+        println!("2. Download by Artists (Download posts from specific artists)");
+        println!("3. Download by Both (Manage both tags and artists)");
+        
+        let selection = loop {
+            let input: String = dialoguer::Input::new()
+                .with_prompt("Select download mode (1-3):")
+                .interact_text()
+                .unwrap_or_else(|_| "1".to_string());
+            
+            if let Ok(num) = input.trim().parse::<usize>() {
+                if num > 0 && num <= 3 {
+                    break num;
+                }
+            }
+            println!("Invalid selection. Please enter a number between 1 and 3");
+        };
+        
+        match selection {
+            1 => {
+                // Tags only
+                println!("\nSelected: Download by Tags");
+                self.configure_tag_fetching();
+            },
+            2 => {
+                // Artists only
+                println!("\nSelected: Download by Artists");
+                self.configure_artist_fetching();
+            },
+            3 => {
+                // Both
+                println!("\nSelected: Download by Both Tags and Artists");
+                self.configure_tag_fetching();
+                self.configure_artist_fetching();
+            },
+            _ => {
+                // Default to tags
+                println!("\nDefaulting to: Download by Tags");
+                self.configure_tag_fetching();
+            }
+        }
+    }
+    
     /// Asks the user about tag fetching and manages tags.txt file
     pub(crate) fn configure_tag_fetching(&self) {
         println!("\nTag Management Options");
@@ -611,6 +660,121 @@ impl E621WebConnector {
             Err(e) => {
                 warn!("Failed to fetch tags: {}", e);
                 println!("Failed to fetch tags. You can manually create tags.txt or try again later.");
+            }
+        }
+    }
+    
+    /// Asks the user about artist fetching and manages artists.json file
+    pub(crate) fn configure_artist_fetching(&self) {
+        println!("\nArtist Management Options");
+        
+        let artist_options = vec![
+            "Interactive Artist Management (Search, discover, and curate artists)",
+            "Auto-fetch Popular Artists (Quick setup with popular artists)",
+            "Skip artist setup (Use existing artists.json or create manually later)"
+        ];
+        
+        println!("How would you like to manage your artists?");
+        for (i, option) in artist_options.iter().enumerate() {
+            println!("{}. {}", i + 1, option);
+        }
+        
+        let selection = loop {
+            let input: String = dialoguer::Input::new()
+                .with_prompt(&format!("Select option (1-{}):", artist_options.len()))
+                .interact_text()
+                .unwrap_or_else(|_| "3".to_string());
+            
+            if let Ok(num) = input.trim().parse::<usize>() {
+                if num > 0 && num <= artist_options.len() {
+                    break num - 1;
+                }
+            }
+            println!("Invalid selection. Please enter a number between 1 and {}", artist_options.len());
+        };
+        
+        match selection {
+            0 => {
+                // Interactive mode
+                let mut artist_fetcher = ArtistFetcher::new(self.request_sender.clone());
+                match artist_fetcher.interactive_artist_management() {
+                    Ok(()) => {
+                        println!("Interactive artist management completed successfully.");
+                    },
+                    Err(e) => {
+                        warn!("Failed during interactive artist management: {}", e);
+                        println!("Interactive artist management failed. You can try again later or create artists.json manually.");
+                    }
+                }
+                return;
+            },
+            1 => {
+                // Auto-fetch mode
+                // Check if artists.json already exists
+                if ArtistFetcher::artists_file_exists() {
+                    println!("\nFound existing artists.json file.");
+                    
+                    let refresh_artists = Self::robust_confirm_prompt(
+                        "Would you like to refresh artists.json with popular artists from e621?",
+                        false
+                    ).unwrap_or(false);
+                    
+                    if !refresh_artists {
+                        info!("Using existing artists.json file.");
+                        return;
+                    }
+                } else {
+                    println!("\nNo artists.json file found.");
+                    
+                    let create_artists = Self::robust_confirm_prompt(
+                        "Would you like to fetch popular artists from e621 and create artists.json?",
+                        true
+                    ).unwrap_or(true);
+                    
+                    if !create_artists {
+                        info!("Skipping artist fetching. You can manually create artists.json with your desired artists.");
+                        return;
+                    }
+                }
+            },
+            _ => {
+                // Skip
+                info!("Skipping artist setup. You can manually create artists.json with your desired artists.");
+                return;
+            }
+        }
+        
+        // Get user preferences for artist fetching
+        println!("\nArtist fetching options:");
+        
+        let artist_count_prompt = "Number of popular artists to fetch (default: 50)";
+        let artist_count: usize = Self::robust_input_prompt(&artist_count_prompt, 50)
+            .unwrap_or_else(|err| {
+                warn!("Failed to get artist count input: {}", err);
+                warn!("Using default artist count: 50");
+                50
+            });
+        
+        let min_posts_prompt = "Minimum post count per artist (default: 500)";
+        let min_posts: i32 = Self::robust_input_prompt(&min_posts_prompt, 500)
+            .unwrap_or_else(|err| {
+                warn!("Failed to get min posts input: {}", err);
+                warn!("Using default min posts: 500");
+                500
+            });
+        
+        // Create artist fetcher
+        let mut artist_fetcher = ArtistFetcher::new(self.request_sender.clone());
+        
+        // Fetch and save artists
+        match artist_fetcher.refresh_artists(artist_count, min_posts) {
+            Ok(()) => {
+                println!("Successfully fetched and saved {} popular artists to artists.json", artist_count);
+                info!("Artist fetching completed successfully.");
+            },
+            Err(e) => {
+                warn!("Failed to fetch artists: {}", e);
+                println!("Failed to fetch artists. You can manually create artists.json or try again later.");
             }
         }
     }
@@ -832,6 +996,13 @@ impl E621WebConnector {
         trace!("Grabbing posts...");
         self.grabber.grab_favorites();
         self.grabber.grab_posts_by_tags(groups);
+        
+        // Also grab by artists if any are configured
+        if let Ok(artists) = crate::e621::io::artist::parse_artist_file(&self.request_sender) {
+            if !artists.is_empty() {
+                self.grabber.grab_posts_by_artists(&artists);
+            }
+        }
     }
 
     /// Removes invalid characters from directory path.

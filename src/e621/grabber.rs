@@ -497,6 +497,43 @@ impl Grabber {
         }
         progress_bar.finish_with_message("All tags processed");
     }
+    
+    pub(crate) fn grab_posts_by_artists(&mut self, artists: &[crate::e621::io::artist::Artist]) {
+        let total_artists = artists.len();
+        let progress_bar = ProgressBar::new(total_artists as u64);
+        progress_bar.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} artists")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("#>-"));
+
+        for artist in artists.iter() {
+            let start_time = Instant::now();
+            self.grab_by_artist(artist);
+            progress_bar.inc(1);
+            let duration = start_time.elapsed();
+            info!("Finished processing artist {} in {:.2?}", artist.name(), duration);
+        }
+        progress_bar.finish_with_message("All artists processed");
+    }
+    
+    fn grab_by_artist(&mut self, artist: &crate::e621::io::artist::Artist) {
+        let search_tag = artist.name();
+        let posts = self.search(search_tag, &TagSearchType::Special);
+        let mut collection = PostCollection::new(
+            search_tag,
+            "Artists",
+            GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
+        );
+        if let Err(e) = collection.initialize_directories() {
+            error!("Failed to initialize directories for artist search: {}", e);
+            emergency_exit("Directory initialization failed");
+        }
+        self.posts.push(collection);
+        info!(
+            "{} grabbed!",
+            console::style(format!("\"{}\"", search_tag)).color256(39).italic()
+        );
+    }
 
     fn grab_by_tag_type(&mut self, tag: &Tag) {
         match tag.tag_type() {
@@ -731,6 +768,7 @@ impl Grabber {
         let mut pages_with_new_content = 0;
         let mut total_new_posts = 0;
         let mut total_duplicate_posts = 0;
+        let mut consecutive_empty_pages = 0;
         let _max_pages_u16 = max_pages as u16; // Keep for potential future use
         let dir_manager = Config::get().directory_manager().unwrap();
         
@@ -830,12 +868,14 @@ impl Grabber {
             
             // Process results and check for new content
             let mut found_posts_in_batch = false;
+            let mut found_any_posts_in_batch = false; // Track if ANY posts were found (including duplicates)
             let mut new_posts_in_batch = 0;
             let mut duplicate_posts_in_batch = 0;
             
             for (_page, mut searched_posts) in batch_results {
                 if !searched_posts.is_empty() {
                     found_posts_in_batch = true;
+                    found_any_posts_in_batch = true;
                     
                     // Process the posts
                     *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
@@ -872,6 +912,13 @@ impl Grabber {
                 pages_with_new_content += 1;
             }
             
+            // Track consecutive empty pages to detect end of content
+            if !found_any_posts_in_batch {
+                consecutive_empty_pages += threads_spawned;
+            } else {
+                consecutive_empty_pages = 0; // Reset counter if we found any posts
+            }
+            
             progress_bar.set_message(format!("processed {} pages ({} new posts, {} duplicates, {}/{} pages with new content)", 
                                              total_pages_searched, total_new_posts, total_duplicate_posts, pages_with_new_content, max_pages));
             
@@ -887,22 +934,31 @@ impl Grabber {
                 // We've searched too many pages, stop to prevent infinite searching
                 info!("Reached search limit of {} pages ({} configured * 3), stopping adaptive search", max_search_limit, max_pages);
                 false
+            } else if consecutive_empty_pages >= 10 {
+                // We've hit multiple consecutive pages with no posts at all - likely reached end of content
+                info!("Found {} consecutive empty pages, likely reached end of available content. Stopping search.", consecutive_empty_pages);
+                false
             } else if !found_posts_in_batch {
                 // No posts found in this batch - check if we should stop based on search depth
                 let should_stop_early = match max_pages {
                     1..=10 => {
-                        if total_pages_searched >= max_pages * 2 {
-                            info!("No posts found after searching {} pages ({}*2), stopping", total_pages_searched, max_pages);
+                        if consecutive_empty_pages >= 6 {
+                            info!("Found {} consecutive empty pages in quick search, stopping", consecutive_empty_pages);
                             true
                         } else {
                             false
                         }
                     },
                     _ => {
-                        // For larger searches, be more persistent
-                        info!("No posts in this batch, but continuing adaptive search ({}/{} pages with new content, {}/{} pages searched)", 
-                              pages_with_new_content, max_pages, total_pages_searched, max_search_limit);
-                        false
+                        // For larger searches, be more persistent but still respect empty page limits
+                        if consecutive_empty_pages >= 8 {
+                            info!("Found {} consecutive empty pages in deep search, likely reached end of content", consecutive_empty_pages);
+                            true
+                        } else {
+                            info!("No posts in this batch, but continuing adaptive search ({}/{} pages with new content, {}/{} pages searched, {} consecutive empty)", 
+                                  pages_with_new_content, max_pages, total_pages_searched, max_search_limit, consecutive_empty_pages);
+                            false
+                        }
                     }
                 };
                 !should_stop_early

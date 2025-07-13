@@ -10,6 +10,7 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty};
 
+pub(crate) mod artist;
 pub(crate) mod parser;
 pub(crate) mod tag;
 pub(crate) mod directory;
