@@ -201,9 +201,12 @@ impl DirectoryManager {
         // This ensures new/deleted files are picked up even if DB was loaded.
         {
             let mut disk_files = HashSet::new();
+            let mut disk_files_by_relative_path = HashSet::new();
             let subdirs = [&artists, &tags, &pools];
             // Gather all candidate files up front for correct ETA math
             let mut candidate_files = Vec::new();
+            let root_path = manager.root_dir.clone();
+            
             for dir in subdirs.iter() {
                 if dir.exists() {
                     for entry in walkdir::WalkDir::new(dir) {
@@ -211,8 +214,15 @@ impl DirectoryManager {
                             let path = e.path();
                             if path.is_file() {
                                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                                    // Store both the absolute filename and relative path from download root
+                                    let relative_path = path.strip_prefix(&root_path)
+                                        .unwrap_or(path)
+                                        .to_string_lossy()
+                                        .to_string();
+                                    
                                     candidate_files.push((filename.to_owned(), path.to_path_buf()));
                                     disk_files.insert(filename.to_owned());
+                                    disk_files_by_relative_path.insert(relative_path);
                                 }
                             }
                         }
@@ -315,11 +325,55 @@ impl DirectoryManager {
                 }
             }
             // Remove any DB entry no longer present on disk
+            // Use smarter logic to check both filename and relative path
             let to_remove: Vec<_> = manager.downloaded_files
                 .iter()
-                .filter(|(f,_)| !disk_files.contains(f))
+                .filter(|(f, _)| {
+                    // Check if file exists by filename OR by relative path
+                    let exists_by_filename = disk_files.contains(f);
+                    let exists_by_relative_path = disk_files_by_relative_path.contains(f);
+                    
+                    if !exists_by_filename && !exists_by_relative_path {
+                        // Double-check by searching for the file in all subdirectories
+                        let mut found_on_disk = false;
+                        for dir in subdirs.iter() {
+                            let potential_path = dir.join(f);
+                            if potential_path.exists() {
+                                found_on_disk = true;
+                                trace!("File '{}' found at: {}", f, potential_path.display());
+                                break;
+                            }
+                            
+                            // Also check subdirectories
+                            if let Ok(entries) = fs::read_dir(dir) {
+                                for entry in entries.flatten() {
+                                    if entry.path().is_dir() {
+                                        let subdir_path = entry.path().join(f);
+                                        if subdir_path.exists() {
+                                            found_on_disk = true;
+                                            trace!("File '{}' found in subdir: {}", f, subdir_path.display());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if found_on_disk { break; }
+                            }
+                        }
+                        
+                        if found_on_disk {
+                            trace!("File '{}' exists on disk but wasn't found in initial scan, keeping in DB", f);
+                            false // Don't remove - file exists
+                        } else {
+                            warn!("File '{}' not found on disk after thorough search, will remove from DB", f);
+                            true // Remove - file truly doesn't exist
+                        }
+                    } else {
+                        false // Don't remove - file exists
+                    }
+                })
                 .cloned()
                 .collect();
+                
             for r in &to_remove {
                 info!("Removing deleted file '{}' from hash DB", r.0);
                 manager.downloaded_files.remove(r);
@@ -327,15 +381,35 @@ impl DirectoryManager {
             // Hash any files that are present but missing hash value
             let mut missing_hash: Vec<_> = vec![];
             for (f, h) in manager.downloaded_files.iter() {
-                if h.is_none() && disk_files.contains(f) {
+                if h.is_none() && (disk_files.contains(f) || disk_files_by_relative_path.contains(f)) {
                     missing_hash.push(f.clone());
                 }
             }
             for f in &missing_hash {
                 let mut full_path = None;
+                
+                // Try to find the file in the directory structure
                 for dir in subdirs.iter() {
+                    // Check direct path
                     let cand = dir.join(&f);
-                    if cand.exists() { full_path = Some(cand); break; }
+                    if cand.exists() { 
+                        full_path = Some(cand); 
+                        break; 
+                    }
+                    
+                    // Check subdirectories
+                    if let Ok(entries) = fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            if entry.path().is_dir() {
+                                let subdir_path = entry.path().join(&f);
+                                if subdir_path.exists() {
+                                    full_path = Some(subdir_path);
+                                    break;
+                                }
+                            }
+                        }
+                        if full_path.is_some() { break; }
+                    }
                 }
                 if let Some(path) = full_path {
                     match fs::read(&path) {
