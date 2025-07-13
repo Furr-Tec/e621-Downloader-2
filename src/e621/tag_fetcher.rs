@@ -240,6 +240,170 @@ impl TagFetcher {
         info!("Saved {} tags to {}", tags.len(), TAG_CACHE_FILE);
         Ok(())
     }
+    
+    /// Append tags to the existing tags.txt file without overwriting
+    pub fn append_tags_to_file(&self, tags: &[ApiTag]) -> Result<()> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+        
+        // If file doesn't exist, create it normally
+        if !Self::tags_file_exists() {
+            return self.save_tags_to_file(tags);
+        }
+        
+        // Read existing content
+        let existing_content = read_to_string(TAG_CACHE_FILE)?;
+        let mut lines: Vec<String> = existing_content.lines().map(|s| s.to_string()).collect();
+        
+        // Group new tags by category
+        let mut new_artists = Vec::new();
+        let mut new_general = Vec::new();
+        
+        for tag in tags {
+            match TagCategory::from_i32(tag.category) {
+                Some(TagCategory::Artist) => new_artists.push(tag),
+                Some(TagCategory::Species) => new_general.push(tag),
+                Some(TagCategory::Character) => new_general.push(tag),
+                Some(TagCategory::General) => new_general.push(tag),
+                Some(TagCategory::Copyright) => new_general.push(tag),
+                None => new_general.push(tag),
+            }
+        }
+        
+        // Get existing tags to avoid duplicates
+        let existing_tags = Self::load_existing_tags().unwrap_or_default();
+        let existing_set: HashSet<String> = existing_tags.into_iter().collect();
+        
+        // Filter out duplicates
+        new_artists.retain(|tag| !existing_set.contains(&tag.name));
+        new_general.retain(|tag| !existing_set.contains(&tag.name));
+        
+        if new_artists.is_empty() && new_general.is_empty() {
+            info!("No new tags to add - all tags already exist in file");
+            return Ok(());
+        }
+        
+        // Find section indices
+        let mut artists_section_start = None;
+        let mut artists_section_end = None;
+        let mut general_section_start = None;
+        let mut general_section_end = None;
+        let mut current_section = None;
+        
+        for (i, line) in lines.iter().enumerate() {
+            let line = line.trim();
+            
+            if line == "[artists]" {
+                artists_section_start = Some(i);
+                current_section = Some("artists");
+            } else if line == "[general]" {
+                general_section_start = Some(i);
+                current_section = Some("general");
+            } else if line.starts_with('[') && line.ends_with(']') {
+                // New section started
+                match current_section {
+                    Some("artists") => artists_section_end = Some(i),
+                    Some("general") => general_section_end = Some(i),
+                    _ => {}
+                }
+                current_section = None;
+            }
+        }
+        
+        // If no end was found, sections go to the end of file
+        if artists_section_start.is_some() && artists_section_end.is_none() {
+            artists_section_end = Some(lines.len());
+        }
+        if general_section_start.is_some() && general_section_end.is_none() {
+            general_section_end = Some(lines.len());
+        }
+        
+        // Add new artists
+        if !new_artists.is_empty() {
+            if let Some(start) = artists_section_start {
+                let end = artists_section_end.unwrap_or(lines.len());
+                
+                // Find the insertion point (after section header, before next section)
+                let mut insert_pos = start + 1;
+                
+                // Skip any existing comments or empty lines after the section header
+                while insert_pos < end {
+                    let line = lines[insert_pos].trim();
+                    if line.starts_with('#') || line.is_empty() {
+                        insert_pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // If we found existing tags, insert after them
+                while insert_pos < end {
+                    let line = lines[insert_pos].trim();
+                    if !line.starts_with('#') && !line.is_empty() && !line.starts_with('[') {
+                        insert_pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Insert new artist tags
+                let artist_count = new_artists.len();
+                for tag in new_artists {
+                    lines.insert(insert_pos, format!("{} # ({} posts)", tag.name, tag.post_count));
+                    insert_pos += 1;
+                }
+                
+                info!("Added {} new artist tags", artist_count);
+            }
+        }
+        
+        // Add new general tags
+        if !new_general.is_empty() {
+            if let Some(start) = general_section_start {
+                let end = general_section_end.unwrap_or(lines.len());
+                
+                // Find the insertion point (after section header, before next section)
+                let mut insert_pos = start + 1;
+                
+                // Skip any existing comments or empty lines after the section header
+                while insert_pos < end {
+                    let line = lines[insert_pos].trim();
+                    if line.starts_with('#') || line.is_empty() {
+                        insert_pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // If we found existing tags, insert after them
+                while insert_pos < end {
+                    let line = lines[insert_pos].trim();
+                    if !line.starts_with('#') && !line.is_empty() && !line.starts_with('[') {
+                        insert_pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Insert new general tags
+                let general_count = new_general.len();
+                for tag in new_general {
+                    lines.insert(insert_pos, format!("{} # ({} posts)", tag.name, tag.post_count));
+                    insert_pos += 1;
+                }
+                
+                info!("Added {} new general tags", general_count);
+            }
+        }
+        
+        // Write back to file
+        let content = lines.join("\n");
+        write(TAG_CACHE_FILE, content)?;
+        
+        info!("Appended {} tags to {}", tags.len(), TAG_CACHE_FILE);
+        Ok(())
+    }
 
     /// Check if tags.txt exists
     pub fn tags_file_exists() -> bool {
@@ -610,7 +774,7 @@ impl TagFetcher {
                             
                             match save_now.trim().to_lowercase().as_str() {
                                 "y" | "yes" => {
-                                    match self.save_tags_to_file(&whitelisted_tags) {
+                                    match self.append_tags_to_file(&whitelisted_tags) {
                                         Ok(()) => {
                                             println!("Saved {} tags to tags.txt", whitelisted_tags.len());
                                             // Track the saved tags for session summary
@@ -748,7 +912,7 @@ impl TagFetcher {
             };
             
             if confirm_save {
-                self.save_tags_to_file(&whitelisted_tags)?;
+                self.append_tags_to_file(&whitelisted_tags)?;
                 println!("Saved {} tags to tags.txt", whitelisted_tags.len());
                 total_saved_tags += whitelisted_tags.len();
             }
