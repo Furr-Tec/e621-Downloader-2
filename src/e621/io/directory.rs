@@ -5,6 +5,7 @@ use std::io::Read;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::time::Instant;
 use anyhow::{Result, Context, anyhow};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -1511,6 +1512,108 @@ impl DirectoryManager {
         
         // Fall back to filename check
         self.file_exists(file_name)
+    }
+    
+    /// Batch check if multiple post IDs have been downloaded before
+    /// This method is optimized for checking many post IDs at once
+    pub(crate) fn batch_has_post_ids(&self, post_ids: &[i64]) -> Vec<(i64, bool)> {
+        let batch_start = Instant::now();
+        trace!("Batch checking {} post IDs in cached hash database", post_ids.len());
+        
+        let mut results = Vec::with_capacity(post_ids.len());
+        
+        // Use cached database if available
+        if let Some(ref db) = self.cached_database {
+            // Create a HashSet of post IDs from the database for O(1) lookups
+            let mut post_id_set = HashSet::new();
+            
+            // First pass: collect all post IDs from the database
+            for entry in &db.entries {
+                if let Some(stored_post_id) = entry.post_id {
+                    post_id_set.insert(stored_post_id);
+                }
+            }
+            
+            // Second pass: Check each requested post ID
+            for &post_id in post_ids {
+                let found = post_id_set.contains(&post_id);
+                results.push((post_id, found));
+                if found {
+                    trace!("Found post ID {} in cached database", post_id);
+                }
+            }
+            
+            // If we didn't find all posts using direct post_id lookup, try filename fallback
+            let mut unfound_posts: Vec<i64> = results.iter()
+                .filter_map(|(id, found)| if !found { Some(*id) } else { None })
+                .collect();
+                
+            if !unfound_posts.is_empty() {
+                trace!("Performing filename fallback check for {} posts", unfound_posts.len());
+                
+                // Create lookup sets for filename patterns
+                let mut filename_set = HashSet::new();
+                for entry in &db.entries {
+                    filename_set.insert(entry.filename.as_str());
+                }
+                
+                // Check filename patterns for unfound posts
+                for &post_id in &unfound_posts {
+                    let post_id_str = post_id.to_string();
+                    let mut found = false;
+                    
+                    // Check for ID naming: "12345.jpg" patterns
+                    for filename in &filename_set {
+                        if filename.starts_with(&format!("{}.", post_id_str)) ||
+                           filename.contains(&format!("_{}.", post_id_str)) {
+                            found = true;
+                            trace!("Found post ID {} via filename pattern in {}", post_id, filename);
+                            break;
+                        }
+                    }
+                    
+                    // Update result
+                    if let Some(result) = results.iter_mut().find(|(id, _)| *id == post_id) {
+                        result.1 = found;
+                    }
+                }
+            }
+        } else {
+            // Fallback to individual checks if cache is not available
+            warn!("Cached database not available, falling back to individual checks for {} posts", post_ids.len());
+            for &post_id in post_ids {
+                let found = self.has_post_id(post_id);
+                results.push((post_id, found));
+            }
+        }
+        
+        let batch_duration = batch_start.elapsed();
+        trace!("Batch post ID check completed in {:.2?} for {} posts", batch_duration, post_ids.len());
+        
+        results
+    }
+    
+    /// Batch check if multiple filenames are duplicates
+    /// This method is optimized for checking many filenames at once
+    pub(crate) fn batch_is_duplicate(&self, filenames: &[String]) -> Vec<(String, bool)> {
+        let batch_start = Instant::now();
+        trace!("Batch checking {} filenames for duplicates", filenames.len());
+        
+        let mut results = Vec::with_capacity(filenames.len());
+        
+        // Create a HashSet from downloaded_files for O(1) lookups
+        let filename_set: HashSet<&str> = self.downloaded_files.iter().map(|(s, _)| s.as_str()).collect();
+        
+        // Check each filename
+        for filename in filenames {
+            let is_duplicate = filename_set.contains(filename.as_str());
+            results.push((filename.clone(), is_duplicate));
+        }
+        
+        let batch_duration = batch_start.elapsed();
+        trace!("Batch duplicate check completed in {:.2?} for {} files", batch_duration, filenames.len());
+        
+        results
     }
     
     /// Checks if a post ID has been downloaded before by checking the cached hash database

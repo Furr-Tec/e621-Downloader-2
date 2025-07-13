@@ -14,6 +14,8 @@ use crate::e621::io::tag::{Group, Tag, TagSearchType, TagType};
 use crate::e621::io::{emergency_exit, Config, Login};
 use crate::e621::sender::entries::{PoolEntry, PostEntry, SetEntry};
 use crate::e621::sender::RequestSender;
+use crate::e621::whitelist_cache::WhitelistCache;
+use crate::e621::rate_limiter::AdaptiveRateLimiter;
 
 /// A trait for implementing a conversion function for turning a type into a [Vec] of the same type
 pub(crate) trait NewVec<T> {
@@ -387,6 +389,10 @@ pub(crate) struct Grabber {
     request_sender: RequestSender,
     blacklist: Option<Arc<Mutex<Blacklist>>>,
     safe_mode: bool,
+    /// Cache for whitelist generation to avoid repeated computation
+    whitelist_cache: WhitelistCache,
+    /// Adaptive rate limiter for managing API request intervals
+    rate_limiter: Arc<Mutex<AdaptiveRateLimiter>>,
 }
 
 impl Grabber {
@@ -396,6 +402,8 @@ impl Grabber {
             request_sender,
             blacklist: None,
             safe_mode,
+            whitelist_cache: WhitelistCache::new(),
+            rate_limiter: Arc::new(Mutex::new(AdaptiveRateLimiter::new())),
         }
     }
 
@@ -570,6 +578,8 @@ impl Grabber {
             request_sender: request_sender.clone(),
             blacklist: blacklist.clone(),
             safe_mode,
+            whitelist_cache: WhitelistCache::new(),
+            rate_limiter: Arc::new(Mutex::new(AdaptiveRateLimiter::new())),
         };
         
         // Process the tag using existing logic
@@ -913,18 +923,8 @@ impl Grabber {
         // Calculate optimal thread count based on max pages
         let thread_count = self.calculate_optimal_thread_count(max_pages);
         
-        // Dynamic rate limiting based on thread count to prevent API overload
-        let rate_limit_delay = match thread_count {
-            1 => Duration::from_millis(100),       // Single thread - minimal delay
-            2 => Duration::from_millis(200),       // Dual thread - conservative
-            3 => Duration::from_millis(300),       // Triple thread - balanced
-            4 => Duration::from_millis(400),       // Quad thread - moderate
-            5 => Duration::from_millis(500),       // Penta thread - higher
-            _ => Duration::from_millis(600),       // Max thread - highest delay
-        };
-        
-        info!("Searching max {} pages using {} threads with {}ms rate limiting (stops early if 4 consecutive empty pages found)", 
-              max_pages, thread_count, rate_limit_delay.as_millis());
+        info!("Searching max {} pages using {} threads with adaptive rate limiting (stops early if 4 consecutive empty pages found)", 
+              max_pages, thread_count);
         
         let progress_bar = ProgressBar::new_spinner();
         progress_bar.set_style(
@@ -972,15 +972,28 @@ impl Grabber {
                 let request_sender = self.request_sender.clone();
                 let searching_tag = searching_tag.to_string();
                 let result_tx = result_tx.clone();
+                let rate_limiter = Arc::clone(&self.rate_limiter);
                 
                 let handle = thread::spawn(move || {
                     // Stagger thread starts to avoid simultaneous API hits
                     let stagger_delay_ms = 50 * thread_id as u64;
                     thread::sleep(Duration::from_millis(stagger_delay_ms));
                     
+                    // Use adaptive rate limiter to wait before making the request
+                    if let Ok(limiter) = rate_limiter.lock() {
+                        let delay = limiter.current_delay();
+                        drop(limiter); // Release lock before sleeping
+                        thread::sleep(delay);
+                    }
+                    
                     let page_start = Instant::now();
                     let searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
                     let request_duration = page_start.elapsed();
+                    
+                    // Record the response time in the adaptive rate limiter
+                    if let Ok(limiter) = rate_limiter.lock() {
+                        limiter.record_response_time(request_duration);
+                    }
                     
                     // Log slow requests as warnings
                     if request_duration > Duration::from_secs(3) {
@@ -993,9 +1006,6 @@ impl Grabber {
                     
                     // Send results back
                     let _ = result_tx.send((page_to_search, searched_posts));
-                    
-                    // Dynamic rate limiting - wait between requests
-                    thread::sleep(rate_limit_delay);
                 });
                 handles.push(handle);
             }
@@ -1167,47 +1177,51 @@ impl Grabber {
 
     /// Generate whitelist from current search context
     /// This includes the tag being searched and any known priority tags
+    /// Uses cache to avoid regenerating the same whitelist multiple times
     fn generate_whitelist_for_search(&self, searching_tag: &str) -> Vec<String> {
-        let mut whitelist = Vec::new();
-        
-        // Always add the currently searched tag to whitelist (cleaned)
-        let clean_tag = searching_tag.trim();
-        if !clean_tag.is_empty() {
-            whitelist.push(clean_tag.to_string());
-        }
-        
-        // Handle special tag prefixes
-        if clean_tag.starts_with("artist:") {
-            let artist_name = clean_tag.strip_prefix("artist:").unwrap_or(clean_tag);
-            if !artist_name.is_empty() {
-                whitelist.push(artist_name.to_string());
-                // Also add "artist" category variants that might appear in tags
-                whitelist.push(format!("artist:{}", artist_name));
+        // Use the cache to get or generate the whitelist
+        self.whitelist_cache.get_or_generate(searching_tag, || {
+            let mut whitelist = Vec::new();
+            
+            // Always add the currently searched tag to whitelist (cleaned)
+            let clean_tag = searching_tag.trim();
+            if !clean_tag.is_empty() {
+                whitelist.push(clean_tag.to_string());
             }
-        } else if clean_tag.starts_with("fav:") {
-            let username = clean_tag.strip_prefix("fav:").unwrap_or(clean_tag);
-            if !username.is_empty() {
-                // Add uploader variant and original username
-                whitelist.push(format!("uploader:{}", username));
-                whitelist.push(username.to_string());
+            
+            // Handle special tag prefixes
+            if clean_tag.starts_with("artist:") {
+                let artist_name = clean_tag.strip_prefix("artist:").unwrap_or(clean_tag);
+                if !artist_name.is_empty() {
+                    whitelist.push(artist_name.to_string());
+                    // Also add "artist" category variants that might appear in tags
+                    whitelist.push(format!("artist:{}", artist_name));
+                }
+            } else if clean_tag.starts_with("fav:") {
+                let username = clean_tag.strip_prefix("fav:").unwrap_or(clean_tag);
+                if !username.is_empty() {
+                    // Add uploader variant and original username
+                    whitelist.push(format!("uploader:{}", username));
+                    whitelist.push(username.to_string());
+                }
+            } else if clean_tag.starts_with("pool:") {
+                // For pool searches, the tag is the pool content, not necessarily whitelistable
+                // But we'll keep the pool identifier just in case
+                whitelist.push(clean_tag.to_string());
+            } else {
+                // For general tags (including artist names without prefix), add variants
+                // This covers cases where an artist name is searched directly
+                whitelist.push(format!("artist:{}", clean_tag));
             }
-        } else if clean_tag.starts_with("pool:") {
-            // For pool searches, the tag is the pool content, not necessarily whitelistable
-            // But we'll keep the pool identifier just in case
-            whitelist.push(clean_tag.to_string());
-        } else {
-            // For general tags (including artist names without prefix), add variants
-            // This covers cases where an artist name is searched directly
-            whitelist.push(format!("artist:{}", clean_tag));
-        }
-        
-        // Remove duplicates and empty entries
-        whitelist.sort();
-        whitelist.dedup();
-        whitelist.retain(|tag| !tag.trim().is_empty());
-        
-        info!("Generated whitelist for search '{}': {:?}", searching_tag, whitelist);
-        whitelist
+            
+            // Remove duplicates and empty entries
+            whitelist.sort();
+            whitelist.dedup();
+            whitelist.retain(|tag| !tag.trim().is_empty());
+            
+            info!("Generated whitelist for search '{}': {:?}", searching_tag, whitelist);
+            whitelist
+        })
     }
 
     fn filter_posts_with_blacklist_and_whitelist(&self, posts: &mut Vec<PostEntry>, whitelist: &Vec<String>) -> u16 {

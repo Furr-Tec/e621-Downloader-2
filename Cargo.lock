@@ -404,6 +404,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "walkdir",
+ "winapi",
 ]
 
 [[package]]

@@ -20,17 +20,22 @@ use crate::e621::artist_fetcher::ArtistFetcher;
 use smallvec::SmallVec;
 use crate::e621::sender::entries::UserEntry;
 use crate::e621::sender::RequestSender;
+use crate::e621::streaming::{StreamingProcessor, StreamingConfig};
 
 pub(crate) mod artist_fetcher;
 pub(crate) mod blacklist;
 pub(crate) mod cache;
+pub(crate) mod connection_pool;
 pub(crate) mod grabber;
 pub(crate) mod io;
 pub(crate) mod memory;
 pub(crate) mod performance;
+pub(crate) mod rate_limiter;
 pub(crate) mod sender;
+pub(crate) mod streaming;
 pub(crate) mod tag_fetcher;
 pub(crate) mod tui;
+pub(crate) mod whitelist_cache;
 
 /// Helper struct to hold collection information for downloading
 /// Optimized to use heap allocation and avoid excessive stack usage
@@ -1981,6 +1986,63 @@ impl E621WebConnector {
 
         // Convert bytes to KB before returning (as documented in function comment)
         total_size / 1024
+    }
+
+    /// Process collections using streaming functionality for memory-efficient large downloads
+    pub(crate) async fn process_collection_stream(
+        &self,
+        stream_config: StreamingConfig,
+    ) -> Result<(), anyhow::Error> {
+        info!("Starting streaming collection processing with config: {:?}", stream_config);
+        
+        // Create a streaming processor with the configuration
+        let mut processor = StreamingProcessor::new(stream_config);
+        
+        // Set the request sender for the processor
+        processor.set_request_sender(self.request_sender.clone());
+        
+        // Set the progress bar if available
+        if !self.progress_bar.is_hidden() {
+            processor.set_progress_bar(self.progress_bar.clone());
+        }
+        
+        // Get collections to process
+        let collections = self.grabber.posts();
+        
+        if collections.is_empty() {
+            info!("No collections to process.");
+            return Ok(());
+        }
+        
+        // Convert collections to streaming format
+        let mut stream_collections = Vec::new();
+        for collection in collections.iter() {
+            // Only process posts that are new
+            let new_posts: Vec<_> = collection.posts().iter()
+                .filter(|post| post.is_new())
+                .cloned()
+                .collect();
+            
+            if !new_posts.is_empty() {
+                stream_collections.push(crate::e621::streaming::Collection {
+                    name: collection.name().to_string(),
+                    posts: new_posts,
+                });
+            }
+        }
+        
+        if stream_collections.is_empty() {
+            info!("No new posts to process.");
+            return Ok(());
+        }
+        
+        info!("Processing {} collections with streaming processor", stream_collections.len());
+        
+        // Process collections with the streaming processor
+        processor.process_collections(stream_collections).await?;
+        
+        info!("Streaming collection processing completed");
+        Ok(())
     }
 }
 
