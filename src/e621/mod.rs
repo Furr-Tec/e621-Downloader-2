@@ -502,29 +502,80 @@ impl E621WebConnector {
     
     /// Asks the user about tag fetching and manages tags.txt file
     pub(crate) fn configure_tag_fetching(&self) {
-        // Check if tags.txt already exists
-        if TagFetcher::tags_file_exists() {
-            println!("\n📋 Found existing tags.txt file.");
+        println!("\n🏷️  Tag Management Options");
+        
+        let tag_options = vec![
+            "Interactive Tag Management (Search, discover, and curate tags)",
+            "Auto-fetch Popular Tags (Quick setup with popular non-blacklisted tags)",
+            "Skip tag setup (Use existing tags.txt or create manually later)"
+        ];
+        
+        println!("How would you like to manage your tags?");
+        for (i, option) in tag_options.iter().enumerate() {
+            println!("{}. {}", i + 1, option);
+        }
+        
+        let selection = loop {
+            let input: String = dialoguer::Input::new()
+                .with_prompt(&format!("Select option (1-{}):", tag_options.len()))
+                .interact_text()
+                .unwrap_or_else(|_| "3".to_string());
             
-            let refresh_tags = Self::robust_confirm_prompt(
-                "Would you like to refresh tags.txt with popular non-blacklisted tags from e621?",
-                false
-            ).unwrap_or(false);
-            
-            if !refresh_tags {
-                info!("Using existing tags.txt file.");
-                return;
+            if let Ok(num) = input.trim().parse::<usize>() {
+                if num > 0 && num <= tag_options.len() {
+                    break num - 1;
+                }
             }
-        } else {
-            println!("\n📋 No tags.txt file found.");
-            
-            let create_tags = Self::robust_confirm_prompt(
-                "Would you like to fetch popular non-blacklisted tags from e621 and create tags.txt?",
-                true
-            ).unwrap_or(true);
-            
-            if !create_tags {
-                info!("Skipping tag fetching. You can manually create tags.txt with your desired tags.");
+            println!("Invalid selection. Please enter a number between 1 and {}", tag_options.len());
+        };
+        
+        match selection {
+            0 => {
+                // Interactive mode
+                let mut tag_fetcher = TagFetcher::new(self.request_sender.clone());
+                match tag_fetcher.interactive_tag_management() {
+                    Ok(()) => {
+                        println!("✅ Interactive tag management completed successfully.");
+                    },
+                    Err(e) => {
+                        warn!("Failed during interactive tag management: {}", e);
+                        println!("❌ Interactive tag management failed. You can try again later or create tags.txt manually.");
+                    }
+                }
+                return;
+            },
+            1 => {
+                // Auto-fetch mode (existing logic)
+                // Check if tags.txt already exists
+                if TagFetcher::tags_file_exists() {
+                    println!("\n📋 Found existing tags.txt file.");
+                    
+                    let refresh_tags = Self::robust_confirm_prompt(
+                        "Would you like to refresh tags.txt with popular non-blacklisted tags from e621?",
+                        false
+                    ).unwrap_or(false);
+                    
+                    if !refresh_tags {
+                        info!("Using existing tags.txt file.");
+                        return;
+                    }
+                } else {
+                    println!("\n📋 No tags.txt file found.");
+                    
+                    let create_tags = Self::robust_confirm_prompt(
+                        "Would you like to fetch popular non-blacklisted tags from e621 and create tags.txt?",
+                        true
+                    ).unwrap_or(true);
+                    
+                    if !create_tags {
+                        info!("Skipping tag fetching. You can manually create tags.txt with your desired tags.");
+                        return;
+                    }
+                }
+            },
+            _ => {
+                // Skip
+                info!("Skipping tag setup. You can manually create tags.txt with your desired tags.");
                 return;
             }
         }

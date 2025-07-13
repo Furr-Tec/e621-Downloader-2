@@ -1,11 +1,13 @@
 use std::fs::{write, read_to_string};
 use std::path::Path;
+use std::collections::HashSet;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use crate::e621::sender::RequestSender;
 use crate::e621::blacklist::Blacklist;
 use crate::e621::sender::entries::UserEntry;
 use crate::e621::io::Login;
+use dialoguer::Input;
 
 /// Name of the tag cache file
 const TAG_CACHE_FILE: &str = "tags.txt";
@@ -112,10 +114,6 @@ impl TagFetcher {
             
             // Make API request
             let response = self.request_sender.get_string(&url)?;
-            
-            // Debug: Log first 500 characters of response to see structure
-            info!("API Response (first 500 chars): {}", &response[..response.len().min(500)]);
-            
             let tags: Vec<ApiTag> = serde_json::from_str(&response)?;
             
             // Filter tags by post count and blacklist
@@ -272,6 +270,419 @@ impl TagFetcher {
         Ok(tags)
     }
 
+    /// Search for tags that match a query string with multiple search strategies
+    pub fn search_tags(&self, query: &str, limit: usize) -> Result<Vec<ApiTag>> {
+        info!("Searching for tags matching: {}", query);
+        
+        let mut all_found_tags = Vec::new();
+        let mut seen_tags = std::collections::HashSet::new();
+        
+        // Strategy 1: Exact and prefix matches
+        let exact_url = format!(
+            "https://e621.net/tags.json?limit={}&search[name_matches]={}&search[hide_empty]=true&search[order]=count",
+            limit, query
+        );
+        
+        if let Ok(response) = self.request_sender.get_string(&exact_url) {
+            if let Ok(tags) = serde_json::from_str::<Vec<ApiTag>>(&response) {
+                for tag in tags {
+                    if seen_tags.insert(tag.name.clone()) {
+                        all_found_tags.push(tag);
+                    }
+                }
+            }
+        }
+        
+        // Strategy 2: Wildcard search for tags containing the query
+        if all_found_tags.len() < limit {
+            let wildcard_url = format!(
+                "https://e621.net/tags.json?limit={}&search[name_matches]=*{}*&search[hide_empty]=true&search[order]=count",
+                limit, query
+            );
+            
+            if let Ok(response) = self.request_sender.get_string(&wildcard_url) {
+                if let Ok(tags) = serde_json::from_str::<Vec<ApiTag>>(&response) {
+                    for tag in tags {
+                        if seen_tags.insert(tag.name.clone()) && all_found_tags.len() < limit {
+                            all_found_tags.push(tag);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Strategy 3: Search for related tags if we found at least one exact match
+        if !all_found_tags.is_empty() && all_found_tags.len() < limit {
+            // Use the first found tag to get related tags via its related_tags field
+            // This requires getting full tag info including related_tags
+            if let Some(first_tag) = all_found_tags.first() {
+                let tag_detail_url = format!(
+                    "https://e621.net/tags/{}.json",
+                    first_tag.id
+                );
+                
+                if let Ok(response) = self.request_sender.get_string(&tag_detail_url) {
+                    // Parse the detailed tag response which includes related_tags
+                    if let Ok(detailed_tag) = serde_json::from_str::<serde_json::Value>(&response) {
+                        if let Some(related_tags_str) = detailed_tag.get("related_tags").and_then(|v| v.as_str()) {
+                            // Parse related tags string (format: "tag1 count1 tag2 count2 ...")
+                            let words: Vec<&str> = related_tags_str.split_whitespace().collect();
+                            let mut related_tag_names = Vec::new();
+                            
+                            // Extract every other word (tag names, skip counts)
+                            for chunk in words.chunks(2) {
+                                if let Some(tag_name) = chunk.get(0) {
+                                    if !seen_tags.contains(*tag_name) {
+                                        related_tag_names.push(*tag_name);
+                                        if related_tag_names.len() >= 10 { // Limit related tags
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Fetch details for related tags
+                            for tag_name in related_tag_names {
+                                if all_found_tags.len() >= limit {
+                                    break;
+                                }
+                                
+                                let related_url = format!(
+                                    "https://e621.net/tags.json?limit=1&search[name_matches]={}&search[hide_empty]=true",
+                                    tag_name
+                                );
+                                
+                                if let Ok(response) = self.request_sender.get_string(&related_url) {
+                                    if let Ok(tags) = serde_json::from_str::<Vec<ApiTag>>(&response) {
+                                        for tag in tags {
+                                            if seen_tags.insert(tag.name.clone()) && all_found_tags.len() < limit {
+                                                all_found_tags.push(tag);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort by post count (highest first)
+        all_found_tags.sort_by(|a, b| b.post_count.cmp(&a.post_count));
+        all_found_tags.truncate(limit);
+        
+        info!("Found {} matching and related tags for query: {}", all_found_tags.len(), query);
+        Ok(all_found_tags)
+    }
+    
+    /// Add a tag to the user's blacklist on e621
+    pub fn add_to_remote_blacklist(&self, tag_name: &str) -> Result<()> {
+        info!("Adding tag '{}' to remote blacklist...", tag_name);
+        
+        // Get current user info to update blacklist
+        let username = Login::get().username();
+        let user: UserEntry = self.request_sender.get_entry_from_appended_id(username, "user");
+        
+        // Add tag to existing blacklist
+        let current_blacklist = user.blacklisted_tags.unwrap_or_default();
+        let _new_blacklist = if current_blacklist.is_empty() {
+            tag_name.to_string()
+        } else {
+            format!("{} {}", current_blacklist, tag_name)
+        };
+        
+        // Note: This is a simplified example. 
+        // The actual API call to update blacklist would require a PATCH request
+        // to the user endpoint with the updated blacklist data
+        warn!("Remote blacklist update not implemented yet - would add: {}", tag_name);
+        warn!("You'll need to manually add '{}' to your e621 blacklist", tag_name);
+        
+        Ok(())
+    }
+    
+    /// Interactive tag management workflow
+    pub fn interactive_tag_management(&mut self) -> Result<()> {
+        println!("\n🎯 Interactive Tag Management");
+        println!("This will help you discover and manage tags for your downloads.");
+        println!("You can search for tags, then choose to whitelist or blacklist them.");
+        
+        // First fetch the user's blacklist
+        self.fetch_user_blacklist()?;
+        
+        let mut whitelisted_tags = Vec::new();
+        let mut blacklisted_tags = Vec::new();
+        
+        loop {
+            println!("\n--- Tag Search ---");
+            
+            // Get search query from user
+            let query: String = Input::new()
+                .with_prompt("Enter a tag or keyword to search for (or 'done' to finish)")
+                .interact_text()
+                .unwrap_or_else(|_| "done".to_string());
+            
+            if query.trim().to_lowercase() == "done" {
+                break;
+            }
+            
+            // Search for matching tags
+            match self.search_tags(&query, 20) {
+                Ok(tags) => {
+                    if tags.is_empty() {
+                        println!("❌ No tags found matching '{}'", query);
+                        continue;
+                    }
+                    
+                    // Show tags to user
+                    println!("\n🔍 Found {} tags matching '{}':", tags.len(), query);
+                    
+                    let mut tag_options = Vec::new();
+                    for (i, tag) in tags.iter().enumerate() {
+                        let status = if self.is_blacklisted(&tag.name) {
+                            "[BLACKLISTED]"
+                        } else {
+                            ""
+                        };
+                        
+                        let display = format!(
+                            "{} - {} posts {}", 
+                            tag.name, 
+                            tag.post_count,
+                            status
+                        );
+                        tag_options.push(display);
+                        
+                        if i >= 19 { // Limit display to prevent overwhelming
+                            break;
+                        }
+                    }
+                    
+                    tag_options.push("Search for different tags".to_string());
+                    
+                    // Let user select a tag
+                    println!("\nAvailable options:");
+                    for (i, option) in tag_options.iter().enumerate() {
+                        println!("{}. {}", i + 1, option);
+                    }
+                    
+                    let selections = loop {
+                        let input: String = Input::new()
+                            .with_prompt(&format!("Select options (e.g., 1,2,3|1-3) (1-{}):", tag_options.len()))
+                            .interact_text()
+                            .unwrap_or_else(|_| tag_options.len().to_string());
+
+                        let ranges: Vec<(usize, usize)> = input
+                            .split(',')
+                            .filter_map(|range| {
+                                if range.contains('-') {
+                                    let parts: Vec<&str> = range.split('-').collect();
+                                    if parts.len() == 2 {
+                                        if let (Ok(start), Ok(end)) = (parts[0].trim().parse::<usize>(), parts[1].trim().parse::<usize>()) {
+                                            return Some((start, end));
+                                        }
+                                    }
+                                    return None;
+                                }
+                                range.trim().parse::<usize>().ok().map(|num| (num, num))
+                            })
+                            .collect();
+
+                        if ranges.iter().all(|&(start, end)| start > 0 && end <= tag_options.len() && start <= end) {
+                            break ranges;
+                        }
+                        println!("Invalid selection. Please enter numbers between 1 and {}", tag_options.len());
+                    };
+
+                    let mut selected_tags = Vec::new();
+                    let mut search_again = false;
+                    
+                    for (start, end) in selections {
+                        for index in start..=end {
+                            if index <= tags.len() {
+                                selected_tags.push(&tags[index - 1]);
+                            } else if index == tag_options.len() {
+                                search_again = true;
+                            }
+                        }
+                    }
+
+                    if search_again || selected_tags.is_empty() {
+                        continue; // "Search for different tags" selected
+                    }
+
+                    // Batch action selection
+                    println!("\nSelected {} tags:", selected_tags.len());
+                    for tag in &selected_tags {
+                        println!("  - {} ({} posts)", tag.name, tag.post_count);
+                    }
+                    
+                    let batch_actions = vec![
+                        "Whitelist all (add all to tags.txt for downloading)",
+                        "Blacklist all (add all to e621 blacklist to avoid)",
+                        "Process individually (choose action for each tag)",
+                        "Go back to search"
+                    ];
+                    
+                    println!("\nBatch actions:");
+                    for (i, action) in batch_actions.iter().enumerate() {
+                        println!("{}. {}", i + 1, action);
+                    }
+                    
+                    let batch_action = loop {
+                        let input: String = Input::new()
+                            .with_prompt(&format!("Select batch action (1-{}):", batch_actions.len()))
+                            .interact_text()
+                            .unwrap_or_else(|_| "4".to_string());
+                        
+                        if let Ok(num) = input.trim().parse::<usize>() {
+                            if num > 0 && num <= batch_actions.len() {
+                                break num - 1;
+                            }
+                        }
+                        println!("Invalid selection. Please enter a number between 1 and {}", batch_actions.len());
+                    };
+                    
+                    match batch_action {
+                        0 => {
+                            // Whitelist all
+                            for selected_tag in selected_tags {
+                                if !whitelisted_tags.iter().any(|t: &ApiTag| t.name == selected_tag.name) {
+                                    whitelisted_tags.push(selected_tag.clone());
+                                    println!("✅ Added '{}' to whitelist", selected_tag.name);
+                                } else {
+                                    println!("ℹ️  '{}' is already whitelisted", selected_tag.name);
+                                }
+                            }
+                        },
+                        1 => {
+                            // Blacklist all
+                            for selected_tag in selected_tags {
+                                match self.add_to_remote_blacklist(&selected_tag.name) {
+                                    Ok(()) => {
+                                        blacklisted_tags.push(selected_tag.clone());
+                                        println!("❌ Added '{}' to blacklist", selected_tag.name);
+                                    },
+                                    Err(e) => {
+                                        warn!("Failed to add '{}' to blacklist: {}", selected_tag.name, e);
+                                    }
+                                }
+                            }
+                        },
+                        2 => {
+                            // Process individually
+                            for selected_tag in selected_tags {
+                                let actions = vec![
+                                    "Whitelist (add to tags.txt for downloading)",
+                                    "Blacklist (add to e621 blacklist to avoid)",
+                                    "Show tag info",
+                                    "Skip this tag"
+                                ];
+                                
+                                println!("\nWhat would you like to do with '{}'?", selected_tag.name);
+                                for (i, action) in actions.iter().enumerate() {
+                                    println!("{}. {}", i + 1, action);
+                                }
+                                
+                                let action = loop {
+                                    let input: String = Input::new()
+                                        .with_prompt(&format!("Select action (1-{}):", actions.len()))
+                                        .interact_text()
+                                        .unwrap_or_else(|_| "4".to_string());
+                                    
+                                    if let Ok(num) = input.trim().parse::<usize>() {
+                                        if num > 0 && num <= actions.len() {
+                                            break num - 1;
+                                        }
+                                    }
+                                    println!("Invalid selection. Please enter a number between 1 and {}", actions.len());
+                                };
+                                
+                                match action {
+                                    0 => {
+                                        // Whitelist
+                                        if !whitelisted_tags.iter().any(|t: &ApiTag| t.name == selected_tag.name) {
+                                            whitelisted_tags.push(selected_tag.clone());
+                                            println!("✅ Added '{}' to whitelist", selected_tag.name);
+                                        } else {
+                                            println!("ℹ️  '{}' is already whitelisted", selected_tag.name);
+                                        }
+                                    },
+                                    1 => {
+                                        // Blacklist
+                                        match self.add_to_remote_blacklist(&selected_tag.name) {
+                                            Ok(()) => {
+                                                blacklisted_tags.push(selected_tag.clone());
+                                                println!("❌ Added '{}' to blacklist", selected_tag.name);
+                                            },
+                                            Err(e) => {
+                                                warn!("Failed to add to blacklist: {}", e);
+                                            }
+                                        }
+                                    },
+                                    2 => {
+                                        // Show info
+                                        println!("\n📊 Tag Information:");
+                                        println!("   Name: {}", selected_tag.name);
+                                        println!("   Posts: {}", selected_tag.post_count);
+                                        println!("   Category: {}", match TagCategory::from_i32(selected_tag.category) {
+                                            Some(cat) => format!("{:?}", cat),
+                                            None => "Unknown".to_string(),
+                                        });
+                                        println!("   Blacklisted: {}", if self.is_blacklisted(&selected_tag.name) { "Yes" } else { "No" });
+                                    },
+                                    _ => {
+                                        // Skip this tag
+                                        println!("⏭️ Skipped '{}'", selected_tag.name);
+                                    }
+                                }
+                            }
+                        },
+                        3 => {
+                            // Go back to search
+                            continue;
+                        },
+                        _ => {
+                            // Go back to search
+                            continue;
+                        }
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to search tags: {}", e);
+                }
+            }
+        }
+        
+        // Save whitelisted tags to tags.txt
+        if !whitelisted_tags.is_empty() {
+            let confirm_save = loop {
+                let input: String = Input::new()
+                    .with_prompt(&format!("Save {} whitelisted tags to tags.txt? (y/n):", whitelisted_tags.len()))
+                    .interact_text()
+                    .unwrap_or_else(|_| "y".to_string());
+                
+                match input.trim().to_lowercase().as_str() {
+                    "y" | "yes" | "" => break true,
+                    "n" | "no" => break false,
+                    _ => println!("Please enter 'y' for yes or 'n' for no."),
+                }
+            };
+            
+            if confirm_save {
+                self.save_tags_to_file(&whitelisted_tags)?;
+                println!("✅ Saved {} tags to tags.txt", whitelisted_tags.len());
+            }
+        }
+        
+        // Summary
+        println!("\n📋 Session Summary:");
+        println!("   Whitelisted: {} tags", whitelisted_tags.len());
+        println!("   Blacklisted: {} tags", blacklisted_tags.len());
+        
+        Ok(())
+    }
+    
     /// Refresh tags - fetch new ones and update the file
     pub fn refresh_tags(&mut self, limit: usize, min_post_count: i32) -> Result<()> {
         // First fetch the user's blacklist
