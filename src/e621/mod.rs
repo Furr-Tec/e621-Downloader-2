@@ -548,20 +548,8 @@ impl E621WebConnector {
                 1000
             });
         
-        // Create tag fetcher with blacklist if available
-        let blacklist = if !Login::get().is_empty() {
-            match self.blacklist.lock() {
-                Ok(bl) => Some(bl.clone()),
-                Err(e) => {
-                    warn!("Failed to get blacklist for tag filtering: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        
-        let tag_fetcher = TagFetcher::new(self.request_sender.clone(), blacklist);
+        // Create tag fetcher (it will fetch user blacklist internally)
+        let mut tag_fetcher = TagFetcher::new(self.request_sender.clone());
         
         // Fetch and save tags
         match tag_fetcher.refresh_tags(tag_count, min_posts) {

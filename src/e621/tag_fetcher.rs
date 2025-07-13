@@ -1,10 +1,11 @@
 use std::fs::{write, read_to_string};
 use std::path::Path;
-use std::collections::HashSet;
-use anyhow::{Result, Error};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use crate::e621::sender::RequestSender;
 use crate::e621::blacklist::Blacklist;
+use crate::e621::sender::entries::UserEntry;
+use crate::e621::io::Login;
 
 /// Name of the tag cache file
 const TAG_CACHE_FILE: &str = "tags.txt";
@@ -16,6 +17,13 @@ pub struct ApiTag {
     pub name: String,
     pub post_count: i32,
     pub category: i32, // 0=general, 1=artist, 3=copyright, 4=character, 5=species
+}
+
+/// Response wrapper for the e621 tags API
+#[derive(Debug, Deserialize)]
+struct TagResponse {
+    #[serde(rename = "value")]
+    tags: Vec<ApiTag>,
 }
 
 /// Category mappings for e621 tags
@@ -60,11 +68,35 @@ pub struct TagFetcher {
 
 impl TagFetcher {
     /// Create a new tag fetcher
-    pub fn new(request_sender: RequestSender, blacklist: Option<Blacklist>) -> Self {
+    pub fn new(request_sender: RequestSender) -> Self {
         Self {
             request_sender,
-            blacklist,
+            blacklist: None,
         }
+    }
+
+    /// Fetch the user's blacklist from their API key
+    pub fn fetch_user_blacklist(&mut self) -> Result<()> {
+        info!("Fetching user blacklist from API...");
+        
+        let username = Login::get().username();
+        let user: UserEntry = self.request_sender.get_entry_from_appended_id(username, "user");
+        
+        if let Some(blacklist_tags) = user.blacklisted_tags {
+            if !blacklist_tags.is_empty() {
+                let mut blacklist = Blacklist::new(self.request_sender.clone());
+                blacklist.parse_blacklist(blacklist_tags);
+                blacklist.cache_users();
+                self.blacklist = Some(blacklist);
+                info!("User blacklist loaded successfully");
+            } else {
+                info!("User has no blacklisted tags");
+            }
+        } else {
+            info!("User blacklist is empty or not available");
+        }
+        
+        Ok(())
     }
 
     /// Fetch popular tags from e621 API, filtered by blacklist
@@ -86,7 +118,8 @@ impl TagFetcher {
             
             // Make API request
             let response = self.request_sender.get_string(&url)?;
-            let tags: Vec<ApiTag> = serde_json::from_str(&response)?;
+            let tag_response: TagResponse = serde_json::from_str(&response)?;
+            let tags = tag_response.tags;
             
             // Filter tags by post count and blacklist
             for tag in tags {
@@ -243,7 +276,11 @@ impl TagFetcher {
     }
 
     /// Refresh tags - fetch new ones and update the file
-    pub fn refresh_tags(&self, limit: usize, min_post_count: i32) -> Result<()> {
+    pub fn refresh_tags(&mut self, limit: usize, min_post_count: i32) -> Result<()> {
+        // First fetch the user's blacklist
+        self.fetch_user_blacklist()?;
+        
+        // Then fetch and filter tags
         let tags = self.fetch_popular_tags(limit, min_post_count)?;
         self.save_tags_to_file(&tags)?;
         Ok(())
