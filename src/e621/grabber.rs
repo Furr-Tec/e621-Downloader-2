@@ -445,45 +445,61 @@ impl Grabber {
         let posts_mutex = Arc::new(Mutex::new(Vec::<PostCollection>::new()));
         let progress_bar_arc = Arc::new(progress_bar);
         
-        // Create a thread pool with limited concurrency to avoid API overload
-        let thread_pool_size = std::cmp::min(4, tags.len()); // Max 4 threads for API safety
-        let chunk_size = (tags.len() + thread_pool_size - 1) / thread_pool_size;
+        // Enhanced thread pool with intelligent sizing and better resource management
+        let cpu_count = std::cmp::min(num_cpus::get(), 8); // Use available CPUs but cap at 8
+        let thread_pool_size = std::cmp::min(std::cmp::max(2, cpu_count / 2), tags.len()); // At least 2, max CPU/2
         
-        // Split tags into chunks for parallel processing
+        // Use smaller chunks for better work distribution
+        let chunk_size = std::cmp::max(1, tags.len() / (thread_pool_size * 2));
         let tag_chunks: Vec<Vec<&Tag>> = tags.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
         
-        info!("Processing {} tags using {} threads in {} chunks", tags.len(), thread_pool_size, tag_chunks.len());
+        info!("Processing {} tags using {} threads in {} chunks (CPU count: {})", 
+              tags.len(), thread_pool_size, tag_chunks.len(), cpu_count);
         
-        // Use scoped threads to avoid lifetime issues
+        // Use channel-based work distribution for better load balancing
+        let (work_tx, work_rx) = mpsc::channel::<Vec<&Tag>>();
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        
+        // Send work chunks to the channel
+        for chunk in tag_chunks {
+            work_tx.send(chunk).unwrap();
+        }
+        drop(work_tx); // Close the channel
+        
+        // Use scoped threads with work-stealing pattern
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             
-            for (chunk_id, tag_chunk) in tag_chunks.into_iter().enumerate() {
+            for thread_id in 0..thread_pool_size {
                 let posts_mutex = Arc::clone(&posts_mutex);
                 let progress_bar = Arc::clone(&progress_bar_arc);
                 let request_sender = self.request_sender.clone();
                 let blacklist = self.blacklist.clone();
                 let safe_mode = self.safe_mode;
+                let work_rx = Arc::clone(&work_rx);
                 
                 let handle = scope.spawn(move || {
-                    // Small delay to stagger thread starts and reduce API burst
-                    thread::sleep(Duration::from_millis(chunk_id as u64 * 100));
+                    // Stagger thread starts to avoid API burst
+                    thread::sleep(Duration::from_millis(thread_id as u64 * 50));
                     
-                    for tag in tag_chunk {
-                        let start_time = Instant::now();
-                        
-                        // Process each tag and create collection
-                        let collection = Self::process_tag_to_collection(tag, groups, &request_sender, &blacklist, safe_mode);
-                        
-                        if let Some(collection) = collection {
-                            // Add to shared collection in thread-safe manner
-                            let mut posts = posts_mutex.lock().unwrap();
-                            posts.push(collection);
+                    // Work-stealing loop
+                    while let Ok(tag_chunk) = work_rx.lock().unwrap().recv() {
+                        for tag in tag_chunk {
+                            let start_time = Instant::now();
+                            
+                            // Process each tag and create collection
+                            let collection = Self::process_tag_to_collection(tag, groups, &request_sender, &blacklist, safe_mode);
+                            
+                            if let Some(collection) = collection {
+                                // Add to shared collection in thread-safe manner
+                                let mut posts = posts_mutex.lock().unwrap();
+                                posts.push(collection);
+                            }
+                            
+                            progress_bar.inc(1);
+                            let duration = start_time.elapsed();
+                            info!("Thread {} finished processing tag {} in {:.2?}", thread_id, tag.name(), duration);
                         }
-                        
-                        progress_bar.inc(1);
-                        let duration = start_time.elapsed();
-                        info!("Finished processing tag {} in {:.2?}", tag.name(), duration);
                     }
                 });
                 

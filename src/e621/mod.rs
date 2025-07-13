@@ -23,9 +23,11 @@ use crate::e621::sender::RequestSender;
 
 pub(crate) mod artist_fetcher;
 pub(crate) mod blacklist;
+pub(crate) mod cache;
 pub(crate) mod grabber;
 pub(crate) mod io;
 pub(crate) mod memory;
+pub(crate) mod performance;
 pub(crate) mod sender;
 pub(crate) mod tag_fetcher;
 pub(crate) mod tui;
@@ -1742,30 +1744,63 @@ impl E621WebConnector {
 
         if total_size_kb <= THRESHOLD_KB {
             // Size is below threshold, no need for confirmation
+            info!("Download size ({}) is below threshold ({}), proceeding automatically", 
+                  self.format_file_size(total_size_kb * 1024), 
+                  self.format_file_size(THRESHOLD_KB * 1024));
             return true;
         }
 
         // Format size for display (convert KB to bytes for formatting)
         let formatted_size = self.format_file_size(total_size_kb * 1024);
         
+        info!("Large download detected: {} files totaling {}", post_count, formatted_size);
 
         // Display warning and options
         println!("\n⚠️  WARNING: Large download detected!");
         println!("You are about to download {} files totaling {}.", post_count, formatted_size);
         println!("This exceeds the recommended size of {}.\n", self.format_file_size(THRESHOLD_KB * 1024));
 
-        // Create selection menu for the user
+        // Create selection menu for the user with robust fallback
         let options = &[
             "Proceed with download",
             "Adjust size limits",
             "Cancel download"
         ];
 
-        let selection = dialoguer::Select::new()
+        info!("Prompting user for large download confirmation...");
+        let selection: Result<usize, _> = match dialoguer::Select::new()
             .with_prompt("What would you like to do?")
             .default(0)
             .items(options)
-            .interact();
+            .interact()
+        {
+            Ok(choice) => {
+                info!("User selected option {}: {}", choice, options[choice]);
+                Ok::<usize, std::io::Error>(choice)
+            },
+            Err(dialoguer_err) => {
+                warn!("dialoguer::Select failed: {}", dialoguer_err);
+                warn!("Falling back to simple confirmation prompt");
+                
+                // Fall back to simple yes/no prompt
+                let proceed = Self::robust_confirm_prompt(
+                    &format!("Proceed with large download of {} ({} files)?", formatted_size, post_count),
+                    false
+                ).unwrap_or_else(|err| {
+                    error!("All input methods failed: {}", err);
+                    error!("Defaulting to cancel download for safety");
+                    false
+                });
+                
+                if proceed {
+                    info!("User confirmed to proceed with download");
+                    Ok(0) // Proceed
+                } else {
+                    info!("User cancelled download");
+                    Ok(2) // Cancel
+                }
+            }
+        };
 
         match selection {
             Ok(0) => {

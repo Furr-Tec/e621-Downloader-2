@@ -27,6 +27,9 @@ use serde_json::{from_value, Value};
 
 use crate::e621::io::{emergency_exit, Login};
 use crate::e621::sender::entries::{AliasEntry, BulkPostEntry, PostEntry, TagEntry};
+use crate::e621::cache::{GLOBAL_CACHE, create_post_search_key};
+use crate::e621::performance::PerformanceTimer;
+use crate::{time_operation_with_error, time_operation};
 
 pub(crate) mod entries;
 
@@ -98,7 +101,12 @@ impl SenderClient {
             .http2_prior_knowledge()
             .tcp_keepalive(Duration::from_secs(30))
             .tcp_nodelay(true)
+            .connection_verbose(true)
+            .pool_idle_timeout(Some(Duration::from_secs(90))) // Keep-alive for persistent connections
+            .tcp_keepalive(Some(Duration::from_secs(60))) // TCP keepalive
             .timeout(Duration::from_secs(60))
+            .gzip(true) // Enable gzip compression
+            .deflate(true) // Enable deflate compression
             .build()
             .unwrap_or_else(|_| Client::new())
     }
@@ -199,7 +207,7 @@ impl RequestSender {
 
 
 impl RequestSender {
-    /// Queries aliases and returns response.
+    /// Queries aliases and returns response with caching.
     ///
     /// # Arguments
     ///
@@ -207,8 +215,15 @@ impl RequestSender {
     ///
     /// returns: Option<Vec<AliasEntry, Global>>
     pub(crate) fn query_aliases(&self, tag: &str) -> Option<Vec<AliasEntry>> {
-        let result = self
-            .check_response(
+        // Check cache first
+        if let Some(cached_result) = GLOBAL_CACHE.get_alias_search(tag) {
+            trace!("Cache hit for alias search '{}'.", tag);
+            return if cached_result.is_empty() { None } else { Some(cached_result) };
+        }
+        
+        // Cache miss - perform API request with performance timing
+        let result = time_operation_with_error!("alias_search", {
+            self.check_response(
                 self.client
                     .get(&self.urls.lock().unwrap()["alias"])
                     .query(&[
@@ -218,14 +233,22 @@ impl RequestSender {
                     ])
                     .send(),
             )
-            .json::<Vec<AliasEntry>>();
+            .json::<Vec<AliasEntry>>()
+        });
 
         match result {
-            Ok(e) => Some(e),
+            Ok(entries) => {
+                // Cache the result (empty or populated)
+                GLOBAL_CACHE.cache_alias_search(tag.to_string(), entries.clone());
+                trace!("Cached alias search result for '{}'", tag);
+                if entries.is_empty() { None } else { Some(entries) }
+            }
             Err(e) => {
                 trace!("No alias was found for {tag}...");
                 trace!("Printing trace message for why None was returned...");
                 trace!("{}", e.to_string());
+                // Cache empty result to avoid repeated failed requests
+                GLOBAL_CACHE.cache_alias_search(tag.to_string(), vec![]);
                 None
             }
         }
@@ -479,40 +502,84 @@ impl RequestSender {
         Ok(json)
     }
 
-    /// Handles a bulk post search with error propagation.
-    /// Returns an empty vector if the API response is empty or invalid, but never panics.
+    /// Handles a bulk post search with error propagation and caching.
+    /// Returns cached results if available, otherwise performs API request.
     pub(crate) fn safe_bulk_post_search(&self, searching_tag: &str, page: u16) -> BulkPostEntry {
-        let start_time = std::time::Instant::now();
-        let result = match self.bulk_search(searching_tag, page) {
+        let cache_key = create_post_search_key(searching_tag, page);
+        
+        // Check cache first
+        if let Some(cached_result) = GLOBAL_CACHE.get_post_search(&cache_key) {
+            trace!("Cache hit for tag '{}' page {}", searching_tag, page);
+            return cached_result;
+        }
+        
+        // Cache miss - perform API request with performance timing
+        let result = time_operation_with_error!("bulk_post_search", {
+            self.bulk_search(searching_tag, page)
+        });
+        
+        match result {
             Ok(entry) => {
-                let duration = start_time.elapsed();
-                trace!("API request for tag '{}' page {} completed in {:.2?}", searching_tag, page, duration);
-                if duration.as_secs() > 2 {
-                    warn!("Slow API request detected: tag '{}' page {} took {:.2?}", searching_tag, page, duration);
-                }
+                // Cache the successful result
+                GLOBAL_CACHE.cache_post_search(cache_key, entry.clone());
+                trace!("Cached result for tag '{}' page {}", searching_tag, page);
                 entry
             }
             Err(e) => {
-                error!("Bulk post search failed after {:.2?}: {}", start_time.elapsed(), e);
+                error!("Bulk post search failed: {}", e);
                 BulkPostEntry::default()
             }
-        };
-        result
+        }
+    }
+    
+    /// Batch post search - processes multiple requests with intelligent rate limiting
+    pub(crate) fn batch_post_search(&self, requests: &[(String, u16)]) -> Vec<(String, u16, BulkPostEntry)> {
+        let mut results = Vec::with_capacity(requests.len());
+        
+        // Process requests in smaller batches to avoid API overload
+        let batch_size = std::cmp::min(4, requests.len());
+        let rate_limit_delay = Duration::from_millis(200);
+        
+        for batch in requests.chunks(batch_size) {
+            let batch_start = std::time::Instant::now();
+            let batch_results: Vec<_> = batch.iter().map(|(tag, page)| {
+                let result = self.safe_bulk_post_search(tag, *page);
+                (tag.clone(), *page, result)
+            }).collect();
+            
+            results.extend(batch_results);
+            
+            // Rate limiting between batches
+            let elapsed = batch_start.elapsed();
+            if elapsed < rate_limit_delay {
+                std::thread::sleep(rate_limit_delay - elapsed);
+            }
+        }
+        
+        results
     }
 
-    /// Gets tags by their name.
+    /// Gets tags by their name with caching.
     ///
     /// # Arguments
     ///
     /// * `tag`: The name of the tag.
     pub(crate) fn get_tags_by_name(&self, tag: &str) -> Vec<TagEntry> {
-        let response = self
-            .check_response(
+        // Check cache first
+        if let Some(cached_result) = GLOBAL_CACHE.get_tag_search(tag) {
+            trace!("Cache hit for tag '{}' search.", tag);
+            return cached_result;
+        }
+
+        // Cache miss - perform API request with performance timing
+        let response = time_operation!("tag_search", {
+            self.check_response(
                 self.client
                     .get(&self.urls.lock().unwrap()["tag_bulk"])
                     .query(&[("search[name]", tag)])
                     .send(),
-            );
+            )
+        });
 
         // Try parsing JSON, log errors and return an empty Vec on fail
         let body = match response.text() {
@@ -526,7 +593,7 @@ impl RequestSender {
         let is_maintenance = body.to_ascii_lowercase().contains("maintenance");
         match result {
             Ok(val) => {
-                if val.is_object() {
+                let entries = if val.is_object() {
                     vec![]
                 } else {
                     match from_value::<Vec<TagEntry>>(val) {
@@ -543,7 +610,11 @@ impl RequestSender {
                             vec![]
                         }
                     }
-                }
+                };
+                // Cache the result
+                GLOBAL_CACHE.cache_tag_search(tag.to_string(), entries.clone());
+                trace!("Cached tag search result for '{}'.", tag);
+                entries
             }
             Err(e) => {
                 if is_maintenance {
