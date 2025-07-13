@@ -19,12 +19,6 @@ pub struct ApiTag {
     pub category: i32, // 0=general, 1=artist, 3=copyright, 4=character, 5=species
 }
 
-/// Response wrapper for the e621 tags API
-#[derive(Debug, Deserialize)]
-struct TagResponse {
-    #[serde(rename = "value")]
-    tags: Vec<ApiTag>,
-}
 
 /// Category mappings for e621 tags
 #[derive(Debug, Clone)]
@@ -118,8 +112,11 @@ impl TagFetcher {
             
             // Make API request
             let response = self.request_sender.get_string(&url)?;
-            let tag_response: TagResponse = serde_json::from_str(&response)?;
-            let tags = tag_response.tags;
+            
+            // Debug: Log first 500 characters of response to see structure
+            info!("API Response (first 500 chars): {}", &response[..response.len().min(500)]);
+            
+            let tags: Vec<ApiTag> = serde_json::from_str(&response)?;
             
             // Filter tags by post count and blacklist
             for tag in tags {
