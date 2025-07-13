@@ -321,55 +321,16 @@ impl PostCollection {
         // Track how many posts were assigned directories
         let mut assigned_count = 0;
         
-        // Step 1: Set up base directory based on category (simplified structure)
-        // All content goes into Tags directory with appropriate subdirectories
-        match self.category.as_str() {
-            "Pools" => {
-                trace!("Setting up tag directory for pool '{}'", self.name);
-                // Use Tags directory instead of separate Pools directory
-                self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
-            }
-            "Sets" => {
-                trace!("Setting up tag directory for set '{}'", self.name);
-                self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
-            }
-            "General Searches" => {
-                trace!("Setting up tag directory for general search '{}'", self.name);
-                self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
-            }
-            _ => {
-                // For single posts or other categories, put them in Tags directory
-                trace!("Processing individual posts for '{}' in Tags directory", self.name);
-                for post in &mut self.posts {
-                    // All posts go into Tags directory, optionally with artist subdirectory
-                    let base_dir = if post.artist().is_some() {
-                        dir_manager.get_tag_directory(&format!("artist_{}", post.artist().unwrap()))
-                    } else {
-                        dir_manager.get_tag_directory("unknown_artist")
-                    }?;
-                    trace!("Assigned tag directory for post '{}'", post.name());
-                    post.set_save_directory(base_dir);
-                    assigned_count += 1;
-                }
-            }
-        }
-
-        // Step 2: For posts in categories with base directories, organize by artist
+        // All content goes into Tags directory using the collection name (tag/artist name) as the main folder
+        trace!("Setting up tag directory for '{}' (category: {})", self.name, self.category);
+        self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
+        
+        // Assign the base directory directly to all posts (no artist subdirectories)
         if let Some(base_dir) = &self.base_directory {
             for post in &mut self.posts {
-                if let Some(artist) = post.artist() {
-                    let artist_subdir = dir_manager.create_artist_subdirectory(base_dir, artist)?;
-                    trace!("Assigned artist subdirectory in '{}/{}' for post '{}'", 
-                          self.category, self.name, post.name());
-                    post.set_save_directory(artist_subdir);
-                    assigned_count += 1;
-                } else {
-                    // Use 'unknown_artist' subdirectory as fallback
-                    let unknown_artist_dir = dir_manager.create_artist_subdirectory(base_dir, "unknown_artist")?;
-                    trace!("Assigned unknown_artist subdirectory for post '{}' with no artist", post.name());
-                    post.set_save_directory(unknown_artist_dir);
-                    assigned_count += 1;
-                }
+                trace!("Assigned directory '{}' for post '{}'", base_dir.display(), post.name());
+                post.set_save_directory(base_dir.clone());
+                assigned_count += 1;
             }
         }
 
@@ -521,7 +482,7 @@ impl Grabber {
         let posts = self.search(search_tag, &TagSearchType::Special);
         let mut collection = PostCollection::new(
             search_tag,
-            "Artists",
+            "General Searches", // Use same category as tags to put them in Tags folder
             GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
         );
         if let Err(e) = collection.initialize_directories() {
