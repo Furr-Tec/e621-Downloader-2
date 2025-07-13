@@ -715,8 +715,8 @@ impl Grabber {
             _ => Duration::from_millis(600),       // Max thread - highest delay
         };
         
-        info!("Searching max {} pages using {} threads with {}ms rate limiting", 
-              max_pages, thread_count, rate_limit_delay.as_millis());
+        info!("Searching max {} pages using {} threads with {}ms rate limiting (adaptive: will continue until {} pages of new content found)", 
+              max_pages, thread_count, rate_limit_delay.as_millis(), max_pages);
         
         let progress_bar = ProgressBar::new_spinner();
         progress_bar.set_style(
@@ -727,13 +727,24 @@ impl Grabber {
         progress_bar.set_message(format!("batches of {} pages", thread_count));
         
         let mut batch_start = 1u16;
-        let mut total_pages = 0;
-        let max_pages_u16 = max_pages as u16;
+        let mut total_pages_searched = 0;
+        let mut pages_with_new_content = 0;
+        let mut total_new_posts = 0;
+        let mut total_duplicate_posts = 0;
+        let _max_pages_u16 = max_pages as u16; // Keep for potential future use
+        let dir_manager = Config::get().directory_manager().unwrap();
         
         loop {
-            // Check if we've already searched the maximum number of pages
-            if batch_start > max_pages_u16 {
-                info!("Reached maximum page limit ({}), stopping search", max_pages);
+            // Check if we've reached the adaptive search limit (allow up to 3x configured pages)
+            let max_search_limit = max_pages * 3;
+            if total_pages_searched >= max_search_limit {
+                info!("Reached adaptive search limit of {} pages ({} configured * 3), stopping search", max_search_limit, max_pages);
+                break;
+            }
+            
+            // Check if we've found enough pages with new content
+            if pages_with_new_content >= max_pages {
+                info!("Found new content in {} pages (target: {}), search complete", pages_with_new_content, max_pages);
                 break;
             }
             
@@ -745,8 +756,8 @@ impl Grabber {
             for thread_id in 0..thread_count {
                 let page_to_search = batch_start + thread_id as u16;
                 
-                // Don't search beyond max pages
-                if page_to_search > max_pages_u16 {
+                // Don't search beyond reasonable limits (prevent infinite searching)
+                if page_to_search > (max_pages * 3) as u16 {
                     break;
                 }
                 
@@ -792,7 +803,7 @@ impl Grabber {
             for _ in 0..threads_spawned {
                 if let Ok((page, searched_posts)) = result_rx.recv() {
                     batch_results.push((page, searched_posts));
-                    total_pages += 1;
+                    total_pages_searched += 1;
                 }
             }
             
@@ -817,8 +828,11 @@ impl Grabber {
             // Sort results by page number to maintain order
             batch_results.sort_by_key(|(page, _)| *page);
             
-            // Process results and check if we should continue
+            // Process results and check for new content
             let mut found_posts_in_batch = false;
+            let mut new_posts_in_batch = 0;
+            let mut duplicate_posts_in_batch = 0;
+            
             for (_page, mut searched_posts) in batch_results {
                 if !searched_posts.is_empty() {
                     found_posts_in_batch = true;
@@ -826,15 +840,78 @@ impl Grabber {
                     // Process the posts
                     *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
                     *invalid_posts += Self::remove_invalid_posts(&mut searched_posts);
-                    searched_posts.reverse();
-                    posts.append(&mut searched_posts);
+                    
+                    // Check for duplicates before adding to results
+                    let _initial_count = searched_posts.len(); // Keep for potential logging
+                    let mut new_posts_from_page = Vec::new();
+                    
+                    for post in searched_posts {
+                        // Check if this post is already downloaded
+                        let filename = format!("{}.{}", post.file.md5, post.file.ext);
+                        let is_duplicate = dir_manager.is_duplicate(&filename, None);
+                        
+                        if !is_duplicate {
+                            new_posts_from_page.push(post);
+                            new_posts_in_batch += 1;
+                        } else {
+                            duplicate_posts_in_batch += 1;
+                        }
+                    }
+                    
+                    // Only add new posts to results
+                    new_posts_from_page.reverse();
+                    posts.append(&mut new_posts_from_page);
                 }
             }
             
-            progress_bar.set_message(format!("processed {} pages in batches of {}", total_pages, thread_count));
+            // Update counters
+            total_new_posts += new_posts_in_batch;
+            total_duplicate_posts += duplicate_posts_in_batch;
             
-            // If no posts found in this entire batch, we're done
-            if !found_posts_in_batch {
+            if new_posts_in_batch > 0 {
+                pages_with_new_content += 1;
+            }
+            
+            progress_bar.set_message(format!("processed {} pages ({} new posts, {} duplicates, {}/{} pages with new content)", 
+                                             total_pages_searched, total_new_posts, total_duplicate_posts, pages_with_new_content, max_pages));
+            
+            // Adaptive search logic: Continue until we find enough pages with new content
+            // or reach a reasonable search limit to prevent infinite searching
+            let max_search_limit = max_pages * 3; // Allow searching up to 3x configured pages to find new content
+            
+            let should_continue = if pages_with_new_content >= max_pages {
+                // We've found the desired amount of new content
+                info!("Found new content in {} pages (target: {}), search complete", pages_with_new_content, max_pages);
+                false
+            } else if total_pages_searched >= max_search_limit {
+                // We've searched too many pages, stop to prevent infinite searching
+                info!("Reached search limit of {} pages ({} configured * 3), stopping adaptive search", max_search_limit, max_pages);
+                false
+            } else if !found_posts_in_batch {
+                // No posts found in this batch - check if we should stop based on search depth
+                let should_stop_early = match max_pages {
+                    1..=10 => {
+                        if total_pages_searched >= max_pages * 2 {
+                            info!("No posts found after searching {} pages ({}*2), stopping", total_pages_searched, max_pages);
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    _ => {
+                        // For larger searches, be more persistent
+                        info!("No posts in this batch, but continuing adaptive search ({}/{} pages with new content, {}/{} pages searched)", 
+                              pages_with_new_content, max_pages, total_pages_searched, max_search_limit);
+                        false
+                    }
+                };
+                !should_stop_early
+            } else {
+                // Found some posts (even if duplicates), continue searching
+                true
+            };
+            
+            if !should_continue {
                 break;
             }
             
@@ -842,8 +919,13 @@ impl Grabber {
             batch_start += thread_count as u16;
         }
         
-        progress_bar.finish_with_message(format!("Found {} posts across {} pages using {} threads in batches", 
-                                                posts.len(), total_pages, thread_count));
+        progress_bar.finish_with_message(format!("Adaptive search: {} new posts found across {} pages ({} pages with new content, {} duplicates skipped)", 
+                                                posts.len(), total_pages_searched, pages_with_new_content, total_duplicate_posts));
+        
+        if total_duplicate_posts > 0 {
+            info!("Adaptive search skipped {} already downloaded posts, found {} new posts from {} pages", 
+                  total_duplicate_posts, posts.len(), total_pages_searched);
+        }
     }
 
     fn general_search(

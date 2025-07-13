@@ -441,13 +441,17 @@ impl TagFetcher {
         
         let mut whitelisted_tags = Vec::new();
         let mut blacklisted_tags = Vec::new();
+        let mut total_saved_tags = 0; // Track total tags saved during session
         
         loop {
             println!("\n--- Tag Search ---");
+            if !whitelisted_tags.is_empty() {
+                println!("Current session: {} tags whitelisted (unsaved)", whitelisted_tags.len());
+            }
             
             // Get search query from user
             let query: String = Input::new()
-                .with_prompt("Enter a tag or keyword to search for (or 'done' to finish)")
+                .with_prompt("Enter a tag or keyword to search for (or 'done' to save & finish)")
                 .interact_text()
                 .unwrap_or_else(|_| "done".to_string());
             
@@ -597,6 +601,36 @@ impl TagFetcher {
                                     println!("'{}' is already whitelisted", selected_tag.name);
                                 }
                             }
+                            
+                            // Ask if user wants to save immediately
+                            let save_now = Input::new()
+                                .with_prompt("Save these tags to tags.txt now? (y/n/later):")
+                                .interact_text()
+                                .unwrap_or_else(|_| "later".to_string());
+                            
+                            match save_now.trim().to_lowercase().as_str() {
+                                "y" | "yes" => {
+                                    match self.save_tags_to_file(&whitelisted_tags) {
+                                        Ok(()) => {
+                                            println!("Saved {} tags to tags.txt", whitelisted_tags.len());
+                                            // Track the saved tags for session summary
+                                            total_saved_tags += whitelisted_tags.len();
+                                            // Clear the whitelisted_tags since they're now saved
+                                            whitelisted_tags.clear();
+                                        },
+                                        Err(e) => {
+                                            warn!("Failed to save tags: {}", e);
+                                            println!("Failed to save tags. They will be saved when you exit.");
+                                        }
+                                    }
+                                },
+                                "n" | "no" => {
+                                    println!("Tags NOT saved. Type 'done' when ready to save and exit.");
+                                },
+                                _ => {
+                                    println!("Tags will be saved when you type 'done' to exit.");
+                                }
+                            }
                         },
                         1 => {
                             // Blacklist all
@@ -716,12 +750,19 @@ impl TagFetcher {
             if confirm_save {
                 self.save_tags_to_file(&whitelisted_tags)?;
                 println!("Saved {} tags to tags.txt", whitelisted_tags.len());
+                total_saved_tags += whitelisted_tags.len();
             }
         }
         
         // Summary
         println!("\nSession Summary:");
-        println!("   Whitelisted: {} tags", whitelisted_tags.len());
+        let total_whitelisted = whitelisted_tags.len() + total_saved_tags;
+        println!("   Whitelisted: {} tags ({})", total_whitelisted, 
+                 if total_saved_tags > 0 {
+                     format!("{} saved to tags.txt", total_saved_tags)
+                 } else {
+                     "not saved".to_string()
+                 });
         println!("   Blacklisted: {} tags", blacklisted_tags.len());
         
         Ok(())
