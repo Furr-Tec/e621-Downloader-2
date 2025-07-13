@@ -38,6 +38,9 @@ struct HashDatabaseEntry {
 struct HashDatabase {
     /// List of file entries
     entries: Vec<HashDatabaseEntry>,
+    /// Date when the database was last repaired
+    #[serde(default)]
+    last_repair_date: Option<String>,
 }
 
 impl HashDatabase {
@@ -45,7 +48,10 @@ impl HashDatabase {
     fn load(file_path: &Path) -> Result<Self> {
         if !file_path.exists() {
             // Create an empty database if the file doesn't exist
-            return Ok(HashDatabase { entries: Vec::new() });
+            return Ok(HashDatabase { 
+                entries: Vec::new(),
+                last_repair_date: None,
+            });
         }
         
         let content = fs::read_to_string(file_path)
@@ -91,7 +97,10 @@ impl HashDatabase {
             })
             .collect();
             
-        HashDatabase { entries }
+        HashDatabase { 
+            entries,
+            last_repair_date: None,
+        }
     }
     
     /// Add or update an entry with full metadata
@@ -114,6 +123,163 @@ impl HashDatabase {
             };
             self.entries.push(new_entry);
         }
+    }
+    
+    /// Repair missing post_id and short_url fields by extracting from filename
+    fn repair_missing_fields(&mut self) {
+        let mut repaired_count = 0;
+        let mut entries_needing_repair = 0;
+        let mut entries_without_extractable_id = 0;
+        
+        // First pass: count entries that need repair
+        for entry in &self.entries {
+            if entry.post_id.is_none() || entry.short_url.is_none() {
+                entries_needing_repair += 1;
+            }
+        }
+        
+        if entries_needing_repair > 0 {
+            info!("Found {} database entries needing repair", entries_needing_repair);
+        }
+        
+        // Second pass: perform repairs
+        for entry in &mut self.entries {
+            let mut needs_repair = false;
+            
+            // Check if entry is missing post_id or short_url
+            if entry.post_id.is_none() || entry.short_url.is_none() {
+                needs_repair = true;
+            }
+            
+            if needs_repair {
+                // Try to extract post ID from filename
+                if let Some(post_id) = Self::extract_post_id_from_filename(&entry.filename) {
+                    entry.post_id = Some(post_id);
+                    entry.short_url = Some(format!("e621.net/posts/{}", post_id));
+                    
+                    // Set download_date to current time if missing
+                    if entry.download_date.is_none() {
+                        entry.download_date = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    
+                    repaired_count += 1;
+                    trace!("Repaired entry for file '{}' with post_id {}", entry.filename, post_id);
+                } else {
+                    entries_without_extractable_id += 1;
+                    trace!("Could not extract post_id from filename: '{}'", entry.filename);
+                }
+            }
+        }
+        
+        // Detailed logging of repair results
+        if repaired_count > 0 {
+            info!("Successfully repaired {} of {} database entries with missing fields", repaired_count, entries_needing_repair);
+        }
+        
+        if entries_without_extractable_id > 0 {
+            warn!("{} entries could not be repaired (post_id not extractable from filename)", entries_without_extractable_id);
+        }
+        
+        if entries_needing_repair == 0 {
+            info!("No database entries needed repair - all entries already have complete metadata");
+        }
+        
+        // Update last repair date regardless of whether repairs were needed
+        self.last_repair_date = Some(chrono::Utc::now().to_rfc3339());
+    }
+    
+    /// Check if a periodic repair is needed (every 7 days)
+    fn needs_periodic_repair(&self) -> bool {
+        match &self.last_repair_date {
+            None => {
+                // Never repaired before
+                info!("Database has never been repaired - periodic repair needed");
+                true
+            },
+            Some(last_repair_str) => {
+                match chrono::DateTime::parse_from_rfc3339(last_repair_str) {
+                    Ok(last_repair) => {
+                        let now = chrono::Utc::now();
+                        let days_since_repair = (now - last_repair.with_timezone(&chrono::Utc)).num_days();
+                        
+                        if days_since_repair >= 7 {
+                            info!("Database last repaired {} days ago - periodic repair needed", days_since_repair);
+                            true
+                        } else {
+                            trace!("Database was repaired {} days ago - no periodic repair needed", days_since_repair);
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to parse last repair date '{}': {} - assuming repair needed", last_repair_str, e);
+                        true
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Get a human-readable string for when the database was last repaired
+    fn last_repair_info(&self) -> String {
+        match &self.last_repair_date {
+            None => "Never repaired".to_string(),
+            Some(last_repair_str) => {
+                match chrono::DateTime::parse_from_rfc3339(last_repair_str) {
+                    Ok(last_repair) => {
+                        let now = chrono::Utc::now();
+                        let days_ago = (now - last_repair.with_timezone(&chrono::Utc)).num_days();
+                        if days_ago == 0 {
+                            "Repaired today".to_string()
+                        } else if days_ago == 1 {
+                            "Repaired 1 day ago".to_string()
+                        } else {
+                            format!("Repaired {} days ago", days_ago)
+                        }
+                    },
+                    Err(_) => "Unknown repair date".to_string()
+                }
+            }
+        }
+    }
+    
+    /// Extract post ID from filename using various naming conventions
+    fn extract_post_id_from_filename(filename: &str) -> Option<i64> {
+        // Remove path separator and get just the filename
+        let filename = filename.split(['/', '\\']).last().unwrap_or(filename);
+        
+        // Try different naming conventions:
+        
+        // 1. Enhanced naming: "artist_123456.jpg" or "artist1+artist2_123456.jpg"
+        if let Some(underscore_pos) = filename.rfind('_') {
+            let after_underscore = &filename[underscore_pos + 1..];
+            if let Some(dot_pos) = after_underscore.find('.') {
+                let id_part = &after_underscore[..dot_pos];
+                if let Ok(post_id) = id_part.parse::<i64>() {
+                    return Some(post_id);
+                }
+            }
+        }
+        
+        // 2. ID-only naming: "123456.jpg"
+        if let Some(dot_pos) = filename.find('.') {
+            let id_part = &filename[..dot_pos];
+            if let Ok(post_id) = id_part.parse::<i64>() {
+                return Some(post_id);
+            }
+        }
+        
+        // 3. Pool naming: "Pool_Name Page_00123.jpg" - extract from "Page_" prefix
+        if let Some(page_pos) = filename.find("Page_") {
+            let after_page = &filename[page_pos + 5..];
+            if let Some(dot_pos) = after_page.find('.') {
+                let page_part = &after_page[..dot_pos];
+                // This is a page number, not a post ID - we can't recover post ID from this
+                return None;
+            }
+        }
+        
+        // 4. MD5 naming: "abcdef123456.jpg" - can't recover post ID from MD5
+        None
     }
 }
 
@@ -189,7 +355,10 @@ impl DirectoryManager {
         } else {
             // Hash database is missing, create and persist it immediately for integrity.
             info!("hash_database.json does not exist; creating new hash database.");
-            let db = HashDatabase { entries: vec![] };
+            let db = HashDatabase { 
+                entries: vec![],
+                last_repair_date: None,
+            };
             if let Err(e) = db.save(&hash_db_path) {
                 error!("Failed to create empty hash database: {}", e);
             }
@@ -627,6 +796,9 @@ impl DirectoryManager {
         }
 
         info!("Found {} existing files in downloads directory", manager.downloaded_files.len());
+
+        // Check and perform periodic repair if needed
+        manager.check_and_perform_periodic_repair()?;
 
         Ok(manager)
     }
@@ -1147,13 +1319,84 @@ impl DirectoryManager {
         // Load current database, update it, and save
         let mut hash_db = match HashDatabase::load(&self.hash_db_path) {
             Ok(db) => db,
-            Err(_) => HashDatabase { entries: Vec::new() }
+            Err(_) => HashDatabase { 
+                entries: Vec::new(),
+                last_repair_date: None,
+            }
         };
         
         hash_db.add_or_update_entry(file_name, hash, short_url, post_id);
         
         if let Err(e) = hash_db.save(&self.hash_db_path) {
             warn!("Failed to update hash database with metadata: {}", e);
+        }
+    }
+    
+    /// Repair missing post_id, short_url, and download_date fields in the database
+    pub(crate) fn repair_missing_database_fields(&mut self) -> Result<()> {
+        info!("Starting database repair for missing fields...");
+        
+        // Load current database
+        let mut hash_db = match HashDatabase::load(&self.hash_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                warn!("Failed to load hash database for repair: {}", e);
+                return Err(e);
+            }
+        };
+        
+        // Repair missing fields
+        hash_db.repair_missing_fields();
+        
+        // Save the repaired database
+        if let Err(e) = hash_db.save(&self.hash_db_path) {
+            warn!("Failed to save repaired hash database: {}", e);
+            return Err(e);
+        }
+        
+        // Update cached database
+        self.cached_database = Some(hash_db);
+        
+        info!("Database repair completed successfully");
+        Ok(())
+    }
+    
+    /// Check if a periodic repair is needed and perform it if necessary
+    pub(crate) fn check_and_perform_periodic_repair(&mut self) -> Result<bool> {
+        info!("Checking if periodic database repair is needed...");
+        
+        // Load current database to check repair status
+        let hash_db = match HashDatabase::load(&self.hash_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                warn!("Failed to load hash database for periodic check: {}", e);
+                return Err(e);
+            }
+        };
+        
+        // Check if repair is needed
+        if hash_db.needs_periodic_repair() {
+            info!("Periodic repair needed. Last repair: {}", hash_db.last_repair_info());
+            
+            // Perform the repair
+            self.repair_missing_database_fields()?;
+            info!("Periodic database repair completed successfully");
+            Ok(true) // Repair was performed
+        } else {
+            info!("No periodic repair needed. {}", hash_db.last_repair_info());
+            Ok(false) // No repair was needed
+        }
+    }
+    
+    /// Get information about the last database repair
+    pub(crate) fn get_repair_status(&self) -> String {
+        match HashDatabase::load(&self.hash_db_path) {
+            Ok(db) => {
+                format!("Database repair status: {} ({} entries)", 
+                    db.last_repair_info(), 
+                    db.entries.len())
+            },
+            Err(_) => "Database repair status: Unknown (database not accessible)".to_string()
         }
     }
     /// Checks if a file exists by name or hash

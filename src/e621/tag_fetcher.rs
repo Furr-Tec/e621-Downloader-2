@@ -153,15 +153,13 @@ impl TagFetcher {
         
         // Group tags by category
         let mut artists = Vec::new();
-        let mut species = Vec::new();
-        let mut characters = Vec::new();
         let mut general = Vec::new();
         
         for tag in tags {
             match TagCategory::from_i32(tag.category) {
                 Some(TagCategory::Artist) => artists.push(tag),
-                Some(TagCategory::Species) => species.push(tag),
-                Some(TagCategory::Character) => characters.push(tag),
+                Some(TagCategory::Species) => general.push(tag),
+                Some(TagCategory::Character) => general.push(tag),
                 Some(TagCategory::General) => general.push(tag),
                 Some(TagCategory::Copyright) => general.push(tag), // Treat copyright as general
                 None => general.push(tag), // Unknown categories go to general
@@ -177,61 +175,30 @@ impl TagFetcher {
         tag_lines.push("[artists]".to_string());
         if !artists.is_empty() {
             for tag in artists {
-                tag_lines.push(format!("{} # ({} posts)", tag.name, tag.post_count));
+                tag_lines.push(tag.name.clone());
             }
-        } else {
-            tag_lines.push("# No popular artists found".to_string());
         }
         tag_lines.push("".to_string());
         
         // Add pools section (empty but required format)
         tag_lines.push("[pools]".to_string());
-        tag_lines.push("# No pool IDs needed".to_string());
         tag_lines.push("".to_string());
         
         // Add sets section (empty but required format)
         tag_lines.push("[sets]".to_string());
-        tag_lines.push("# No set IDs needed".to_string());
         tag_lines.push("".to_string());
         
         // Add single-post section (empty but required format)
         tag_lines.push("[single-post]".to_string());
-        tag_lines.push("# No individual post IDs needed".to_string());
         tag_lines.push("".to_string());
         
         // Add general tags section
         tag_lines.push("[general]".to_string());
         if !general.is_empty() {
             for tag in &general {
-                tag_lines.push(format!("{} # ({} posts)", tag.name, tag.post_count));
+                tag_lines.push(tag.name.clone());
             }
         }
-        
-        // Add species as general tags if any
-        if !species.is_empty() {
-            if !general.is_empty() {
-                tag_lines.push("# Popular species:".to_string());
-            }
-            for tag in &species {
-                tag_lines.push(format!("{} # ({} posts)", tag.name, tag.post_count));
-            }
-        }
-        
-        // Add characters as general tags if any
-        if !characters.is_empty() {
-            if !general.is_empty() || !species.is_empty() {
-                tag_lines.push("# Popular characters:".to_string());
-            }
-            for tag in &characters {
-                tag_lines.push(format!("{} # ({} posts)", tag.name, tag.post_count));
-            }
-        }
-        
-        if general.is_empty() && species.is_empty() && characters.is_empty() {
-            tag_lines.push("# No popular general tags found".to_string());
-        }
-        
-        tag_lines.push("".to_string());
         
         // Write to file
         let content = tag_lines.join("\n");
@@ -350,7 +317,7 @@ impl TagFetcher {
                 // Insert new artist tags
                 let artist_count = new_artists.len();
                 for tag in new_artists {
-                    lines.insert(insert_pos, format!("{} # ({} posts)", tag.name, tag.post_count));
+                    lines.insert(insert_pos, tag.name.clone());
                     insert_pos += 1;
                 }
                 
@@ -389,7 +356,7 @@ impl TagFetcher {
                 // Insert new general tags
                 let general_count = new_general.len();
                 for tag in new_general {
-                    lines.insert(insert_pos, format!("{} # ({} posts)", tag.name, tag.post_count));
+                    lines.insert(insert_pos, tag.name.clone());
                     insert_pos += 1;
                 }
                 

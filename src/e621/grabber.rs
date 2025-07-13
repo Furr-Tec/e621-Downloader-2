@@ -439,7 +439,7 @@ impl Grabber {
 
         for tag in tags.iter() {
             let start_time = Instant::now();
-            self.grab_by_tag_type(tag);
+            self.grab_by_tag_type_with_context(tag, groups);
             progress_bar.inc(1);
             let duration = start_time.elapsed();
             info!("Finished processing tag {} in {:.2?}", tag.name(), duration);
@@ -484,12 +484,57 @@ impl Grabber {
         );
     }
 
+    /// Process a tag with context awareness to handle same tag names in different sections
+    fn grab_by_tag_type_with_context(&mut self, tag: &Tag, groups: &[Group]) {
+        // Check if this tag name appears in multiple sections
+        let tag_name = tag.name();
+        let current_tag_type = tag.tag_type();
+        
+        // Count how many times this tag name appears across all groups
+        let tag_occurrences: Vec<_> = groups.iter()
+            .flat_map(|group| group.tags())
+            .filter(|t| t.name() == tag_name)
+            .collect();
+            
+        if tag_occurrences.len() > 1 {
+            // Same tag name appears in multiple sections
+            info!("Tag '{}' appears in {} different sections - processing each context separately", tag_name, tag_occurrences.len());
+            
+            // Create a unique collection name based on tag type and section
+            let collection_suffix = match current_tag_type {
+                TagType::Artist => "_artist_search",
+                TagType::General => "_general_search",
+                TagType::Pool => "_pool",
+                TagType::Set => "_set", 
+                TagType::Post => "_post",
+                TagType::Unknown => "_unknown",
+            };
+            
+            // Process with modified name to avoid conflicts
+            self.grab_by_tag_type_with_suffix(tag, collection_suffix);
+        } else {
+            // Normal processing for unique tag names
+            self.grab_by_tag_type(tag);
+        }
+    }
+    
     fn grab_by_tag_type(&mut self, tag: &Tag) {
         match tag.tag_type() {
             TagType::Pool => self.grab_pool(tag),
             TagType::Set => self.grab_set(tag),
             TagType::Post => self.grab_post(tag),
             TagType::General | TagType::Artist => self.grab_general(tag),
+            TagType::Unknown => unreachable!(),
+        };
+    }
+    
+    /// Process a tag with a suffix to create unique collection names
+    fn grab_by_tag_type_with_suffix(&mut self, tag: &Tag, suffix: &str) {
+        match tag.tag_type() {
+            TagType::Pool => self.grab_pool_with_suffix(tag, suffix),
+            TagType::Set => self.grab_set_with_suffix(tag, suffix),
+            TagType::Post => self.grab_post_with_suffix(tag, suffix),
+            TagType::General | TagType::Artist => self.grab_general_with_suffix(tag, suffix),
             TagType::Unknown => unreachable!(),
         };
     }
@@ -509,6 +554,25 @@ impl Grabber {
         info!(
             "{} grabbed!",
             console::style(format!("\"{}\"", tag.name())).color256(39).italic()
+        );
+    }
+    
+    fn grab_general_with_suffix(&mut self, tag: &Tag, suffix: &str) {
+        let posts = self.get_posts_from_tag(tag);
+        let collection_name = format!("{}{}", tag.name(), suffix);
+        let mut collection = PostCollection::new(
+            &collection_name,
+            "General Searches",
+            GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
+        );
+        if let Err(e) = collection.initialize_directories() {
+            error!("Failed to initialize directories for general search with suffix: {}", e);
+            emergency_exit("Directory initialization failed");
+        }
+        self.posts.push(collection);
+        info!(
+            "{} grabbed!",
+            console::style(format!("\"{}\"", collection_name)).color256(39).italic()
         );
     }
 
@@ -532,6 +596,11 @@ impl Grabber {
             self.add_single_post(entry, id);
         }
     }
+    
+    fn grab_post_with_suffix(&mut self, tag: &Tag, _suffix: &str) {
+        // For single posts, suffix doesn't change behavior since they go to the "Single Posts" collection
+        self.grab_post(tag);
+    }
 
     fn grab_set(&mut self, tag: &Tag) {
         let entry: SetEntry = self.request_sender.get_entry_from_appended_id(tag.name(), "set");
@@ -546,6 +615,27 @@ impl Grabber {
         info!(
             "{} grabbed!",
             console::style(format!("\"{}\"", entry.name)).color256(39).italic()
+        );
+    }
+    
+    fn grab_set_with_suffix(&mut self, tag: &Tag, suffix: &str) {
+        let entry: SetEntry = self.request_sender.get_entry_from_appended_id(tag.name(), "set");
+        let posts = self.search(&format!("set:{}", entry.shortname), &TagSearchType::Special);
+        let collection_name = format!("{}{}", entry.name, suffix);
+        let mut collection = PostCollection::new(
+            &collection_name,
+            "Sets",
+            GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
+        );
+        if let Err(e) = collection.initialize_directories() {
+            error!("Failed to initialize directories for set with suffix: {}", e);
+            emergency_exit("Directory initialization failed");
+        }
+        self.posts.push(collection);
+
+        info!(
+            "{} grabbed!",
+            console::style(format!("\"{}\"", collection_name)).color256(39).italic()
         );
     }
 
@@ -571,6 +661,31 @@ impl Grabber {
         info!(
             "{} grabbed!",
             console::style(format!("\"{name}\"")).color256(39).italic()
+        );
+    }
+    
+    fn grab_pool_with_suffix(&mut self, tag: &Tag, suffix: &str) {
+        let mut entry: PoolEntry = self.request_sender.get_entry_from_appended_id(tag.name(), "pool");
+        let collection_name = format!("{}{}", entry.name, suffix);
+        let mut posts = self.search(&format!("pool:{}", entry.id), &TagSearchType::Special);
+
+        entry.post_ids.retain(|id| posts.iter().any(|post| post.id == *id));
+        Self::sort_pool_by_id(&entry, &mut posts);
+
+        let mut collection = PostCollection::new(
+            &collection_name,
+            "Pools",
+            GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
+        );
+        if let Err(e) = collection.initialize_directories() {
+            error!("Failed to initialize directories for pool with suffix: {}", e);
+            emergency_exit("Directory initialization failed");
+        }
+        self.posts.push(collection);
+
+        info!(
+            "{} grabbed!",
+            console::style(format!("\"{}\"", collection_name)).color256(39).italic()
         );
     }
 

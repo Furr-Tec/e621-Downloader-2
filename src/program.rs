@@ -114,6 +114,7 @@ impl Program {
         connector.configure_max_pages_to_search();
         connector.configure_download_mode();
         connector.configure_batch_size();
+        connector.configure_database_management();
 
         // Parses tag file.
         trace!("Parsing tag file...");

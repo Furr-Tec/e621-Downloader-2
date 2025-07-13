@@ -377,7 +377,22 @@ impl TagParser {
                 break;
             }
 
+            // Check if we have any actual content to parse
+            // If the next line is empty or starts with a comment, skip it
+            let next_char = self.parser.next_char();
+            if next_char == '\n' || next_char == '\r' {
+                self.parser.consume_char(); // consume the newline
+                continue;
+            }
+
             let mut tag = self.parse_tag(group.name());
+            
+            // Skip default/empty tags that couldn't be parsed properly
+            if tag == Tag::default() || tag.name().is_empty() {
+                trace!("Skipping invalid or empty tag entry");
+                continue;
+            }
+            
             if let Err(e) = tag.initialize_directory() {
                 error!("Failed to initialize directory for tag {}: {}", tag.name(), e);
                 emergency_exit("Directory initialization failed");
@@ -403,22 +418,38 @@ impl TagParser {
             }
             e => {
                 let temp_char = self.parser.next_char();
-                if !char::is_ascii_digit(&temp_char) && temp_char != '#' {
-                    panic!("Invalid tag type! Pools, sets, and single-post tags must be a number!");
-                }
-
-                let tag = self.parser.consume_while(valid_id);
-                let tag_type = match e {
-                    "pools" => TagType::Pool,
-                    "sets" => TagType::Set,
-                    "single-post" => TagType::Post,
-                    _ => {
-                        self.parser.report_error("Unknown tag type!");
-                        TagType::Unknown
+                
+                // Check if this is a valid numeric ID or comment
+                if char::is_ascii_digit(&temp_char) || temp_char == '#' {
+                    // Valid numeric ID, parse normally
+                    let tag = self.parser.consume_while(valid_id);
+                    let tag_type = match e {
+                        "pools" => TagType::Pool,
+                        "sets" => TagType::Set,
+                        "single-post" => TagType::Post,
+                        _ => {
+                            self.parser.report_error("Unknown tag type!");
+                            TagType::Unknown
+                        }
+                    };
+                    Tag::new(tag.trim(), TagSearchType::Special, tag_type)
+                } else {
+                    // Invalid entry - this should be a tag name, not an ID
+                    let tag = self.parser.consume_while(valid_tag);
+                    let tag_name = tag.trim();
+                    
+                    // Log a warning about the misplaced tag
+                    warn!("Found non-numeric entry '{}' in [{}] section. This should be moved to [artists] or [general] section.", tag_name, e);
+                    warn!("Entries in [pools], [sets], and [single-post] sections must be numeric IDs.");
+                    
+                    // Try to identify this as a regular tag since it's not a numeric ID
+                    if !tag_name.is_empty() {
+                        TagIdentifier::id_tag(tag_name, self.request_sender.clone())
+                    } else {
+                        // Return a default tag if we can't parse anything useful
+                        Tag::default()
                     }
-                };
-
-                Tag::new(tag.trim(), TagSearchType::Special, tag_type)
+                }
             }
         }
     }

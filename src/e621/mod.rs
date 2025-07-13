@@ -13,6 +13,7 @@ use crate::e621::blacklist::Blacklist;
 use crate::e621::grabber::{Grabber, Shorten};
 use crate::e621::io::tag::Group;
 use crate::e621::io::{Config, Login};
+use crate::e621::io::directory::DirectoryManager;
 use crate::e621::memory::{MemoryManager, estimate_collection_memory_usage};
 use crate::e621::tag_fetcher::TagFetcher;
 use crate::e621::artist_fetcher::ArtistFetcher;
@@ -902,6 +903,100 @@ impl E621WebConnector {
                 // Fallback to standard
                 self.max_download_concurrency = 5;
                 info!("Fallback to standard concurrency: {} simultaneous downloads", self.max_download_concurrency);
+            }
+        }
+    }
+    
+    /// Asks the user about database management options
+    pub(crate) fn configure_database_management(&self) {
+        println!("\nDatabase Management Options");
+        
+        let db_options = vec![
+            "Check repair status (View when database was last repaired)",
+            "Repair database now (Fix missing post_id/short_url fields)",
+            "Skip database management"
+        ];
+        
+        println!("How would you like to manage your database?");
+        for (i, option) in db_options.iter().enumerate() {
+            println!("{}. {}", i + 1, option);
+        }
+        
+        let selection = loop {
+            let input: String = dialoguer::Input::new()
+                .with_prompt(&format!("Select option (1-{}):", db_options.len()))
+                .interact_text()
+                .unwrap_or_else(|_| "3".to_string());
+            
+            if let Ok(num) = input.trim().parse::<usize>() {
+                if num > 0 && num <= db_options.len() {
+                    break num - 1;
+                }
+            }
+            println!("Invalid selection. Please enter a number between 1 and {}", db_options.len());
+        };
+        
+        match selection {
+            0 => {
+                // Check repair status
+                println!("\nChecking database repair status...");
+                
+                // Get status from DirectoryManager
+                match DirectoryManager::new(".") {
+                    Ok(manager) => {
+                        let status = manager.get_repair_status();
+                        println!("{}", status);
+                        info!("Database repair status: {}", status);
+                    },
+                    Err(e) => {
+                        warn!("Failed to access database for status check: {}", e);
+                        println!("✗ Could not check repair status: {}", e);
+                    }
+                }
+                
+                info!("User requested database repair status check");
+            },
+            1 => {
+                // Repair database now
+                println!("\nPerforming on-demand database repair...");
+                
+                let confirm_repair = Self::robust_confirm_prompt(
+                    "This will scan and repair missing post_id and short_url fields. Continue?",
+                    true
+                ).unwrap_or(true);
+                
+                if confirm_repair {
+                    println!("Starting database repair...");
+                    println!("Extracting missing post_id and short_url fields from filenames.");
+                    info!("User requested on-demand database repair");
+
+                    // Trigger the repair directly via DirectoryManager
+                    match DirectoryManager::new(".") {
+                        Ok(mut manager) => {
+                            match manager.repair_missing_database_fields() {
+                                Ok(_) => {
+                                    let status = manager.get_repair_status();
+                                    println!("✓ Repair complete! {}", status);
+                                    info!("On-demand database repair completed successfully");
+                                },
+                                Err(e) => {
+                                    warn!("Failed during on-demand repair: {}", e);
+                                    println!("✗ Repair failed: {}", e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to initialize DirectoryManager for repair: {}", e);
+                            println!("✗ Could not access database for repair: {}", e);
+                        }
+                    }
+                } else {
+                    info!("User cancelled database repair");
+                }
+            },
+            _ => {
+                // Skip
+                info!("Skipping database management.");
             }
         }
     }
