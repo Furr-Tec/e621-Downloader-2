@@ -57,7 +57,9 @@ fn default_simplified_folders() -> bool { true }
 fn default_max_pages_to_search() -> usize { 10 }
 fn default_whitelist_override() -> bool { true }
 
-static CONFIG: OnceCell<Config> = OnceCell::new();
+use std::sync::RwLock;
+
+static CONFIG: OnceCell<RwLock<Config>> = OnceCell::new();
 
 impl Config {
     /// The location of the download directory.
@@ -126,8 +128,9 @@ impl Config {
     }
 
     /// Get the global instance of the `Config`.
-    pub(crate) fn get() -> &'static Self {
-        CONFIG.get_or_init(|| Self::get_config().unwrap())
+    pub(crate) fn get() -> Config {
+        let config_lock = CONFIG.get_or_init(|| RwLock::new(Self::get_config().unwrap()));
+        config_lock.read().unwrap().clone()
     }
 
     /// Updates the maximum pages to search and saves to config file
@@ -138,9 +141,20 @@ impl Config {
         // Update the field
         config.max_pages_to_search = new_max_pages;
         
+        // Initialize directory manager if needed
+        if config.directory_manager.is_none() {
+            config.directory_manager = Some(DirectoryManager::new(&config.download_directory)?);
+        }
+        
         // Save back to file
         let json = to_string_pretty(&config)?;
         write(Path::new(CONFIG_NAME), json)?;
+        
+        // Update the cached CONFIG in memory
+        let config_lock = CONFIG.get_or_init(|| RwLock::new(Self::get_config().unwrap()));
+        if let Ok(mut cached_config) = config_lock.write() {
+            *cached_config = config;
+        }
         
         info!("Max pages to search updated to: {}", new_max_pages);
         Ok(())

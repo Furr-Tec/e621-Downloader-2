@@ -109,7 +109,6 @@ impl Program {
 
         let request_sender = RequestSender::new();
         let mut connector = E621WebConnector::new(&request_sender);
-        connector.should_enter_safe_mode();
         connector.configure_size_limits();
         connector.configure_max_pages_to_search();
         connector.configure_download_mode();

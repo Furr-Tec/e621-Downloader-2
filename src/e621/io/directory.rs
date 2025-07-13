@@ -33,6 +33,72 @@ struct HashDatabaseEntry {
     download_date: Option<String>,
 }
 
+/// Represents a file entry in the blacklist
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlacklistEntry {
+    /// Filename of the deleted file
+    filename: String,
+    /// The date the file was deleted
+    #[serde(default)]
+    deleted_date: Option<String>,
+}
+
+/// Stores and manages blacklist entries in a persistent JSON file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileBlacklist {
+    /// List of blacklisted file entries
+    entries: Vec<BlacklistEntry>,
+}
+
+impl FileBlacklist {
+    /// Load the blacklist from the specified file path
+    fn load(file_path: &Path) -> Result<Self> {
+        if !file_path.exists() {
+            // Create an empty blacklist if the file doesn't exist
+            return Ok(FileBlacklist { 
+                entries: Vec::new(),
+            });
+        }
+        
+        let content = fs::read_to_string(file_path)
+            .with_context(|| format!("Failed to read blacklist file: {}", file_path.display()))?;
+            
+        let blacklist: FileBlacklist = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse blacklist file: {}", file_path.display()))?;
+            
+        Ok(blacklist)
+    }
+    
+    /// Save the blacklist to the specified file path
+    fn save(&self, file_path: &Path) -> Result<()> {
+        let content = serde_json::to_string_pretty(self)
+            .with_context(|| "Failed to serialize blacklist")?;
+            
+        let parent_dir = file_path.parent().unwrap_or_else(|| Path::new(""));
+        fs::create_dir_all(parent_dir)
+            .with_context(|| format!("Failed to create directory for blacklist: {}", parent_dir.display()))?;
+            
+        fs::write(file_path, content)
+            .with_context(|| format!("Failed to write blacklist file: {}", file_path.display()))?;
+            
+        Ok(())
+    }
+
+    /// Add a filename to the blacklist
+    fn add_entry(&mut self, filename: String) {
+        let entry = BlacklistEntry {
+            filename,
+            deleted_date: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        self.entries.push(entry);
+    }
+
+    /// Check if a file is blacklisted
+    fn is_blacklisted(&self, filename: &str) -> bool {
+        self.entries.iter().any(|e| e.filename == filename)
+    }
+}
+
 /// Stores and manages file hashes in a persistent JSON file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HashDatabase {
@@ -301,10 +367,14 @@ pub(crate) struct DirectoryManager {
     use_strict_verification: bool,
     /// Path to the hash database file
     hash_db_path: PathBuf,
+    /// Path to the file blacklist
+    blacklist_path: PathBuf,
     /// Whether to use simplified folder structure (only Tags)
     simplified_folders: bool,
     /// Cached hash database for efficient post ID lookups
     cached_database: Option<HashDatabase>,
+    /// Cached file blacklist for efficient lookups
+    cached_blacklist: Option<FileBlacklist>,
 }
 
 impl DirectoryManager {
@@ -315,6 +385,7 @@ impl DirectoryManager {
         let tags = root.join("Tags");
         let pools = root.join("Pools");
         let hash_db_path = root.join("hash_database.json");
+        let blacklist_path = root.join("fileblacklist.json");
         
         // Use simplified folders by default (only Tags folder)
         let simplified_folders = true;
@@ -328,8 +399,10 @@ impl DirectoryManager {
             downloaded_files: HashSet::new(),
             use_strict_verification: true, // Enable strict verification by default
             hash_db_path: hash_db_path.clone(),
+            blacklist_path: blacklist_path.clone(),
             simplified_folders,
             cached_database: None,
+            cached_blacklist: None,
         };
         
         // Create directory structure first
@@ -543,10 +616,36 @@ impl DirectoryManager {
                 .cloned()
                 .collect();
                 
+            // Load the blacklist and check for files to add
+            let mut blacklist = match FileBlacklist::load(&blacklist_path) {
+                Ok(bl) => bl,
+                Err(e) => {
+                    warn!("Failed to load blacklist: {}", e);
+                    FileBlacklist { entries: Vec::new() }
+                }
+            };
+            
             for r in &to_remove {
-                info!("Removing deleted file '{}' from hash DB", r.0);
+                info!("Removing deleted file '{}' from hash DB and adding to blacklist", r.0);
                 manager.downloaded_files.remove(r);
+                
+                // Add to blacklist if not already present
+                if !blacklist.is_blacklisted(&r.0) {
+                    blacklist.add_entry(r.0.clone());
+                }
             }
+            
+            // Save updated blacklist if files were added
+            if !to_remove.is_empty() {
+                if let Err(e) = blacklist.save(&blacklist_path) {
+                    warn!("Failed to save updated blacklist: {}", e);
+                } else {
+                    info!("Updated blacklist with {} deleted files", to_remove.len());
+                }
+            }
+            
+            // Cache the blacklist for future use
+            manager.cached_blacklist = Some(blacklist);
             // Hash any files that are present but missing hash value
             let mut missing_hash: Vec<_> = vec![];
             for (f, h) in manager.downloaded_files.iter() {

@@ -92,7 +92,8 @@ impl Tag {
 
     /// Initialize directory for this tag based on its type
     pub(crate) fn initialize_directory(&mut self) -> Result<(), Error> {
-        let dir_manager = Config::get().directory_manager()?;
+        let binding = Config::get();
+        let dir_manager = binding.directory_manager()?;
         
         self.directory = Some(match self.tag_type {
             TagType::Artist => dir_manager.get_artist_directory(&self.name)?,

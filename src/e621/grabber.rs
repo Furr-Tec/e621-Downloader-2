@@ -144,7 +144,8 @@ impl GrabbedPost {
 
 impl NewVec<Vec<PostEntry>> for GrabbedPost {
     fn new_vec(vec: Vec<PostEntry>) -> Vec<Self> {
-        let dir_manager = Config::get().directory_manager().unwrap();
+        let binding = Config::get();
+        let dir_manager = binding.directory_manager().unwrap();
         vec.into_iter()
             .map(|e| {
                 let mut post = GrabbedPost::from((e.clone(), Config::get().naming_convention()));
@@ -163,7 +164,8 @@ impl NewVec<Vec<PostEntry>> for GrabbedPost {
 impl GrabbedPost {
     /// Enhanced new_vec that includes artist ID information in filenames
     pub(crate) fn new_vec_with_artist_ids(vec: Vec<PostEntry>, request_sender: &RequestSender) -> Vec<Self> {
-        let dir_manager = Config::get().directory_manager().unwrap();
+        let binding = Config::get();
+        let dir_manager = binding.directory_manager().unwrap();
         vec.into_iter()
             .map(|e| {
                 // Generate enhanced filename with artist names and IDs
@@ -203,7 +205,8 @@ impl GrabbedPost {
 
 impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
     fn new_vec((vec, pool_name): (Vec<PostEntry>, &str)) -> Vec<Self> {
-        let dir_manager = Config::get().directory_manager().unwrap();
+        let binding = Config::get();
+        let dir_manager = binding.directory_manager().unwrap();
         vec.iter()
             .enumerate()
             .map(|(i, e)| {
@@ -302,7 +305,8 @@ impl PostCollection {
     }
 
     pub(crate) fn initialize_directories(&mut self) -> anyhow::Result<()> {
-        let dir_manager = Config::get().directory_manager()?;
+        let binding = Config::get();
+        let dir_manager = binding.directory_manager()?;
         
         // Track how many posts were assigned directories
         let mut assigned_count = 0;
@@ -812,7 +816,8 @@ impl Grabber {
                 }
                 
                 // Check if this post ID has been downloaded before
-                let dir_manager = Config::get().directory_manager().unwrap();
+                let binding = Config::get();
+                let dir_manager = binding.directory_manager().unwrap();
                 let is_duplicate = dir_manager.has_post_id(entry.id);
                 grabbed_post.set_is_new(!is_duplicate);
                 let collection = self.single_post_collection();
@@ -920,7 +925,8 @@ impl Grabber {
         let mut total_duplicate_posts = 0;
         let mut consecutive_empty_pages = 0;
         let _max_pages_u16 = max_pages as u16; // Keep for potential future use
-        let dir_manager = Config::get().directory_manager().unwrap();
+        let binding = Config::get();
+        let dir_manager = binding.directory_manager().unwrap();
         
         loop {
             // Check if we've reached the adaptive search limit (allow up to 3x configured pages)
