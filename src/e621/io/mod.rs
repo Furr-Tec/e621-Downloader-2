@@ -44,6 +44,9 @@ pub(crate) struct Config {
     /// Maximum number of pages to search per tag (default: 10)
     #[serde(rename = "maxPagesToSearch", default = "default_max_pages_to_search")]
     max_pages_to_search: usize,
+    /// Enable whitelist override for blacklisted content (default: true)
+    #[serde(rename = "whitelistOverrideBlacklist", default = "default_whitelist_override")]
+    whitelist_override_blacklist: bool,
     #[serde(skip)]
     directory_manager: Option<DirectoryManager>,
 }
@@ -52,6 +55,7 @@ fn default_batch_size() -> usize { 4 }
 fn default_download_concurrency() -> usize { 3 }
 fn default_simplified_folders() -> bool { true }
 fn default_max_pages_to_search() -> usize { 10 }
+fn default_whitelist_override() -> bool { true }
 
 static CONFIG: OnceCell<Config> = OnceCell::new();
 
@@ -84,6 +88,11 @@ impl Config {
     /// Maximum number of pages to search per tag
     pub(crate) fn max_pages_to_search(&self) -> usize {
         self.max_pages_to_search
+    }
+    
+    /// Whether whitelist should override blacklist
+    pub(crate) fn whitelist_override_blacklist(&self) -> bool {
+        self.whitelist_override_blacklist
     }
 
     /// Get the directory manager instance
@@ -202,6 +211,7 @@ impl Default for Config {
             download_concurrency: default_download_concurrency(),
             simplified_folders: default_simplified_folders(),
             max_pages_to_search: default_max_pages_to_search(),
+            whitelist_override_blacklist: default_whitelist_override(),
             directory_manager: None,
         }
     }

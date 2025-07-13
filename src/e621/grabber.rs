@@ -831,8 +831,18 @@ impl Grabber {
                     found_posts_in_batch = true;
                     found_any_posts_in_batch = true;
                     
-                    // Process the posts
-                    *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
+                    // Check if whitelist override is enabled in config
+                    let config = Config::get();
+                    if config.whitelist_override_blacklist() {
+                        // Generate whitelist for this search context
+                        let whitelist = self.generate_whitelist_for_search(searching_tag);
+                        
+                        // Process the posts with whitelist override
+                        *filtered += self.filter_posts_with_blacklist_and_whitelist(&mut searched_posts, &whitelist);
+                    } else {
+                        // Use traditional blacklist filtering without whitelist override
+                        *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
+                    }
                     *invalid_posts += Self::remove_invalid_posts(&mut searched_posts);
                     
                     // Check for duplicates before adding to results
@@ -938,16 +948,87 @@ impl Grabber {
         self.special_search(searching_tag, posts, filtered, invalid_posts);
     }
 
-    fn filter_posts_with_blacklist(&self, posts: &mut Vec<PostEntry>) -> u16 {
+    /// Generate whitelist from current search context
+    /// This includes the tag being searched and any known priority tags
+    fn generate_whitelist_for_search(&self, searching_tag: &str) -> Vec<String> {
+        let mut whitelist = Vec::new();
+        
+        // Always add the currently searched tag to whitelist (cleaned)
+        let clean_tag = searching_tag.trim();
+        if !clean_tag.is_empty() {
+            whitelist.push(clean_tag.to_string());
+        }
+        
+        // Handle special tag prefixes
+        if clean_tag.starts_with("artist:") {
+            let artist_name = clean_tag.strip_prefix("artist:").unwrap_or(clean_tag);
+            if !artist_name.is_empty() {
+                whitelist.push(artist_name.to_string());
+                // Also add "artist" category variants that might appear in tags
+                whitelist.push(format!("artist:{}", artist_name));
+            }
+        } else if clean_tag.starts_with("fav:") {
+            let username = clean_tag.strip_prefix("fav:").unwrap_or(clean_tag);
+            if !username.is_empty() {
+                // Add uploader variant and original username
+                whitelist.push(format!("uploader:{}", username));
+                whitelist.push(username.to_string());
+            }
+        } else if clean_tag.starts_with("pool:") {
+            // For pool searches, the tag is the pool content, not necessarily whitelistable
+            // But we'll keep the pool identifier just in case
+            whitelist.push(clean_tag.to_string());
+        } else {
+            // For general tags (including artist names without prefix), add variants
+            // This covers cases where an artist name is searched directly
+            whitelist.push(format!("artist:{}", clean_tag));
+        }
+        
+        // Remove duplicates and empty entries
+        whitelist.sort();
+        whitelist.dedup();
+        whitelist.retain(|tag| !tag.trim().is_empty());
+        
+        info!("Generated whitelist for search '{}': {:?}", searching_tag, whitelist);
+        whitelist
+    }
+
+    fn filter_posts_with_blacklist_and_whitelist(&self, posts: &mut Vec<PostEntry>, whitelist: &Vec<String>) -> u16 {
         if self.request_sender.is_authenticated() {
             if let Some(ref blacklist) = self.blacklist {
-                if let Ok(mut bl) = blacklist.lock() {
-                    return bl.filter_posts(posts);
+                if let Ok(bl) = blacklist.lock() {
+                    let original_len = posts.len();
+                    posts.retain(|post| {
+                        // Check if post contains any whitelisted tags
+                        let post_tags = post.tags.clone().combine_tags();
+                        let is_whitelisted = whitelist.iter().any(|whitelist_tag| {
+                            post_tags.iter().any(|post_tag| post_tag == whitelist_tag)
+                        });
+                        
+                        if is_whitelisted {
+                            trace!("Post {} is whitelisted due to tag(s): {:?}, skipping blacklist", post.id, 
+                                   whitelist.iter().filter(|wt| post_tags.iter().any(|pt| pt == *wt)).collect::<Vec<_>>());
+                            return true;
+                        }
+                        
+                        // Apply blacklist filter if not whitelisted
+                        let mut single_post = vec![post.clone()];
+                        let filtered_count = bl.filter_posts(&mut single_post);
+                        filtered_count == 0 // Keep post if it wasn't filtered by blacklist
+                    });
+                    
+                    let filtered_count = original_len - posts.len();
+                    return filtered_count as u16;
                 }
-                return 0;
             }
         }
         0
+    }
+    
+    /// Backward-compatible method that doesn't use whitelist
+    fn filter_posts_with_blacklist(&self, posts: &mut Vec<PostEntry>) -> u16 {
+        let empty_whitelist = Vec::new();
+        self.filter_posts_with_blacklist_and_whitelist(posts, &empty_whitelist)
     }
 
     fn remove_invalid_posts(posts: &mut Vec<PostEntry>) -> u16 {
