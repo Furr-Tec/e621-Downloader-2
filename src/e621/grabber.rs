@@ -741,11 +741,9 @@ impl Grabber {
                 break;
             }
             
-            // Check if we've found enough pages with new content
-            if pages_with_new_content >= max_pages {
-                info!("Found new content in {} pages (target: {}), search complete", pages_with_new_content, max_pages);
-                break;
-            }
+            // Continue searching until we've reached the configured maximum pages
+            // Note: This ensures we search the full configured amount rather than stopping early
+            // when we find fewer pages with new content than expected
             
             // Channel for this batch
             let (result_tx, result_rx) = mpsc::channel::<(u16, Vec<PostEntry>)>();
@@ -887,9 +885,9 @@ impl Grabber {
             // or reach a reasonable search limit to prevent infinite searching
             let max_search_limit = max_pages * 3; // Allow searching up to 3x configured pages to find new content
             
-            let should_continue = if pages_with_new_content >= max_pages {
-                // We've found the desired amount of new content
-                info!("Found new content in {} pages (target: {}), search complete", pages_with_new_content, max_pages);
+            let should_continue = if total_pages_searched >= max_pages {
+                // We've searched the configured number of pages - this is the primary condition
+                info!("Searched {} pages (target: {}), search complete. Found {} pages with new content", total_pages_searched, max_pages, pages_with_new_content);
                 false
             } else if total_pages_searched >= max_search_limit {
                 // We've searched too many pages, stop to prevent infinite searching
@@ -916,8 +914,8 @@ impl Grabber {
                             info!("Found {} consecutive empty pages in deep search, likely reached end of content", consecutive_empty_pages);
                             true
                         } else {
-                            info!("No posts in this batch, but continuing adaptive search ({}/{} pages with new content, {}/{} pages searched, {} consecutive empty)", 
-                                  pages_with_new_content, max_pages, total_pages_searched, max_search_limit, consecutive_empty_pages);
+                            info!("No posts in this batch, but continuing search ({}/{} pages searched, {} pages with new content, {} consecutive empty)", 
+                                  total_pages_searched, max_pages, pages_with_new_content, consecutive_empty_pages);
                             false
                         }
                     }

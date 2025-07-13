@@ -1153,10 +1153,25 @@ impl E621WebConnector {
         // Process collections
         if approx_total_posts > self.batch_size * 2 {
             // For very large downloads, we'll process one collection at a time
-            // Get the actual total post count we calculated earlier
-            let post_count = total_post_count;
+            // If we didn't calculate the new post count earlier, calculate it now
+            let post_count = if total_post_count == 0 {
+                // Calculate the actual new files count for large downloads
+                let collections = self.grabber.posts();
+                let mut count = 0;
+                for collection in collections {
+                    // For each collection, count new files
+                    for post in collection.posts() {
+                        if post.is_new() {
+                            count += 1;
+                        }
+                    }
+                }
+                count
+            } else {
+                total_post_count
+            };
 
-            // Initialize progress bar for large downloads
+            // Initialize progress bar for large downloads with accurate count
             self.progress_bar = ProgressBar::new(post_count as u64);
             
             // Configure progress bar to show file counts and download size
@@ -1235,6 +1250,9 @@ impl E621WebConnector {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-");
         self.progress_bar.set_style(progress_style);
+        
+        // Enable the progress bar to be displayed during downloads
+        self.progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
 
             // Confirm with user if download size is large
             if !self.confirm_large_download(length, new_post_count) {
