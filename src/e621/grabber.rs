@@ -437,14 +437,65 @@ impl Grabber {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-"));
 
-        for tag in tags.iter() {
-            let start_time = Instant::now();
-            self.grab_by_tag_type_with_context(tag, groups);
-            progress_bar.inc(1);
-            let duration = start_time.elapsed();
-            info!("Finished processing tag {} in {:.2?}", tag.name(), duration);
-        }
-        progress_bar.finish_with_message("All tags processed");
+// Use thread-safe collections for concurrent post gathering
+        let posts_mutex = Arc::new(Mutex::new(Vec::<PostCollection>::new()));
+        let progress_bar_arc = Arc::new(progress_bar);
+        
+        // Create a thread pool with limited concurrency to avoid API overload
+        let thread_pool_size = std::cmp::min(4, tags.len()); // Max 4 threads for API safety
+        let chunk_size = (tags.len() + thread_pool_size - 1) / thread_pool_size;
+        
+        // Split tags into chunks for parallel processing
+        let tag_chunks: Vec<Vec<&Tag>> = tags.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
+        
+        info!("Processing {} tags using {} threads in {} chunks", tags.len(), thread_pool_size, tag_chunks.len());
+        
+        // Use scoped threads to avoid lifetime issues
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            
+            for (chunk_id, tag_chunk) in tag_chunks.into_iter().enumerate() {
+                let posts_mutex = Arc::clone(&posts_mutex);
+                let progress_bar = Arc::clone(&progress_bar_arc);
+                let request_sender = self.request_sender.clone();
+                let blacklist = self.blacklist.clone();
+                let safe_mode = self.safe_mode;
+                
+                let handle = scope.spawn(move || {
+                    // Small delay to stagger thread starts and reduce API burst
+                    thread::sleep(Duration::from_millis(chunk_id as u64 * 100));
+                    
+                    for tag in tag_chunk {
+                        let start_time = Instant::now();
+                        
+                        // Process each tag and create collection
+                        let collection = Self::process_tag_to_collection(tag, groups, &request_sender, &blacklist, safe_mode);
+                        
+                        if let Some(collection) = collection {
+                            // Add to shared collection in thread-safe manner
+                            let mut posts = posts_mutex.lock().unwrap();
+                            posts.push(collection);
+                        }
+                        
+                        progress_bar.inc(1);
+                        let duration = start_time.elapsed();
+                        info!("Finished processing tag {} in {:.2?}", tag.name(), duration);
+                    }
+                });
+                
+                handles.push(handle);
+            }
+            
+            // Wait for all threads to complete
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        
+        // Extract collections from the mutex and add to self.posts
+        let mut collected_posts = posts_mutex.lock().unwrap();
+        self.posts.append(&mut collected_posts);
+        progress_bar_arc.finish_with_message("All tags processed");
     }
     
     pub(crate) fn grab_posts_by_artists(&mut self, artists: &[crate::e621::io::artist::Artist]) {
@@ -484,6 +535,35 @@ impl Grabber {
         );
     }
 
+    /// Static method to process a tag and return a PostCollection
+    /// This is thread-safe and can be called from parallel contexts
+    fn process_tag_to_collection(
+        tag: &Tag,
+        groups: &[Group],
+        request_sender: &RequestSender,
+        blacklist: &Option<Arc<Mutex<Blacklist>>>,
+        safe_mode: bool,
+    ) -> Option<PostCollection> {
+        // Create a temporary grabber instance for processing
+        let mut temp_grabber = Grabber {
+            posts: Vec::new(),
+            request_sender: request_sender.clone(),
+            blacklist: blacklist.clone(),
+            safe_mode,
+        };
+        
+        // Process the tag using existing logic
+        temp_grabber.grab_by_tag_type_with_context(tag, groups);
+        
+        // Return the first collection if any were created
+        if temp_grabber.posts.len() > 1 {
+            // Skip the first "Single Posts" collection and return the actual tag collection
+            temp_grabber.posts.into_iter().nth(1)
+        } else {
+            None
+        }
+    }
+    
     /// Process a tag with context awareness to handle same tag names in different sections
     fn grab_by_tag_type_with_context(&mut self, tag: &Tag, groups: &[Group]) {
         // Check if this tag name appears in multiple sections
