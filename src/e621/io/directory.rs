@@ -137,6 +137,8 @@ pub(crate) struct DirectoryManager {
     hash_db_path: PathBuf,
     /// Whether to use simplified folder structure (only Tags)
     simplified_folders: bool,
+    /// Cached hash database for efficient post ID lookups
+    cached_database: Option<HashDatabase>,
 }
 
 impl DirectoryManager {
@@ -161,6 +163,7 @@ impl DirectoryManager {
             use_strict_verification: true, // Enable strict verification by default
             hash_db_path: hash_db_path.clone(),
             simplified_folders,
+            cached_database: None,
         };
         
         // Create directory structure first
@@ -176,6 +179,7 @@ impl DirectoryManager {
                     let file_count = db.entries.len();
                     info!("Loaded hash database with {} file entries", file_count);
                     manager.downloaded_files = db.to_hash_set();
+                    manager.cached_database = Some(db); // Cache the database for efficient lookups
                     loaded_from_db = true;
                 },
                 Err(e) => {
@@ -190,6 +194,7 @@ impl DirectoryManager {
                 error!("Failed to create empty hash database: {}", e);
             }
             manager.downloaded_files = db.to_hash_set();
+            manager.cached_database = Some(db); // Cache the empty database
         }
         
         // Always resync the hash DB with actual downloaded files found
@@ -1090,6 +1095,96 @@ impl DirectoryManager {
         
         // Fall back to filename check
         self.file_exists(file_name)
+    }
+    
+    /// Checks if a post ID has been downloaded before by checking the cached hash database
+    /// This method uses the cached database for efficient lookups
+    pub(crate) fn has_post_id(&self, post_id: i64) -> bool {
+        trace!("Checking if post ID {} exists in cached hash database", post_id);
+        
+        // Use cached database if available
+        if let Some(ref db) = self.cached_database {
+            // Check if any entry has this post ID
+            for entry in &db.entries {
+                if let Some(stored_post_id) = entry.post_id {
+                    if stored_post_id == post_id {
+                        trace!("Found post ID {} in cached database for filename {}", post_id, entry.filename);
+                        return true;
+                    }
+                }
+            }
+            
+            // Fallback: Check filenames for post IDs (for backwards compatibility)
+            let post_id_str = post_id.to_string();
+            for entry in &db.entries {
+                let filename = &entry.filename;
+                
+                // 1. ID naming: "12345.jpg"
+                if filename.starts_with(&format!("{}.", post_id_str)) {
+                    trace!("Found post ID {} in filename {} (ID naming convention) - cached database fallback", post_id, filename);
+                    return true;
+                }
+                
+                // 2. Enhanced naming: "artist_12345.jpg" or "artist1+artist2_12345.jpg"
+                if filename.contains(&format!("_{}.", post_id_str)) {
+                    trace!("Found post ID {} in filename {} (enhanced naming convention) - cached database fallback", post_id, filename);
+                    return true;
+                }
+            }
+            
+            trace!("Post ID {} not found in cached hash database", post_id);
+            false
+        } else {
+            // Fallback to loading from disk if cache is not available
+            warn!("Cached database not available, falling back to disk read for post ID {}", post_id);
+            match HashDatabase::load(&self.hash_db_path) {
+                Ok(db) => {
+                    // Check if any entry has this post ID
+                    for entry in &db.entries {
+                        if let Some(stored_post_id) = entry.post_id {
+                            if stored_post_id == post_id {
+                                trace!("Found post ID {} in database for filename {}", post_id, entry.filename);
+                                return true;
+                            }
+                        }
+                    }
+                    
+                    // Fallback: Check filenames for post IDs (for backwards compatibility)
+                    let post_id_str = post_id.to_string();
+                    for entry in &db.entries {
+                        let filename = &entry.filename;
+                        
+                        // 1. ID naming: "12345.jpg"
+                        if filename.starts_with(&format!("{}.", post_id_str)) {
+                            trace!("Found post ID {} in filename {} (ID naming convention) - database fallback", post_id, filename);
+                            return true;
+                        }
+                        
+                        // 2. Enhanced naming: "artist_12345.jpg" or "artist1+artist2_12345.jpg"
+                        if filename.contains(&format!("_{}.", post_id_str)) {
+                            trace!("Found post ID {} in filename {} (enhanced naming convention) - database fallback", post_id, filename);
+                            return true;
+                        }
+                    }
+                    
+                    trace!("Post ID {} not found in hash database", post_id);
+                    false
+                },
+                Err(e) => {
+                    warn!("Failed to load hash database for post ID check: {}", e);
+                    // Final fallback to the old method using downloaded_files HashSet
+                    let post_id_str = post_id.to_string();
+                    for (filename, _) in &self.downloaded_files {
+                        if filename.starts_with(&format!("{}.", post_id_str)) || 
+                           filename.contains(&format!("_{}.", post_id_str)) {
+                            trace!("Found post ID {} in filename {} (fallback method)", post_id, filename);
+                            return true;
+                        }
+                    }
+                    false
+                }
+            }
+        }
     }
     
     /// An iterative version of is_duplicate that avoids deep recursive calls

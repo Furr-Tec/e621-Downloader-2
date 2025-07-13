@@ -1486,11 +1486,20 @@ impl E621WebConnector {
         }
 
         // Count new files that will be downloaded
+        let all_posts_count = collection_info.posts().len();
         let new_files: Vec<_> = collection_info.posts().iter().filter(|post| post.is_new()).collect();
         let total_files = new_files.len();
         
+        info!(
+            "Collection '{}': {} total posts, {} marked as new",
+            collection_info.name, all_posts_count, total_files
+        );
+        
         if total_files == 0 {
-            // No new files to download in this collection
+            warn!(
+                "No new files to download in collection '{}' - all {} posts marked as duplicates",
+                collection_info.name, all_posts_count
+            );
             return;
         }
 

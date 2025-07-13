@@ -151,16 +151,9 @@ impl NewVec<Vec<PostEntry>> for GrabbedPost {
                 if let Some(artist_tag) = e.tags.artist.first() {
                     post.set_artist(artist_tag.clone());
                 }
-                // Short URL is already set in the From trait implementation
-                // Check if this file has been downloaded before
-                // Use hash-based duplicate detection when available
-                let relpath = if let Some(dir) = post.save_directory() {
-                    let file_path = dir.join(post.name());
-                    file_path.strip_prefix(&Config::get().download_directory()).unwrap_or(&file_path).to_string_lossy().to_string()
-                } else {
-                    post.name.clone()
-                };
-                post.set_is_new(!dir_manager.is_duplicate(&relpath, post.sha512_hash()));
+                // Check if this post ID has been downloaded before
+                let is_duplicate = dir_manager.has_post_id(e.id);
+                post.set_is_new(!is_duplicate);
                 post
             })
             .collect()
@@ -175,6 +168,7 @@ impl GrabbedPost {
             .map(|e| {
                 // Generate enhanced filename with artist names and IDs
                 let enhanced_name = GrabbedPost::generate_enhanced_filename(&e, Config::get().naming_convention(), request_sender);
+                trace!("Generated filename '{}' for post ID {}", enhanced_name, e.id);
                 
                 let short_url = format!("e621.net/posts/{}", e.id);
                 let mut post = GrabbedPost {
@@ -193,15 +187,14 @@ impl GrabbedPost {
                     post.set_artist(artist_tag.clone());
                 }
                 
-                // Check if this file has been downloaded before
-                // Use hash-based duplicate detection when available
-                let relpath = if let Some(dir) = post.save_directory() {
-                    let file_path = dir.join(post.name());
-                    file_path.strip_prefix(&Config::get().download_directory()).unwrap_or(&file_path).to_string_lossy().to_string()
+                // Check if this post ID has been downloaded before
+                let is_duplicate = dir_manager.has_post_id(e.id);
+                if is_duplicate {
+                    trace!("Post ID {} marked as duplicate (already downloaded)", e.id);
                 } else {
-                    post.name.clone()
-                };
-                post.set_is_new(!dir_manager.is_duplicate(&relpath, post.sha512_hash()));
+                    trace!("Post ID {} marked as new (not found in database)", e.id);
+                }
+                post.set_is_new(!is_duplicate);
                 post
             })
             .collect()
@@ -218,16 +211,9 @@ impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
                 if let Some(artist_tag) = e.tags.artist.first() {
                     post.set_artist(artist_tag.clone());
                 }
-                // Short URL is already set in the From trait implementation
-                // Check if this file has been downloaded before
-                // Use hash-based duplicate detection when available
-                let relpath = if let Some(dir) = post.save_directory() {
-                    let file_path = dir.join(post.name());
-                    file_path.strip_prefix(&Config::get().download_directory()).unwrap_or(&file_path).to_string_lossy().to_string()
-                } else {
-                    post.name.clone()
-                };
-                post.set_is_new(!dir_manager.is_duplicate(&relpath, post.sha512_hash()));
+                // Check if this post ID has been downloaded before  
+                let is_duplicate = dir_manager.has_post_id(e.id);
+                post.set_is_new(!is_duplicate);
                 post
             })
             .collect()
@@ -333,6 +319,8 @@ impl PostCollection {
                 assigned_count += 1;
             }
         }
+        
+        // Note: Duplicate checking is now performed during search phase
 
         // Verify all posts were assigned directories
         let total_posts = self.posts.len();
@@ -627,12 +615,18 @@ impl Grabber {
                 if let Some(artist_tag) = entry.tags.artist.first() {
                     grabbed_post.set_artist(artist_tag.clone());
                 }
+                
+                // Check if this post ID has been downloaded before
+                let dir_manager = Config::get().directory_manager().unwrap();
+                let is_duplicate = dir_manager.has_post_id(entry.id);
+                grabbed_post.set_is_new(!is_duplicate);
                 let collection = self.single_post_collection();
+                // Add the post first, then initialize directories (which includes duplicate checking)
+                collection.posts.push(grabbed_post);
                 if let Err(e) = collection.initialize_directories() {
                     error!("Failed to initialize directories for single post: {}", e);
                     emergency_exit("Directory initialization failed");
                 }
-                collection.posts.push(grabbed_post);
                 info!(
                     "Post with ID {} grabbed!",
                     console::style(format!("\"{id}\"")).color256(39).italic()
@@ -713,8 +707,8 @@ impl Grabber {
             _ => Duration::from_millis(600),       // Max thread - highest delay
         };
         
-        info!("Searching max {} pages using {} threads with {}ms rate limiting (adaptive: will continue until {} pages of new content found)", 
-              max_pages, thread_count, rate_limit_delay.as_millis(), max_pages);
+        info!("Searching max {} pages using {} threads with {}ms rate limiting (stops early if 4 consecutive empty pages found)", 
+              max_pages, thread_count, rate_limit_delay.as_millis());
         
         let progress_bar = ProgressBar::new_spinner();
         progress_bar.set_style(
@@ -830,6 +824,7 @@ impl Grabber {
             let mut found_any_posts_in_batch = false; // Track if ANY posts were found (including duplicates)
             let mut new_posts_in_batch = 0;
             let mut duplicate_posts_in_batch = 0;
+            let mut empty_pages_in_batch = 0;
             
             for (_page, mut searched_posts) in batch_results {
                 if !searched_posts.is_empty() {
@@ -860,6 +855,9 @@ impl Grabber {
                     // Only add new posts to results
                     new_posts_from_page.reverse();
                     posts.append(&mut new_posts_from_page);
+                } else {
+                    // This individual page was empty
+                    empty_pages_in_batch += 1;
                 }
             }
             
@@ -872,10 +870,12 @@ impl Grabber {
             }
             
             // Track consecutive empty pages to detect end of content
-            if !found_any_posts_in_batch {
-                consecutive_empty_pages += threads_spawned;
+            if found_any_posts_in_batch {
+                // Reset counter if we found any posts in this batch
+                consecutive_empty_pages = 0;
             } else {
-                consecutive_empty_pages = 0; // Reset counter if we found any posts
+                // Add the actual number of empty pages found in this batch
+                consecutive_empty_pages += empty_pages_in_batch;
             }
             
             progress_bar.set_message(format!("processed {} pages ({} new posts, {} duplicates, {}/{} pages with new content)", 
@@ -893,33 +893,17 @@ impl Grabber {
                 // We've searched too many pages, stop to prevent infinite searching
                 info!("Reached search limit of {} pages ({} configured * 3), stopping adaptive search", max_search_limit, max_pages);
                 false
-            } else if consecutive_empty_pages >= 10 {
-                // We've hit multiple consecutive pages with no posts at all - likely reached end of content
+            } else if consecutive_empty_pages >= 4 {
+                // We've hit 4 consecutive pages with no posts at all - likely reached end of content
                 info!("Found {} consecutive empty pages, likely reached end of available content. Stopping search.", consecutive_empty_pages);
                 false
             } else if !found_posts_in_batch {
                 // No posts found in this batch - check if we should stop based on search depth
-                let should_stop_early = match max_pages {
-                    1..=10 => {
-                        if consecutive_empty_pages >= 6 {
-                            info!("Found {} consecutive empty pages in quick search, stopping", consecutive_empty_pages);
-                            true
-                        } else {
-                            false
-                        }
-                    },
-                    _ => {
-                        // For larger searches, be more persistent but still respect empty page limits
-                        if consecutive_empty_pages >= 8 {
-                            info!("Found {} consecutive empty pages in deep search, likely reached end of content", consecutive_empty_pages);
-                            true
-                        } else {
-                            info!("No posts in this batch, but continuing search ({}/{} pages searched, {} pages with new content, {} consecutive empty)", 
-                                  total_pages_searched, max_pages, pages_with_new_content, consecutive_empty_pages);
-                            false
-                        }
-                    }
-                };
+                // This logic is now redundant since we handle 4 consecutive empty pages above
+                // Just continue searching unless we've hit the 4 consecutive limit
+                info!("No posts in this batch, but continuing search ({}/{} pages searched, {} pages with new content, {} consecutive empty)", 
+                      total_pages_searched, max_pages, pages_with_new_content, consecutive_empty_pages);
+                let should_stop_early = false;
                 !should_stop_early
             } else {
                 // Found some posts (even if duplicates), continue searching
