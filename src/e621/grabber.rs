@@ -265,7 +265,13 @@ impl GrabbedPost {
 impl NewVec<Vec<PostEntry>> for GrabbedPost {
     fn new_vec(vec: Vec<PostEntry>) -> Vec<Self> {
         let binding = Config::get();
-        let dir_manager = binding.directory_manager().unwrap();
+        let dir_manager = match binding.directory_manager() {
+            Ok(dm) => dm,
+            Err(e) => {
+                error!("Failed to get directory manager: {}", e);
+                return Vec::new();
+            }
+        };
         let naming_convention = binding.naming_convention();
         
         // Batch check all post IDs at once for O(1) performance
@@ -294,7 +300,13 @@ impl GrabbedPost {
     /// Enhanced new_vec that includes artist ID information in filenames
     pub(crate) fn new_vec_with_artist_ids(vec: Vec<PostEntry>, request_sender: &RequestSender) -> Vec<Self> {
         let binding = Config::get();
-        let dir_manager = binding.directory_manager().unwrap();
+        let dir_manager = match binding.directory_manager() {
+            Ok(dm) => dm,
+            Err(e) => {
+                error!("Failed to get directory manager: {}", e);
+                return Vec::new();
+            }
+        };
         
         // Batch check all post IDs at once for O(1) performance
         let post_ids: Vec<i64> = vec.iter().map(|e| e.id).collect();
@@ -308,13 +320,20 @@ impl GrabbedPost {
         let mut duplicate_posts_count = 0;
         
         let result: Vec<Self> = vec.into_iter()
-            .map(|e| {
+            .filter_map(|e| {
                 // Generate enhanced filename with artist names and IDs
                 let enhanced_name = GrabbedPost::generate_enhanced_filename(&e, Config::get().naming_convention(), request_sender);
                 
                 let short_url = format!("e621.net/posts/{}", e.id);
+                let url = match e.file.url.clone() {
+                    Some(url) => url,
+                    None => {
+                        error!("Post {} has no URL, skipping", e.id);
+                        return None;
+                    }
+                };
                 let mut post = GrabbedPost {
-                    url: e.file.url.clone().unwrap(),
+                    url,
                     name: enhanced_name,
                     file_size: e.file.size,
                     save_directory: None,
@@ -337,7 +356,7 @@ impl GrabbedPost {
                     new_posts_count += 1;
                 }
                 post.set_is_new(!is_duplicate);
-                post
+                Some(post)
             })
             .collect();
         
@@ -354,7 +373,13 @@ impl GrabbedPost {
 impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
     fn new_vec((vec, pool_name): (Vec<PostEntry>, &str)) -> Vec<Self> {
         let binding = Config::get();
-        let dir_manager = binding.directory_manager().unwrap();
+        let dir_manager = match binding.directory_manager() {
+            Ok(dm) => dm,
+            Err(e) => {
+                error!("Failed to get directory manager: {}", e);
+                return Vec::new();
+            }
+        };
         
         // Batch check all post IDs at once for O(1) performance
         let post_ids: Vec<i64> = vec.iter().map(|e| e.id).collect();
@@ -383,7 +408,10 @@ impl From<(&PostEntry, &str, u16)> for GrabbedPost {
     fn from((post, name, current_page): (&PostEntry, &str, u16)) -> Self {
         let short_url = format!("e621.net/posts/{}", post.id);
         GrabbedPost {
-            url: post.file.url.clone().unwrap(),
+            url: post.file.url.clone().unwrap_or_else(|| {
+                error!("Post does not have a URL: {}", post.id);
+                return String::new();
+            }),
             name: format!("{} Page_{:05}.{}", name, current_page, post.file.ext),
             file_size: post.file.size, // post.file.size is already i64
             save_directory: None,
@@ -401,7 +429,10 @@ impl From<(PostEntry, &str)> for GrabbedPost {
         let short_url = format!("e621.net/posts/{}", post.id);
         match name_convention {
             "md5" => GrabbedPost {
-                url: post.file.url.clone().unwrap(),
+                url: post.file.url.clone().unwrap_or_else(|| {
+                    error!("Post {} has no URL in md5 naming mode", post.id);
+                    String::new()
+                }),
                 name: format!("{}.{}", post.file.md5, post.file.ext),
                 file_size: post.file.size, // post.file.size is already i64
                 save_directory: None,
@@ -412,7 +443,10 @@ impl From<(PostEntry, &str)> for GrabbedPost {
                 post_id: post.id,
             },
             "id" => GrabbedPost {
-                url: post.file.url.clone().unwrap(),
+                url: post.file.url.clone().unwrap_or_else(|| {
+                    error!("Post {} has no URL in id naming mode", post.id);
+                    String::new()
+                }),
                 name: format!("{}.{}", post.id, post.file.ext),
                 file_size: post.file.size, // post.file.size is already i64
                 save_directory: None,
@@ -734,7 +768,9 @@ impl Grabber {
         
         // Send tag batches to the channel
         for batch in tag_batches {
-            batch_tx.send(batch).unwrap();
+            if let Err(e) = batch_tx.send(batch) {
+                error!("Failed to send tag batch: {:?}", e);
+            }
         }
         drop(batch_tx); // Close the channel
         
@@ -756,7 +792,10 @@ impl Grabber {
                     thread::sleep(Duration::from_millis(batch_processor_id as u64 * 100));
                     
                     // Process batches
-                    while let Ok(tag_batch) = batch_rx.lock().unwrap().recv() {
+                    while let Ok(tag_batch) = batch_rx.lock().unwrap_or_else(|e| {
+                        error!("Failed to lock batch receiver: {}", e);
+                        panic!("Batch receiver lock poisoned");
+                    }).recv() {
                         let batch_start_time = Instant::now();
                         
                         // Process tags in this batch concurrently
@@ -769,7 +808,8 @@ impl Grabber {
                             &posts_mutex, 
                             &progress_bar, 
                             &rate_limiter,
-                            batch_processor_id
+                            batch_processor_id,
+                            total_tags
                         );
                         
                         let batch_duration = batch_start_time.elapsed();
@@ -782,13 +822,21 @@ impl Grabber {
             
             // Wait for all batch processors to complete
             for handle in handles {
-                handle.join().unwrap();
+                if let Err(e) = handle.join() {
+                    error!("Batch processor thread panicked: {:?}", e);
+                }
             }
         });
         
         // Extract collections from the mutex and add to self.posts
-        let mut collected_posts = posts_mutex.lock().unwrap();
-        self.posts.append(&mut collected_posts);
+        match posts_mutex.lock() {
+            Ok(mut collected_posts) => {
+                self.posts.append(&mut collected_posts);
+            }
+            Err(e) => {
+                error!("Failed to lock posts mutex for final collection: {}", e);
+            }
+        }
         progress_bar_arc.finish_with_message("All tags processed");
     }
     
@@ -803,6 +851,7 @@ impl Grabber {
         progress_bar: &Arc<ProgressBar>,
         rate_limiter: &Arc<Mutex<AdaptiveRateLimiter>>,
         batch_processor_id: usize,
+        total_tags: usize,
     ) {
         let batch_size = tag_batch.len();
         info!("Batch processor {} starting concurrent processing of {} tags", batch_processor_id, batch_size);
@@ -1268,8 +1317,11 @@ impl Grabber {
     fn sort_pool_by_id(entry: &PoolEntry, posts: &mut [PostEntry]) {
         for (i, id) in entry.post_ids.iter().enumerate() {
             if posts[i].id != *id {
-                let correct_index = posts.iter().position(|e| e.id == *id).unwrap();
-                posts.swap(i, correct_index);
+                if let Some(correct_index) = posts.iter().position(|e| e.id == *id) {
+                    posts.swap(i, correct_index);
+                } else {
+                    warn!("Post with ID {} not found in pool posts", id);
+                }
             }
         }
     }
@@ -1279,7 +1331,7 @@ impl Grabber {
     }
 
     fn single_post_collection(&mut self) -> &mut PostCollection {
-        self.posts.first_mut().unwrap()
+        self.posts.first_mut().expect("No single post collection found")
     }
 
     fn add_single_post(&mut self, entry: PostEntry, id: i64) {
@@ -1292,8 +1344,15 @@ impl Grabber {
                 // Generate enhanced filename with artist names and IDs
                 let enhanced_name = GrabbedPost::generate_enhanced_filename(&entry, Config::get().naming_convention(), &self.request_sender);
                 let short_url = format!("e621.net/posts/{}", entry.id);
+                let url = match entry.file.url.clone() {
+                    Some(url) => url,
+                    None => {
+                        error!("Post {} has no URL in add_single_post", entry.id);
+                        return;
+                    }
+                };
                 let mut grabbed_post = GrabbedPost {
-                    url: entry.file.url.clone().unwrap(),
+                    url,
                     name: enhanced_name,
                     file_size: entry.file.size,
                     save_directory: None,
@@ -1309,7 +1368,13 @@ impl Grabber {
                 
                 // Check if this post ID has been downloaded before using batch processing
                 let binding = Config::get();
-                let dir_manager = binding.directory_manager().unwrap();
+                let dir_manager = match binding.directory_manager() {
+                    Ok(dm) => dm,
+                    Err(e) => {
+                        error!("Failed to get directory manager: {}", e);
+                        return;
+                    }
+                };
                 let batch_results = dir_manager.batch_has_post_ids(&[entry.id]);
                 let is_duplicate = batch_results.first().map(|(_, exists)| *exists).unwrap_or(false);
                 grabbed_post.set_is_new(!is_duplicate);
@@ -1441,7 +1506,13 @@ impl Grabber {
         let mut consecutive_empty_pages = 0;
         let _max_pages_u16 = max_pages as u16; // Keep for potential future use
         let binding = Config::get();
-        let dir_manager = binding.directory_manager().unwrap();
+        let dir_manager = match binding.directory_manager() {
+            Ok(dm) => dm,
+            Err(e) => {
+                error!("Failed to get directory manager for special search: {}", e);
+                return;
+            }
+        };
         
         loop {
             // Check if we've reached the adaptive search limit (allow up to 3x configured pages)
@@ -2021,7 +2092,13 @@ impl Grabber {
     /// Helper method to process posts for duplicates and generate enhanced filenames
     fn process_posts_for_duplicates_and_filenames(posts: &mut Vec<PostEntry>) {
         let binding = Config::get();
-        let dir_manager = binding.directory_manager().unwrap();
+        let dir_manager = match binding.directory_manager() {
+            Ok(dm) => dm,
+            Err(e) => {
+                error!("Failed to get directory manager for duplicate processing: {}", e);
+                return;
+            }
+        };
         
         // Batch check all post IDs for duplicates
         let post_ids: Vec<i64> = posts.iter().map(|post| post.id).collect();

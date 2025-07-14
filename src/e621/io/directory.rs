@@ -635,14 +635,32 @@ impl DirectoryManager {
                         }
                     };
                     {
-                        let mut results_guard = results.lock().unwrap();
+let mut results_guard = match results.lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => {
+        warn!("Mutex poisoned, recovering lock");
+        poisoned.into_inner()
+    }
+};
                         results_guard.push((filename.clone(), hash));
                     }
                     let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
                     if done == 1 || done % milestone == 0 || done == n_new {
                         // Flush DB with results, thread-safe
-                        let mut manager_guard = manager_arc.lock().unwrap();
-                        for (f, h) in results.lock().unwrap().drain(..) {
+let mut manager_guard = match manager_arc.lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => {
+        warn!("Mutex poisoned, recovering lock");
+        poisoned.into_inner()
+    }
+};
+                        for (f, h) in match results.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                warn!("Mutex poisoned, recovering lock");
+                                poisoned.into_inner()
+                            }
+                        }.drain(..) {
                             manager_guard.downloaded_files.insert((f, h));
                         }
                         let db = HashDatabase::from_hash_set(&manager_guard.downloaded_files);
@@ -667,8 +685,20 @@ impl DirectoryManager {
                     bar.inc(1);
                 });
                 // Any remaining (less than a milestone) results
-                let mut manager_guard = manager_arc.lock().unwrap();
-                for (f, h) in results.lock().unwrap().drain(..) {
+                let mut manager_guard = match manager_arc.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        warn!("Mutex poisoned, recovering lock");
+                        poisoned.into_inner()
+                    }
+                };
+                for (f, h) in match results.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        warn!("Mutex poisoned, recovering lock");
+                        poisoned.into_inner()
+                    }
+                }.drain(..) {
                     manager_guard.downloaded_files.insert((f, h));
                 }
                 bar.finish_with_message(format!(
@@ -919,10 +949,22 @@ impl DirectoryManager {
 
             // Optionally prioritize largest files to maximize core utilization on SSD/NVMe
             let all_files_for_hash = {
-                let files_guard = all_files.lock().unwrap();
+let files_guard = match all_files.lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => {
+        warn!("Mutex poisoned, recovering lock");
+        poisoned.into_inner()
+    }
+};
                 let mut files_vec = files_guard.clone();
                 files_vec.sort_unstable_by_key(|p| {
-                    fs::metadata(p).map(|m| -(m.len() as i64)).unwrap_or(0)
+                    match fs::metadata(p) {
+                        Ok(m) => -(m.len() as i64),
+                        Err(e) => {
+                            warn!("Failed to read metadata for '{}': {}", p.display(), e);
+                            0
+                        }
+                    }
                 });
                 files_vec
             };
@@ -975,7 +1017,13 @@ impl DirectoryManager {
                     progress_bar.inc(1);
                     (file_name, hash)
                 }).collect();
-                let mut results_guard = results.lock().unwrap();
+let mut results_guard = match results.lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => {
+        warn!("Mutex poisoned, recovering lock");
+        poisoned.into_inner()
+    }
+};
                 for result in chunk_results {
                     results_guard.insert(result);
                 }
@@ -1163,15 +1211,21 @@ impl DirectoryManager {
             // When batch is full or for last item, process the batch
             if entry_batch.len() >= BATCH_SIZE {
                 // Get file names for progress update
-                let first_file = entry_batch.first()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("[unnamed]");
+let first_file = entry_batch.first()
+    .and_then(|p| p.file_name())
+    .and_then(|n| n.to_str())
+    .unwrap_or_else(|| {
+        warn!("Failed to get first file name");
+        "[unnamed]"
+    });
                     
-                let last_file = entry_batch.last()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("[unnamed]");
+let last_file = entry_batch.last()
+    .and_then(|p| p.file_name())
+    .and_then(|n| n.to_str())
+    .unwrap_or_else(|| {
+        warn!("Failed to get last file name");
+        "[unnamed]"
+    });
                 
                 // Update progress with batch range
                 progress_bar.set_message(format!("{} - Processing files: {} to {}", 
@@ -1180,7 +1234,13 @@ impl DirectoryManager {
                 // Add paths to shared vector
                 {
                     let batch_len = entry_batch.len();
-                    let mut files = files_mutex.lock().unwrap();
+let mut files = match files_mutex.lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => {
+        warn!("Mutex poisoned, recovering lock");
+        poisoned.into_inner()
+    }
+};
                     files.extend(entry_batch.drain(..));
                     
                     // Update the atomic file count and progress
@@ -1200,7 +1260,13 @@ impl DirectoryManager {
                 
             // Add paths to shared vector
             {
-                let mut files = files_mutex.lock().unwrap();
+                let mut files = match files_mutex.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        warn!("Mutex poisoned, recovering lock");
+                        poisoned.into_inner()
+                    }
+                };
                 files.extend(entry_batch);
                 
                 // Update the atomic file count and progress

@@ -705,7 +705,7 @@ mod tests {
     }
     
     #[test]
-    fn test_remove_invalid_chars() {
+    async fn test_remove_invalid_chars() {
         let input = "file:with*invalid<chars>\"test|.jpg";
         let expected = "file_with_invalid_chars__test_.jpg";
         assert_eq!(remove_invalid_chars(input), expected);

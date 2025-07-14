@@ -1144,7 +1144,7 @@ impl E621WebConnector {
 
         // Read the file in chunks and update the hasher
         let mut hasher = Sha512::new();
-        let mut buffer = [0; 1024 * 1024]; // 1MB buffer for reading
+        let mut buffer = vec![0; 1024 * 1024]; // 1MB buffer moved to heap for safety
 
         loop {
             let bytes_read = file.read(&mut buffer)?;
@@ -1449,16 +1449,32 @@ impl E621WebConnector {
         let mut download_queue = VecDeque::new();
 
         // Thread pool for downloads
-        let _download_pool = ThreadPoolBuilder::new()
+        let _download_pool = match ThreadPoolBuilder::new()
             .num_threads(pipeline_config.download_threads)
             .build()
-            .expect("Failed to create download thread pool");
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                error!("Failed to create download thread pool: {}", e);
+                self.progress_bar.set_message("Error: Failed to create download thread pool!");
+                self.progress_bar.finish_with_message("Download failed: Thread pool creation error");
+                return;
+            }
+        };
 
         // Thread pool for hashing
-        let _hash_pool = ThreadPoolBuilder::new()
+        let _hash_pool = match ThreadPoolBuilder::new()
             .num_threads(pipeline_config.hash_threads)
             .build()
-            .expect("Failed to create hash thread pool");
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                error!("Failed to create hash thread pool: {}", e);
+                self.progress_bar.set_message("Error: Failed to create hash thread pool!");
+                self.progress_bar.finish_with_message("Download failed: Thread pool creation error");
+                return;
+            }
+        };
 
         // Clone shared variables
         let _progress_bar = self.progress_bar.clone();
@@ -1479,7 +1495,13 @@ impl E621WebConnector {
             let handle = thread::spawn(move || {
                 loop {
                     let job = {
-                        let rx = download_rx.lock().unwrap();
+                        let rx = match download_rx.lock() {
+                            Ok(rx) => rx,
+                            Err(e) => {
+                                error!("Failed to lock download receiver: {}", e);
+                                return;
+                            }
+                        };
                         rx.recv()
                     };
                     
@@ -1527,7 +1549,13 @@ impl E621WebConnector {
             let handle = thread::spawn(move || {
                 loop {
                     let job = {
-                        let rx = hash_rx.lock().unwrap();
+                        let rx = match hash_rx.lock() {
+                            Ok(rx) => rx,
+                            Err(e) => {
+                                error!("Failed to lock hash receiver: {}", e);
+                                return;
+                            }
+                        };
                         rx.recv()
                     };
                     
@@ -1656,7 +1684,9 @@ impl E621WebConnector {
         // Feed initial jobs to download threads
         for _ in 0..std::cmp::min(pipeline_config.download_queue_size, download_queue.len()) {
             if let Some(job) = download_queue.pop_front() {
-                download_tx.send(job).unwrap();
+                if let Err(e) = download_tx.send(job) {
+                    error!("Failed to send download job: {}", e);
+                }
             }
         }
         
@@ -1682,11 +1712,15 @@ impl E621WebConnector {
                 };
                 
                 // Send to hash queue
-                hash_tx.send(hash_job).unwrap();
+                if let Err(e) = hash_tx.send(hash_job) {
+                    error!("Failed to send hashing job: {}", e);
+                }
                 
                 // Feed more download jobs if available
                 if let Some(job) = download_queue.pop_front() {
-                    download_tx.send(job).unwrap();
+                    if let Err(e) = download_tx.send(job) {
+                        error!("Failed to send download job: {}", e);
+                    }
                 }
             }
             
@@ -1707,7 +1741,13 @@ impl E621WebConnector {
                         .strip_prefix(Config::get().download_directory())
                         .unwrap_or(&relpath)
                         .to_string_lossy();
-                    let mut dm = dir_manager.lock().unwrap();
+                    let mut dm = match dir_manager.lock() {
+                        Ok(dm) => dm,
+                        Err(e) => {
+                            error!("Failed to lock directory manager: {}", e);
+                            return;
+                        }
+                    };
                     dm.add_or_update_entry(
                         relpath_str.to_string(),
                         Some(processed_file.calculated_hash.clone()),
@@ -1909,8 +1949,8 @@ impl E621WebConnector {
 
             // For large files, use memory mapping for better performance and memory efficiency
             if file_size > LARGE_FILE_THRESHOLD {
-                // Use memory mapping for large files
-                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+                            // SAFETY: Memory mapping is safe because the file is guaranteed to be open and valid during this context.
+                            let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
                 let mut hasher = Sha512::new();
                 hasher.update(&mmap[..]);

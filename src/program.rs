@@ -35,13 +35,18 @@ impl Program {
         trace!("Program Name: {}", NAME);
         trace!("Program Version: {}", VERSION);
         trace!("Program Authors: {}", AUTHORS);
-        trace!(
-            "Program Working Directory: {}",
-            current_dir()
-                .expect("Unable to get working directory!")
-                .to_str()
-                .unwrap()
-        );
+        let current_dir_path = current_dir()
+            .map_err(|e| {
+                error!("Unable to get working directory: {}", e);
+                anyhow::anyhow!("Failed to get working directory: {}", e)
+            })?;
+        let current_dir = current_dir_path
+            .to_str()
+            .ok_or_else(|| {
+                error!("Working directory path contains invalid UTF-8");
+                anyhow::anyhow!("Working directory path contains invalid UTF-8")
+            })?;
+        trace!("Program Working Directory: {}", current_dir);
 
         // Check the config file and ensures that it is created.
         trace!("Checking if config file exists...");

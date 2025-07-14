@@ -108,7 +108,10 @@ impl SenderClient {
             .gzip(true) // Enable gzip compression
             .deflate(true) // Enable deflate compression
             .build()
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|e| {
+                warn!("Failed to build custom client: {}. Falling back to default client.", e);
+                Client::new()
+            })
     }
 
     /// A wrapping function that acts the exact same as `self.client.get` but will instead attach the user agent header
@@ -225,7 +228,13 @@ impl RequestSender {
         let result = time_operation_with_error!("alias_search", {
             self.check_response(
                 self.client
-                    .get(&self.urls.lock().unwrap()["alias"])
+                    .get(&match self.urls.lock() {
+                        Ok(urls) => urls["alias"].clone(),
+                        Err(e) => {
+                            error!("Failed to lock urls mutex: {}", e);
+                            return None;
+                        }
+                    })
                     .query(&[
                         ("commit", "Search"),
                         ("search[name_matches]", tag),
@@ -336,12 +345,13 @@ impl RequestSender {
     pub(crate) fn download_image(&self, url: &str, file_size: i64) -> Vec<u8> {
         let mut image_response = self.check_response(self.client.get(url).send());
         let mut image_bytes: Vec<u8> = Vec::with_capacity(file_size as usize);
-        image_response
-            .copy_to(&mut image_bytes)
-            .with_context(|| "Failed to download image!".to_string())
-            .unwrap();
-
-        image_bytes
+        match image_response.copy_to(&mut image_bytes) {
+            Ok(_) => image_bytes,
+            Err(e) => {
+                error!("Failed to download image from {}: {}", url, e);
+                Vec::new()
+            }
+        }
     }
 
     /// Downloads bytes from a URL, handling errors properly
@@ -426,7 +436,13 @@ impl RequestSender {
                 self.client
                     .get_with_auth(
                         &self.append_url(
-                            &self.urls.lock().unwrap()[url_type_key],
+                            &match self.urls.lock() {
+                                Ok(urls) => urls[url_type_key].clone(),
+                                Err(e) => {
+                                    error!("Failed to lock urls mutex: {}", e);
+                                    emergency_exit("Critical error: Failed to access URL configuration");
+                                }
+                            },
                             id
                         )
                     )
@@ -443,19 +459,22 @@ impl RequestSender {
                     id
                 )
             })
-            .unwrap();
+            .unwrap_or_else(|e| {
+                error!("Failed to deserialize JSON: {}", e);
+                emergency_exit(&format!("Critical error: Failed to deserialize entry of type {}", type_name::<Value>()));
+            });
 
         let value = match url_type_key {
             "single" => value
                 .get("post")
+                .map(|v| v.to_owned())
                 .unwrap_or_else(|| {
                     // This will terminate the program, so no code after it will be reached
                     emergency_exit(&format!(
                         "Post was not found! Post ID ({}) is invalid or post was deleted.",
                         id
                     ));
-                })
-                .to_owned(),
+                }),
             _ => value,
         };
 
@@ -466,7 +485,10 @@ impl RequestSender {
                 type above."
                     .to_string()
             })
-            .unwrap()
+            .unwrap_or_else(|e| {
+                error!("Failed to convert value to type {}: {}", type_name::<T>(), e);
+                emergency_exit(&format!("Critical error: Failed to convert entry to type {}", type_name::<T>()));
+            })
     }
 
     /// Performs a bulk search for posts using tags to filter the response.
@@ -482,7 +504,13 @@ impl RequestSender {
 
         let response = self.check_response(
             self.client
-                .get_with_auth(&self.urls.lock().unwrap()["posts"])
+                .get_with_auth(&match self.urls.lock() {
+                    Ok(urls) => urls["posts"].clone(),
+                    Err(e) => {
+                        error!("Failed to lock urls mutex: {}", e);
+                        return Err(anyhow::anyhow!("Failed to access URL configuration"));
+                    }
+                })
                 .query(&[
                     ("tags", searching_tag),
                     ("page", &format!("{page}")),
@@ -575,7 +603,13 @@ impl RequestSender {
         let response = time_operation!("tag_search", {
             self.check_response(
                 self.client
-                    .get(&self.urls.lock().unwrap()["tag_bulk"])
+                    .get(&match self.urls.lock() {
+                        Ok(urls) => urls["tag_bulk"].clone(),
+                        Err(e) => {
+                            error!("Failed to lock urls mutex: {}", e);
+                            return vec![];
+                        }
+                    })
                     .query(&[("search[name]", tag)])
                     .send(),
             )
