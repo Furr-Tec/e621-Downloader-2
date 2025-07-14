@@ -1420,9 +1420,10 @@ impl E621WebConnector {
     }
     
     /// Downloads a collection using the multicore pipeline system
-    fn download_collection_with_pipeline(&mut self, collection_info: &CollectionInfo, config: PipelineConfig) {
+    fn download_collection_with_pipeline(&mut self, collection_info: &CollectionInfo, pipeline_config: PipelineConfig) {
         // Get directory manager
-        let dir_manager = match Config::get().directory_manager() {
+        let config = Config::get();
+        let dir_manager = match config.directory_manager() {
             Ok(manager_ref) => Arc::new(Mutex::new(manager_ref.clone())), // assumes DirectoryManager: Clone
             Err(err) => {
                 error!("Failed to get directory manager from configuration: {}", err);
@@ -1448,21 +1449,21 @@ impl E621WebConnector {
         let mut download_queue = VecDeque::new();
 
         // Thread pool for downloads
-        let download_pool = ThreadPoolBuilder::new()
-            .num_threads(config.download_threads)
+        let _download_pool = ThreadPoolBuilder::new()
+            .num_threads(pipeline_config.download_threads)
             .build()
             .expect("Failed to create download thread pool");
 
         // Thread pool for hashing
-        let hash_pool = ThreadPoolBuilder::new()
-            .num_threads(config.hash_threads)
+        let _hash_pool = ThreadPoolBuilder::new()
+            .num_threads(pipeline_config.hash_threads)
             .build()
             .expect("Failed to create hash thread pool");
 
         // Clone shared variables
-        let progress_bar = self.progress_bar.clone();
-        let request_sender = self.request_sender.clone();
-        let global_progress_counter = Arc::clone(&self.global_progress_counter);
+        let _progress_bar = self.progress_bar.clone();
+        let _request_sender = self.request_sender.clone();
+        let _global_progress_counter = Arc::clone(&self.global_progress_counter);
 
         // Create cloneable functions for the threads
         let download_fn = self.clone_download_fn();
@@ -1470,7 +1471,7 @@ impl E621WebConnector {
         
         // Spawn download threads
         let mut download_handles = Vec::new();
-        for _ in 0..config.download_threads {
+        for _ in 0..pipeline_config.download_threads {
             let download_rx = Arc::clone(&download_rx);
             let completed_tx = completed_tx.clone();
             let download_fn = Arc::clone(&download_fn);
@@ -1518,7 +1519,7 @@ impl E621WebConnector {
 
         // Spawn hashing threads
         let mut hash_handles = Vec::new();
-        for _ in 0..config.hash_threads {
+        for _ in 0..pipeline_config.hash_threads {
             let hash_rx = Arc::clone(&hash_rx);
             let processed_tx = processed_tx.clone();
             let calculate_hash = Arc::clone(&calculate_hash);
@@ -1576,6 +1577,7 @@ impl E621WebConnector {
         }
 
         let progress_bar = self.progress_bar.clone();
+        let global_progress_counter = Arc::clone(&self.global_progress_counter);
 
         // Use a function pointer for stateless remove_invalid_chars
         fn remove_invalid_chars(text: &str) -> String {
@@ -1652,7 +1654,7 @@ impl E621WebConnector {
         info!("Starting pipeline: {} jobs queued for download", download_queue.len());
         
         // Feed initial jobs to download threads
-        for _ in 0..std::cmp::min(config.download_queue_size, download_queue.len()) {
+        for _ in 0..std::cmp::min(pipeline_config.download_queue_size, download_queue.len()) {
             if let Some(job) = download_queue.pop_front() {
                 download_tx.send(job).unwrap();
             }

@@ -148,14 +148,23 @@ impl NewVec<Vec<PostEntry>> for GrabbedPost {
     fn new_vec(vec: Vec<PostEntry>) -> Vec<Self> {
         let binding = Config::get();
         let dir_manager = binding.directory_manager().unwrap();
+        let naming_convention = binding.naming_convention();
+        
+        // Batch check all post IDs at once for O(1) performance
+        let post_ids: Vec<i64> = vec.iter().map(|e| e.id).collect();
+        let duplicate_results = dir_manager.batch_has_post_ids(&post_ids);
+        
+        // Create a lookup map for O(1) duplicate checking
+        let duplicate_map: std::collections::HashMap<i64, bool> = duplicate_results.into_iter().collect();
+        
         vec.into_iter()
             .map(|e| {
-                let mut post = GrabbedPost::from((e.clone(), Config::get().naming_convention()));
+                let mut post = GrabbedPost::from((e.clone(), naming_convention));
                 if let Some(artist_tag) = e.tags.artist.first() {
                     post.set_artist(artist_tag.clone());
                 }
-                // Check if this post ID has been downloaded before
-                let is_duplicate = dir_manager.has_post_id(e.id);
+                // Use the batch-checked result
+                let is_duplicate = duplicate_map.get(&e.id).copied().unwrap_or(false);
                 post.set_is_new(!is_duplicate);
                 post
             })
@@ -168,6 +177,14 @@ impl GrabbedPost {
     pub(crate) fn new_vec_with_artist_ids(vec: Vec<PostEntry>, request_sender: &RequestSender) -> Vec<Self> {
         let binding = Config::get();
         let dir_manager = binding.directory_manager().unwrap();
+        
+        // Batch check all post IDs at once for O(1) performance
+        let post_ids: Vec<i64> = vec.iter().map(|e| e.id).collect();
+        let duplicate_results = dir_manager.batch_has_post_ids(&post_ids);
+        
+        // Create a lookup map for O(1) duplicate checking
+        let duplicate_map: std::collections::HashMap<i64, bool> = duplicate_results.into_iter().collect();
+        
         vec.into_iter()
             .map(|e| {
                 // Generate enhanced filename with artist names and IDs
@@ -191,8 +208,8 @@ impl GrabbedPost {
                     post.set_artist(artist_tag.clone());
                 }
                 
-                // Check if this post ID has been downloaded before
-                let is_duplicate = dir_manager.has_post_id(e.id);
+                // Use the batch-checked result
+                let is_duplicate = duplicate_map.get(&e.id).copied().unwrap_or(false);
                 if is_duplicate {
                     trace!("Post ID {} marked as duplicate (already downloaded)", e.id);
                 } else {
@@ -209,6 +226,14 @@ impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
     fn new_vec((vec, pool_name): (Vec<PostEntry>, &str)) -> Vec<Self> {
         let binding = Config::get();
         let dir_manager = binding.directory_manager().unwrap();
+        
+        // Batch check all post IDs at once for O(1) performance
+        let post_ids: Vec<i64> = vec.iter().map(|e| e.id).collect();
+        let duplicate_results = dir_manager.batch_has_post_ids(&post_ids);
+        
+        // Create a lookup map for O(1) duplicate checking
+        let duplicate_map: std::collections::HashMap<i64, bool> = duplicate_results.into_iter().collect();
+        
         vec.iter()
             .enumerate()
             .map(|(i, e)| {
@@ -216,8 +241,8 @@ impl NewVec<(Vec<PostEntry>, &str)> for GrabbedPost {
                 if let Some(artist_tag) = e.tags.artist.first() {
                     post.set_artist(artist_tag.clone());
                 }
-                // Check if this post ID has been downloaded before  
-                let is_duplicate = dir_manager.has_post_id(e.id);
+                // Use the batch-checked result
+                let is_duplicate = duplicate_map.get(&e.id).copied().unwrap_or(false);
                 post.set_is_new(!is_duplicate);
                 post
             })
@@ -453,9 +478,10 @@ impl Grabber {
         let posts_mutex = Arc::new(Mutex::new(Vec::<PostCollection>::new()));
         let progress_bar_arc = Arc::new(progress_bar);
         
-        // Enhanced thread pool with intelligent sizing and better resource management
-        let cpu_count = std::cmp::min(num_cpus::get(), 8); // Use available CPUs but cap at 8
-        let thread_pool_size = std::cmp::min(std::cmp::max(2, cpu_count / 2), tags.len()); // At least 2, max CPU/2
+        // Enhanced thread pool with half of detected cores for aggressive parallel processing
+        let cpu_count = num_cpus::get();
+        let half_cores = std::cmp::max(1, cpu_count / 2); // Use half of available cores, minimum 1
+        let thread_pool_size = std::cmp::min(half_cores, tags.len()); // Don't exceed number of tags
         
         // Use smaller chunks for better work distribution
         let chunk_size = std::cmp::max(1, tags.len() / (thread_pool_size * 2));
@@ -841,10 +867,11 @@ impl Grabber {
                     grabbed_post.set_artist(artist_tag.clone());
                 }
                 
-                // Check if this post ID has been downloaded before
+                // Check if this post ID has been downloaded before using batch processing
                 let binding = Config::get();
                 let dir_manager = binding.directory_manager().unwrap();
-                let is_duplicate = dir_manager.has_post_id(entry.id);
+                let batch_results = dir_manager.batch_has_post_ids(&[entry.id]);
+                let is_duplicate = batch_results.first().map(|(_, exists)| *exists).unwrap_or(false);
                 grabbed_post.set_is_new(!is_duplicate);
                 let collection = self.single_post_collection();
                 // Add the post first, then initialize directories (which includes duplicate checking)
@@ -1053,6 +1080,11 @@ impl Grabber {
             let mut duplicate_posts_in_batch = 0;
             let mut empty_pages_in_batch = 0;
             
+            // Enhanced progress feedback for post-processing
+            let batch_processing_start = std::time::Instant::now();
+            let total_posts_to_process: usize = batch_results.iter().map(|(_, posts)| posts.len()).sum();
+            let mut processed_posts = 0;
+            
             for (_page, mut searched_posts) in batch_results {
                 if !searched_posts.is_empty() {
                     found_posts_in_batch = true;
@@ -1086,6 +1118,17 @@ impl Grabber {
                             new_posts_in_batch += 1;
                         } else {
                             duplicate_posts_in_batch += 1;
+                        }
+                        
+                        processed_posts += 1;
+                        
+                        // Provide real-time feedback when processing large batches
+                        if total_posts_to_process > 100 && processed_posts % 50 == 0 {
+                            let processing_time = batch_processing_start.elapsed();
+                            let posts_per_second = processed_posts as f64 / processing_time.as_secs_f64();
+                            progress_bar.set_message(format!("processing posts: {}/{} ({:.1} posts/sec, {} new, {} duplicates)", 
+                                                           processed_posts, total_posts_to_process, 
+                                                           posts_per_second, new_posts_in_batch, duplicate_posts_in_batch));
                         }
                     }
                     

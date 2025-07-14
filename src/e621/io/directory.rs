@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::fs::{self, File};
 use sha2::{Sha512, Digest};
 use std::io::Read;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::time::Duration;
 use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 use std::time::Instant;
@@ -14,9 +14,8 @@ use memmap2::Mmap;
 use hex::encode as hex_encode;
 use serde::{Serialize, Deserialize};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use chrono::Utc;
+use dashmap::DashMap;
 use crate::e621::tui::{ProgressBarBuilder, ProgressStyleBuilder};
-use crate::e621::io::file_metadata::{get_file_metadata, file_metadata_changed, FileMeta};
 mod walk; // Declare the walk submodule
 /// Represents a file entry in the hash database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +349,106 @@ impl HashDatabase {
     }
 }
 
+/// Optimized caching structure for fast file lookups
+#[derive(Debug, Clone)]
+struct FileCache {
+    /// Fast filename lookup set
+    filename_cache: DashMap<String, ()>,
+    /// Fast hash lookup map
+    hash_cache: DashMap<String, String>,
+    /// Fast post ID lookup set
+    post_id_cache: DashMap<i64, String>,
+    /// Blacklisted filenames for quick exclusion
+    blacklist_cache: DashMap<String, ()>,
+}
+
+impl FileCache {
+    fn new() -> Self {
+        Self {
+            filename_cache: DashMap::new(),
+            hash_cache: DashMap::new(),
+            post_id_cache: DashMap::new(),
+            blacklist_cache: DashMap::new(),
+        }
+    }
+    
+    /// Rebuild caches from database entries
+    fn rebuild_from_database(&self, database: &HashDatabase, blacklist: &FileBlacklist) {
+        // Clear existing caches
+        self.filename_cache.clear();
+        self.hash_cache.clear();
+        self.post_id_cache.clear();
+        self.blacklist_cache.clear();
+        
+        // Populate filename and hash caches
+        for entry in &database.entries {
+            self.filename_cache.insert(entry.filename.clone(), ());
+            
+            if let Some(ref hash) = entry.hash {
+                self.hash_cache.insert(hash.clone(), entry.filename.clone());
+            }
+            
+            if let Some(post_id) = entry.post_id {
+                self.post_id_cache.insert(post_id, entry.filename.clone());
+            }
+        }
+        
+        // Populate blacklist cache
+        for entry in &blacklist.entries {
+            self.blacklist_cache.insert(entry.filename.clone(), ());
+        }
+    }
+    
+    /// Check if filename exists in cache
+    fn contains_filename(&self, filename: &str) -> bool {
+        self.filename_cache.contains_key(filename)
+    }
+    
+    /// Check if hash exists in cache
+    fn contains_hash(&self, hash: &str) -> bool {
+        self.hash_cache.contains_key(hash)
+    }
+    
+    /// Check if post ID exists in cache
+    fn contains_post_id(&self, post_id: i64) -> bool {
+        self.post_id_cache.contains_key(&post_id)
+    }
+    
+    /// Check if filename is blacklisted
+    fn is_blacklisted(&self, filename: &str) -> bool {
+        self.blacklist_cache.contains_key(filename)
+    }
+    
+    /// Add filename to cache
+    fn add_filename(&self, filename: String) {
+        self.filename_cache.insert(filename, ());
+    }
+    
+    /// Add hash to cache
+    fn add_hash(&self, hash: String, filename: String) {
+        self.hash_cache.insert(hash, filename);
+    }
+    
+    /// Add post ID to cache
+    fn add_post_id(&self, post_id: i64, filename: String) {
+        self.post_id_cache.insert(post_id, filename);
+    }
+    
+    /// Batch check filenames
+    fn batch_contains_filenames(&self, filenames: &[String]) -> Vec<(String, bool)> {
+        filenames.iter()
+            .map(|filename| (filename.clone(), self.contains_filename(filename)))
+            .collect()
+    }
+    
+    /// Batch check post IDs
+    fn batch_contains_post_ids(&self, post_ids: &[i64]) -> Vec<(i64, bool)> {
+        post_ids.iter()
+            .map(|&post_id| (post_id, self.contains_post_id(post_id)))
+            .collect()
+    }
+}
+
 /// Manages the directory structure for downloaded content
 #[derive(Debug, Clone)]
 pub(crate) struct DirectoryManager {
@@ -376,6 +475,11 @@ pub(crate) struct DirectoryManager {
     cached_database: Option<HashDatabase>,
     /// Cached file blacklist for efficient lookups
     cached_blacklist: Option<FileBlacklist>,
+    /// High-performance cache for fast lookups
+    file_cache: FileCache,
+    /// In-memory cache of all downloaded post IDs for instant O(1) lookups
+    /// This dramatically speeds up duplicate detection during post processing
+    post_id_cache: HashSet<i64>,
 }
 
 impl DirectoryManager {
@@ -404,6 +508,8 @@ impl DirectoryManager {
             simplified_folders,
             cached_database: None,
             cached_blacklist: None,
+            file_cache: FileCache::new(),
+            post_id_cache: HashSet::new(),
         };
         
         // Create directory structure first
@@ -419,6 +525,13 @@ impl DirectoryManager {
                     let file_count = db.entries.len();
                     info!("Loaded hash database with {} file entries", file_count);
                     manager.downloaded_files = db.to_hash_set();
+                    
+                    // Populate post_id_cache from database entries for O(1) lookup
+                    manager.post_id_cache = db.entries.iter()
+                        .filter_map(|entry| entry.post_id)
+                        .collect();
+                    trace!("Populated post_id_cache with {} post IDs", manager.post_id_cache.len());
+                    
                     manager.cached_database = Some(db); // Cache the database for efficient lookups
                     loaded_from_db = true;
                 },
@@ -805,7 +918,7 @@ impl DirectoryManager {
             let hash_threads = num_cpus::get();
 
             // Optionally prioritize largest files to maximize core utilization on SSD/NVMe
-            let mut all_files_for_hash = {
+            let all_files_for_hash = {
                 let files_guard = all_files.lock().unwrap();
                 let mut files_vec = files_guard.clone();
                 files_vec.sort_unstable_by_key(|p| {
@@ -830,7 +943,7 @@ impl DirectoryManager {
             let results = Arc::new(Mutex::new(HashSet::new()));
             let progress_bar = &phase2_progress;
             let total_files = all_files_for_hash.len();
-            let mut processed_counter = Arc::new(AtomicUsize::new(0));
+            let processed_counter = Arc::new(AtomicUsize::new(0));
 
             all_files_for_hash.par_chunks(chunk_size).for_each(|chunk| {
                 let counter = Arc::clone(&processed_counter);
@@ -899,10 +1012,53 @@ impl DirectoryManager {
 
         // Check and perform periodic repair if needed
         manager.check_and_perform_periodic_repair()?;
+        
+        // Rebuild cache from loaded database and blacklist
+        manager.rebuild_cache();
 
         Ok(manager)
     }
-
+    
+    /// Rebuild cache from current database and blacklist state
+    fn rebuild_cache(&self) {
+        if let (Some(db), Some(blacklist)) = (&self.cached_database, &self.cached_blacklist) {
+            trace!("Rebuilding FileCache from database ({} entries) and blacklist ({} entries)", 
+                   db.entries.len(), blacklist.entries.len());
+            self.file_cache.rebuild_from_database(db, blacklist);
+            info!("FileCache rebuilt with {} filenames, {} hashes, {} post IDs, {} blacklisted",
+                  self.file_cache.filename_cache.len(),
+                  self.file_cache.hash_cache.len(),
+                  self.file_cache.post_id_cache.len(),
+                  self.file_cache.blacklist_cache.len());
+        } else {
+            warn!("Cannot rebuild cache: database or blacklist not available");
+        }
+    }
+    
+    /// Refreshes the post_id_cache from the current database state
+    /// This should be called after database updates to maintain cache consistency
+    pub(crate) fn refresh_post_id_cache(&mut self) -> Result<()> {
+        trace!("Refreshing post_id_cache from current database state");
+        
+        // Clear the current cache
+        self.post_id_cache.clear();
+        
+        // Reload from database
+        let hash_db = HashDatabase::load(&self.hash_db_path)
+            .with_context(|| "Failed to load hash database for post_id_cache refresh")?;
+        
+        // Populate cache with all post IDs from database entries
+        self.post_id_cache = hash_db.entries.iter()
+            .filter_map(|entry| entry.post_id)
+            .collect();
+        
+        // Update cached database reference
+        self.cached_database = Some(hash_db);
+        
+        info!("Refreshed post_id_cache with {} post IDs from database", self.post_id_cache.len());
+        Ok(())
+    }
+    
     /// Creates the basic directory structure
     fn create_directory_structure(&self) -> Result<()> {
         fs::create_dir_all(&self.root_dir)
@@ -1416,6 +1572,12 @@ impl DirectoryManager {
         // Add to the tracking set for compatibility with existing duplicate checking
         self.downloaded_files.insert((file_name.clone(), hash.clone()));
         
+        // Add post_id to cache if present
+        if let Some(id) = post_id {
+            self.post_id_cache.insert(id);
+            trace!("Added post ID {} to post_id_cache", id);
+        }
+        
         // Load current database, update it, and save
         let mut hash_db = match HashDatabase::load(&self.hash_db_path) {
             Ok(db) => db,
@@ -1429,6 +1591,12 @@ impl DirectoryManager {
         
         if let Err(e) = hash_db.save(&self.hash_db_path) {
             warn!("Failed to update hash database with metadata: {}", e);
+            return; // Exit early if save failed
+        }
+        
+        // Refresh the post_id_cache to ensure consistency with the updated database
+        if let Err(e) = self.refresh_post_id_cache() {
+            warn!("Failed to refresh post_id_cache after database update: {}", e);
         }
     }
     
@@ -1514,81 +1682,89 @@ impl DirectoryManager {
         self.file_exists(file_name)
     }
     
-    /// Batch check if multiple post IDs have been downloaded before
-    /// This method is optimized for checking many post IDs at once
+    /// Batch check if multiple post IDs have been downloaded before using O(1) cache lookup
+    /// This method is optimized for checking many post IDs at once with instant performance
     pub(crate) fn batch_has_post_ids(&self, post_ids: &[i64]) -> Vec<(i64, bool)> {
         let batch_start = Instant::now();
-        trace!("Batch checking {} post IDs in cached hash database", post_ids.len());
+        trace!("Batch checking {} post IDs using O(1) post_id_cache lookup", post_ids.len());
         
         let mut results = Vec::with_capacity(post_ids.len());
         
-        // Use cached database if available
-        if let Some(ref db) = self.cached_database {
-            // Create a HashSet of post IDs from the database for O(1) lookups
-            let mut post_id_set = HashSet::new();
-            
-            // First pass: collect all post IDs from the database
-            for entry in &db.entries {
-                if let Some(stored_post_id) = entry.post_id {
-                    post_id_set.insert(stored_post_id);
-                }
+        // First pass: Check O(1) post_id_cache for all requested IDs
+        for &post_id in post_ids {
+            let found_in_cache = self.post_id_cache.contains(&post_id);
+            results.push((post_id, found_in_cache));
+            if found_in_cache {
+                trace!("Found post ID {} in O(1) post_id_cache", post_id);
             }
+        }
+        
+        // Second pass: For unfound posts, try filename pattern fallback
+        let unfound_posts: Vec<i64> = results.iter()
+            .filter_map(|(id, found)| if !found { Some(*id) } else { None })
+            .collect();
             
-            // Second pass: Check each requested post ID
-            for &post_id in post_ids {
-                let found = post_id_set.contains(&post_id);
-                results.push((post_id, found));
-                if found {
-                    trace!("Found post ID {} in cached database", post_id);
-                }
-            }
+        if !unfound_posts.is_empty() {
+            trace!("Performing filename fallback check for {} posts not found in post_id_cache", unfound_posts.len());
             
-            // If we didn't find all posts using direct post_id lookup, try filename fallback
-            let mut unfound_posts: Vec<i64> = results.iter()
-                .filter_map(|(id, found)| if !found { Some(*id) } else { None })
-                .collect();
+            // Use cached database for filename fallback if available
+            if let Some(ref db) = self.cached_database {
+                // Create optimized lookup maps for O(1) post ID searches
+                // This avoids O(n*m) nested loop performance issues
+                let mut post_id_filename_map: HashMap<i64, &str> = HashMap::new();
                 
-            if !unfound_posts.is_empty() {
-                trace!("Performing filename fallback check for {} posts", unfound_posts.len());
-                
-                // Create lookup sets for filename patterns
-                let mut filename_set = HashSet::new();
+                // Build reverse lookup map for post IDs found in filenames
                 for entry in &db.entries {
-                    filename_set.insert(entry.filename.as_str());
+                    let filename = &entry.filename;
+                    
+                    // Extract post ID from filename patterns
+                    if let Some(post_id) = extract_post_id_from_filename(filename) {
+                        post_id_filename_map.insert(post_id, filename);
+                    }
                 }
                 
-                // Check filename patterns for unfound posts
+                // O(1) lookup for each unfound post ID
+                for &post_id in &unfound_posts {
+                    if let Some(filename) = post_id_filename_map.get(&post_id) {
+                        trace!("Found post ID {} via filename pattern in {} (O(1) lookup)", post_id, filename);
+                        
+                        // Update result if found via filename
+                        if let Some(result) = results.iter_mut().find(|(id, _)| *id == post_id) {
+                            result.1 = true;
+                        }
+                    }
+                }
+            } else {
+                // Final fallback using downloaded_files if no cached database
+                warn!("No cached database available, using downloaded_files fallback for {} unfound posts", unfound_posts.len());
                 for &post_id in &unfound_posts {
                     let post_id_str = post_id.to_string();
                     let mut found = false;
                     
-                    // Check for ID naming: "12345.jpg" patterns
-                    for filename in &filename_set {
-                        if filename.starts_with(&format!("{}.", post_id_str)) ||
+                    for (filename, _) in &self.downloaded_files {
+                        if filename.starts_with(&format!("{}.", post_id_str)) || 
                            filename.contains(&format!("_{}.", post_id_str)) {
                             found = true;
-                            trace!("Found post ID {} via filename pattern in {}", post_id, filename);
+                            trace!("Found post ID {} in filename {} (downloaded_files fallback)", post_id, filename);
                             break;
                         }
                     }
                     
-                    // Update result
-                    if let Some(result) = results.iter_mut().find(|(id, _)| *id == post_id) {
-                        result.1 = found;
+                    if found {
+                        if let Some(result) = results.iter_mut().find(|(id, _)| *id == post_id) {
+                            result.1 = true;
+                        }
                     }
                 }
-            }
-        } else {
-            // Fallback to individual checks if cache is not available
-            warn!("Cached database not available, falling back to individual checks for {} posts", post_ids.len());
-            for &post_id in post_ids {
-                let found = self.has_post_id(post_id);
-                results.push((post_id, found));
             }
         }
         
         let batch_duration = batch_start.elapsed();
-        trace!("Batch post ID check completed in {:.2?} for {} posts", batch_duration, post_ids.len());
+        let found_count = results.iter().filter(|(_, found)| *found).count();
+        trace!("Batch post ID check completed in {:.2?} for {} posts ({} found, {} via cache, {} via fallback)", 
+               batch_duration, post_ids.len(), found_count, 
+               post_ids.len() - unfound_posts.len(), 
+               found_count - (post_ids.len() - unfound_posts.len()));
         
         results
     }
@@ -1616,94 +1792,50 @@ impl DirectoryManager {
         results
     }
     
-    /// Checks if a post ID has been downloaded before by checking the cached hash database
-    /// This method uses the cached database for efficient lookups
+    /// Checks if a post ID has been downloaded before using O(1) cache lookup
+    /// This method uses the in-memory post_id_cache for instant duplicate detection
     pub(crate) fn has_post_id(&self, post_id: i64) -> bool {
-        trace!("Checking if post ID {} exists in cached hash database", post_id);
+        trace!("Checking if post ID {} exists using O(1) cache lookup", post_id);
         
-        // Use cached database if available
+        // First check the O(1) post_id_cache
+        if self.post_id_cache.contains(&post_id) {
+            trace!("Found post ID {} in O(1) post_id_cache", post_id);
+            return true;
+        }
+        
+        // Fallback: Check filenames for post IDs (for backwards compatibility with files without post_id metadata)
         if let Some(ref db) = self.cached_database {
-            // Check if any entry has this post ID
-            for entry in &db.entries {
-                if let Some(stored_post_id) = entry.post_id {
-                    if stored_post_id == post_id {
-                        trace!("Found post ID {} in cached database for filename {}", post_id, entry.filename);
-                        return true;
-                    }
-                }
-            }
-            
-            // Fallback: Check filenames for post IDs (for backwards compatibility)
             let post_id_str = post_id.to_string();
             for entry in &db.entries {
                 let filename = &entry.filename;
                 
                 // 1. ID naming: "12345.jpg"
                 if filename.starts_with(&format!("{}.", post_id_str)) {
-                    trace!("Found post ID {} in filename {} (ID naming convention) - cached database fallback", post_id, filename);
+                    trace!("Found post ID {} in filename {} (ID naming convention) - filename fallback", post_id, filename);
                     return true;
                 }
                 
                 // 2. Enhanced naming: "artist_12345.jpg" or "artist1+artist2_12345.jpg"
                 if filename.contains(&format!("_{}.", post_id_str)) {
-                    trace!("Found post ID {} in filename {} (enhanced naming convention) - cached database fallback", post_id, filename);
+                    trace!("Found post ID {} in filename {} (enhanced naming convention) - filename fallback", post_id, filename);
                     return true;
                 }
             }
-            
-            trace!("Post ID {} not found in cached hash database", post_id);
-            false
         } else {
-            // Fallback to loading from disk if cache is not available
-            warn!("Cached database not available, falling back to disk read for post ID {}", post_id);
-            match HashDatabase::load(&self.hash_db_path) {
-                Ok(db) => {
-                    // Check if any entry has this post ID
-                    for entry in &db.entries {
-                        if let Some(stored_post_id) = entry.post_id {
-                            if stored_post_id == post_id {
-                                trace!("Found post ID {} in database for filename {}", post_id, entry.filename);
-                                return true;
-                            }
-                        }
-                    }
-                    
-                    // Fallback: Check filenames for post IDs (for backwards compatibility)
-                    let post_id_str = post_id.to_string();
-                    for entry in &db.entries {
-                        let filename = &entry.filename;
-                        
-                        // 1. ID naming: "12345.jpg"
-                        if filename.starts_with(&format!("{}.", post_id_str)) {
-                            trace!("Found post ID {} in filename {} (ID naming convention) - database fallback", post_id, filename);
-                            return true;
-                        }
-                        
-                        // 2. Enhanced naming: "artist_12345.jpg" or "artist1+artist2_12345.jpg"
-                        if filename.contains(&format!("_{}.", post_id_str)) {
-                            trace!("Found post ID {} in filename {} (enhanced naming convention) - database fallback", post_id, filename);
-                            return true;
-                        }
-                    }
-                    
-                    trace!("Post ID {} not found in hash database", post_id);
-                    false
-                },
-                Err(e) => {
-                    warn!("Failed to load hash database for post ID check: {}", e);
-                    // Final fallback to the old method using downloaded_files HashSet
-                    let post_id_str = post_id.to_string();
-                    for (filename, _) in &self.downloaded_files {
-                        if filename.starts_with(&format!("{}.", post_id_str)) || 
-                           filename.contains(&format!("_{}.", post_id_str)) {
-                            trace!("Found post ID {} in filename {} (fallback method)", post_id, filename);
-                            return true;
-                        }
-                    }
-                    false
+            // Final fallback if no cache is available
+            warn!("No cached database available, using downloaded_files fallback for post ID {}", post_id);
+            let post_id_str = post_id.to_string();
+            for (filename, _) in &self.downloaded_files {
+                if filename.starts_with(&format!("{}.", post_id_str)) || 
+                   filename.contains(&format!("_{}.", post_id_str)) {
+                    trace!("Found post ID {} in filename {} (downloaded_files fallback)", post_id, filename);
+                    return true;
                 }
             }
         }
+        
+        trace!("Post ID {} not found in any cache or fallback method", post_id);
+        false
     }
     
     /// An iterative version of is_duplicate that avoids deep recursive calls
@@ -1861,6 +1993,47 @@ impl DirectoryManager {
         
         Ok(matching_files)
     }
+}
+
+/// Extract post ID from filename using various naming conventions
+/// This is a standalone function for use in optimized lookups
+fn extract_post_id_from_filename(filename: &str) -> Option<i64> {
+    // Remove path separator and get just the filename
+    let filename = filename.split(['/', '\\']).last().unwrap_or(filename);
+    
+    // Try different naming conventions:
+    
+    // 1. Enhanced naming: "artist_123456.jpg" or "artist1+artist2_123456.jpg"
+    if let Some(underscore_pos) = filename.rfind('_') {
+        let after_underscore = &filename[underscore_pos + 1..];
+        if let Some(dot_pos) = after_underscore.find('.') {
+            let id_part = &after_underscore[..dot_pos];
+            if let Ok(post_id) = id_part.parse::<i64>() {
+                return Some(post_id);
+            }
+        }
+    }
+    
+    // 2. ID-only naming: "123456.jpg"
+    if let Some(dot_pos) = filename.find('.') {
+        let id_part = &filename[..dot_pos];
+        if let Ok(post_id) = id_part.parse::<i64>() {
+            return Some(post_id);
+        }
+    }
+    
+    // 3. Pool naming: "Pool_Name Page_00123.jpg" - extract from "Page_" prefix
+    if let Some(page_pos) = filename.find("Page_") {
+        let after_page = &filename[page_pos + 5..];
+        if let Some(dot_pos) = after_page.find('.') {
+            let _page_part = &after_page[..dot_pos];
+            // This is a page number, not a post ID - we can't recover post ID from this
+            return None;
+        }
+    }
+    
+    // 4. MD5 naming: "abcdef123456.jpg" - can't recover post ID from MD5
+    None
 }
 
 /// Sanitizes a filename to be safe for use in file systems
