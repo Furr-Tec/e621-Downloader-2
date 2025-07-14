@@ -128,7 +128,13 @@ pub fn record_cache_miss(operation: &str) {
 
 /// Get performance summary
 pub fn get_performance_summary() -> HashMap<String, PerformanceMetrics> {
-    PERFORMANCE_TRACKER.lock().unwrap().clone()
+    match PERFORMANCE_TRACKER.lock() {
+        Ok(tracker) => tracker.clone(),
+        Err(e) => {
+            log::error!("Failed to acquire performance tracker lock: {}", e);
+            HashMap::new()
+        }
+    }
 }
 
 /// Print performance summary

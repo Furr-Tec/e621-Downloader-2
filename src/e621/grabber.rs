@@ -1330,8 +1330,8 @@ impl Grabber {
         self.search(tag.name(), tag.search_type())
     }
 
-    fn single_post_collection(&mut self) -> &mut PostCollection {
-        self.posts.first_mut().expect("No single post collection found")
+    fn single_post_collection(&mut self) -> Option<&mut PostCollection> {
+        self.posts.first_mut()
     }
 
     fn add_single_post(&mut self, entry: PostEntry, id: i64) {
@@ -1378,12 +1378,19 @@ impl Grabber {
                 let batch_results = dir_manager.batch_has_post_ids(&[entry.id]);
                 let is_duplicate = batch_results.first().map(|(_, exists)| *exists).unwrap_or(false);
                 grabbed_post.set_is_new(!is_duplicate);
-                let collection = self.single_post_collection();
-                // Add the post first, then initialize directories (which includes duplicate checking)
-                collection.posts.push(grabbed_post);
-                if let Err(e) = collection.initialize_directories() {
-                    error!("Failed to initialize directories for single post: {}", e);
-                    emergency_exit("Directory initialization failed");
+                match self.single_post_collection() {
+                    Some(collection) => {
+                        // Add the post first, then initialize directories (which includes duplicate checking)
+                        collection.posts.push(grabbed_post);
+                        if let Err(e) = collection.initialize_directories() {
+                            error!("Failed to initialize directories for single post: {}", e);
+                            emergency_exit("Directory initialization failed");
+                        }
+                    }
+                    None => {
+                        error!("No single post collection available");
+                        return;
+                    }
                 }
                 info!(
                     "Post with ID {} grabbed!",

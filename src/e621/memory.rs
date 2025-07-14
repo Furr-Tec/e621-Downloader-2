@@ -42,7 +42,21 @@ impl MemoryManager {
             }
         }
 
-        let system = self.system.lock().unwrap();
+        let system = match self.system.lock() {
+            Ok(sys) => sys,
+            Err(e) => {
+                log::error!("Failed to acquire system lock for memory info: {}", e);
+                // Return default values when unable to get system info
+                return MemoryInfo {
+                    total_kb: 0,
+                    used_kb: 0,
+                    available_kb: 0,
+                    usage_percentage: 0.0,
+                    warning_threshold: self.warning_threshold,
+                    critical_threshold: self.critical_threshold,
+                };
+            }
+        };
         let total_memory = system.total_memory();
         let used_memory = system.used_memory();
         let available_memory = system.available_memory();

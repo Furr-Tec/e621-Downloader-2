@@ -87,10 +87,30 @@ impl ResponseCache {
     
     /// Create a new response cache with custom configuration
     pub fn with_config(config: CacheConfig) -> Self {
+        use std::num::NonZeroUsize;
+        
         Self {
-            post_cache: Arc::new(RwLock::new(LruCache::new(config.max_post_cache_size.try_into().unwrap()))),
-            tag_cache: Arc::new(RwLock::new(LruCache::new(config.max_tag_cache_size.try_into().unwrap()))),
-            alias_cache: Arc::new(RwLock::new(LruCache::new(config.max_alias_cache_size.try_into().unwrap()))),
+            post_cache: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(config.max_post_cache_size)
+                    .unwrap_or_else(|| {
+                        log::warn!("Invalid post cache size {}, defaulting to 1000", config.max_post_cache_size);
+                        NonZeroUsize::new(1000).expect("1000 is always a valid non-zero usize")
+                    })
+            ))),
+            tag_cache: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(config.max_tag_cache_size)
+                    .unwrap_or_else(|| {
+                        log::warn!("Invalid tag cache size {}, defaulting to 500", config.max_tag_cache_size);
+                        NonZeroUsize::new(500).expect("500 is always a valid non-zero usize")
+                    })
+            ))),
+            alias_cache: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(config.max_alias_cache_size)
+                    .unwrap_or_else(|| {
+                        log::warn!("Invalid alias cache size {}, defaulting to 200", config.max_alias_cache_size);
+                        NonZeroUsize::new(200).expect("200 is always a valid non-zero usize")
+                    })
+            ))),
             duplicate_cache: Arc::new(DashMap::new()),
             post_id_cache: Arc::new(DashMap::new()),
             config,

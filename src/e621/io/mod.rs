@@ -5,7 +5,7 @@ use std::io;
 use std::path::Path;
 use std::process::exit;
 
-use anyhow::Error;
+use anyhow::{Context, Error};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty};
@@ -129,8 +129,23 @@ impl Config {
 
     /// Get the global instance of the `Config`.
     pub(crate) fn get() -> Config {
-        let config_lock = CONFIG.get_or_init(|| RwLock::new(Self::get_config().unwrap()));
-        config_lock.read().unwrap().clone()
+        let config_lock = CONFIG.get_or_init(|| {
+            match Self::get_config() {
+                Ok(config) => RwLock::new(config),
+                Err(e) => {
+                    error!("Failed to load config: {}", e);
+                    emergency_exit("Configuration loading failed");
+                }
+            }
+        });
+        match config_lock.read() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                warn!("Failed to acquire read lock on config: {}. Recovering lock.", e);
+                let guard = e.into_inner();
+                guard.clone()
+            }
+        }
     }
 
     /// Updates the maximum pages to search and saves to config file
@@ -151,7 +166,15 @@ impl Config {
         write(Path::new(CONFIG_NAME), json)?;
         
         // Update the cached CONFIG in memory
-        let config_lock = CONFIG.get_or_init(|| RwLock::new(Self::get_config().unwrap()));
+        let config_lock = CONFIG.get_or_init(|| {
+            match Self::get_config() {
+                Ok(config) => RwLock::new(config),
+                Err(e) => {
+                    error!("Failed to load config: {}", e);
+                    emergency_exit("Configuration loading failed");
+                }
+            }
+        });
         if let Ok(mut cached_config) = config_lock.write() {
             *cached_config = config;
         }
@@ -194,7 +217,9 @@ impl Config {
 
     /// Loads and returns `config` for quick management and settings.
     fn get_config() -> Result<Self, Error> {
-        let mut config: Config = from_str(&read_to_string(CONFIG_NAME).unwrap())?;
+        let config_contents = read_to_string(CONFIG_NAME)
+            .with_context(|| format!("Failed to read config file: {}", CONFIG_NAME))?;
+        let mut config: Config = from_str(&config_contents)?;
         config.naming_convention = config.naming_convention.to_lowercase();
         let convention = ["md5", "id"];
         if !convention

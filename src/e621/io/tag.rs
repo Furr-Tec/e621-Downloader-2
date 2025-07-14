@@ -157,15 +157,14 @@ impl Group {
 ///
 /// returns: Result<Vec<Group>, Error>
 pub(crate) fn parse_tag_file(request_sender: &RequestSender) -> Result<Vec<Group>, Error> {
+    let file_contents = read_to_string(TAG_NAME)
+        .with_context(|| {
+            error!("Unable to read tag file!");
+            "Possible I/O block when trying to read tag file..."
+        })?;
+    
     TagParser {
-        parser: BaseParser::new(
-            read_to_string(TAG_NAME)
-                .with_context(|| {
-                    error!("Unable to read tag file!");
-                    "Possible I/O block when trying to read tag file..."
-                })
-                .unwrap(),
-        ),
+        parser: BaseParser::new(file_contents),
         request_sender: request_sender.clone(),
     }
     .parse_groups()

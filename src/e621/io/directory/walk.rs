@@ -57,12 +57,19 @@ pub fn walk_directories_parallel(
                             if path.is_file() {
                                 entry_batch.push(path.to_path_buf());
 
-                                if entry_batch.len() >= WALK_BATCH_SIZE {
-                                    let batch_len = entry_batch.len();
-                                    files_clone.lock().unwrap().extend(entry_batch.drain(..));
-                                    let new_count = count_clone.fetch_add(batch_len, Ordering::SeqCst) + batch_len;
-                                    progress_clone.set_position(new_count as u64);
-                                }
+if entry_batch.len() >= WALK_BATCH_SIZE {
+    let batch_len = entry_batch.len();
+    match files_clone.lock() {
+        Ok(mut files) => files.extend(entry_batch.drain(..)),
+        Err(e) => {
+            warn!("Failed to acquire lock for file batch: {}. Recovering lock.", e);
+            let mut files = e.into_inner();
+            files.extend(entry_batch.drain(..));
+        }
+    }
+    let new_count = count_clone.fetch_add(batch_len, Ordering::SeqCst) + batch_len;
+    progress_clone.set_position(new_count as u64);
+}
                             }
                         }
                         Err(err) => {
@@ -71,13 +78,20 @@ pub fn walk_directories_parallel(
                     }
                 }
 
-                // Process any remaining entries in the batch
-                if !entry_batch.is_empty() {
-                    let batch_len = entry_batch.len();
-                    files_clone.lock().unwrap().extend(entry_batch);
-                    let new_count = count_clone.fetch_add(batch_len, Ordering::SeqCst) + batch_len;
-                    progress_clone.set_position(new_count as u64);
-                }
+// Process any remaining entries in the batch
+if !entry_batch.is_empty() {
+    let batch_len = entry_batch.len();
+    match files_clone.lock() {
+        Ok(mut files) => files.extend(entry_batch),
+        Err(e) => {
+            warn!("Failed to acquire lock for final batch: {}. Recovering lock.", e);
+            let mut files = e.into_inner();
+            files.extend(entry_batch);
+        }
+    }
+    let new_count = count_clone.fetch_add(batch_len, Ordering::SeqCst) + batch_len;
+    progress_clone.set_position(new_count as u64);
+}
                  let final_count = count_clone.load(Ordering::SeqCst);
                  progress_clone.set_message(format!("{} scan complete. Found {} files total.", section_name, final_count));
             });

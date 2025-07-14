@@ -133,7 +133,9 @@ impl WhitelistCache {
 
     /// Create a new whitelist cache with custom configuration
     pub fn with_config(config: WhitelistCacheConfig) -> Self {
-        let cache_size = NonZeroUsize::new(config.max_entries).unwrap_or(NonZeroUsize::new(1000).unwrap());
+        let cache_size = NonZeroUsize::new(config.max_entries)
+            .unwrap_or_else(|| NonZeroUsize::new(1000)
+                .expect("1000 is always a valid non-zero usize"));
         
         let cache = Self {
             cache: Arc::new(RwLock::new(LruCache::new(cache_size))),
@@ -346,12 +348,16 @@ impl WhitelistCache {
         for (_key, cached) in cache.iter() {
             total_access_count += cached.access_count;
             
-            if oldest_entry.is_none() || cached.created_at < oldest_entry.unwrap() {
-                oldest_entry = Some(cached.created_at);
+            match oldest_entry {
+                None => oldest_entry = Some(cached.created_at),
+                Some(oldest) if cached.created_at < oldest => oldest_entry = Some(cached.created_at),
+                _ => {}
             }
             
-            if newest_entry.is_none() || cached.created_at > newest_entry.unwrap() {
-                newest_entry = Some(cached.created_at);
+            match newest_entry {
+                None => newest_entry = Some(cached.created_at),
+                Some(newest) if cached.created_at > newest => newest_entry = Some(cached.created_at),
+                _ => {}
             }
         }
         

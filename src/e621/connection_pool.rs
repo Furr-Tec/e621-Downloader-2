@@ -393,7 +393,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_pool_creation() {
-        let pool = ConnectionPool::new().unwrap();
+        let pool = match ConnectionPool::new() {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create connection pool: {}", e),
+        };
         let stats = pool.get_stats();
         
         assert_eq!(stats.total_requests, 0);
@@ -402,18 +405,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_host_extraction() {
-        let pool = ConnectionPool::new().unwrap();
+        let pool = match ConnectionPool::new() {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create connection pool: {}", e),
+        };
         
-        let host = pool.extract_host("https://example.com/path").unwrap();
+        let host = match pool.extract_host("https://example.com/path") {
+            Some(h) => h,
+            None => panic!("Failed to extract host from URL"),
+        };
         assert_eq!(host, "example.com");
         
-        let host = pool.extract_host("https://api.example.com:8080/v1/data").unwrap();
+        let host = match pool.extract_host("https://api.example.com:8080/v1/data") {
+            Some(h) => h,
+            None => panic!("Failed to extract host from URL"),
+        };
         assert_eq!(host, "api.example.com");
     }
 
     #[tokio::test]
     async fn test_stats_tracking() {
-        let pool = ConnectionPool::new().unwrap();
+        let pool = match ConnectionPool::new() {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create connection pool: {}", e),
+        };
         
         // Simulate request tracking
         pool.track_request_start("example.com");
@@ -427,7 +442,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_efficiency_metrics() {
-        let pool = ConnectionPool::new().unwrap();
+        let pool = match ConnectionPool::new() {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create connection pool: {}", e),
+        };
         
         // Simulate some requests
         pool.track_request_start("example.com");

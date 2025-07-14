@@ -190,7 +190,10 @@ impl BlacklistParser {
                 let score = self.base_parser.consume_while(valid_score);
                 token.tag_type = TagType::Score(
                     ordering,
-                    score.parse::<i32>().unwrap(),
+                    score.parse::<i32>().unwrap_or_else(|e| {
+                        error!("Failed to parse score '{}': {}", score, e);
+                        0 // Default to 0 on parse error
+                    }),
                 );
             }
             _ => {
@@ -443,13 +446,13 @@ impl FlagWorker {
                     }
                 }
                 TagType::User(_) => {
-                    let user_id = tag
-                        .name
-                        .parse::<i64>()
-                        .with_context(|| {
-                            format!("Failed to parse blacklisted user id: {}!", tag.name)
-                        })
-                        .unwrap();
+                    let user_id = match tag.name.parse::<i64>() {
+                        Ok(id) => id,
+                        Err(e) => {
+                            error!("Failed to parse blacklisted user id '{}': {}", tag.name, e);
+                            continue; // Skip this tag if we can't parse the user ID
+                        }
+                    };
                     self.flag_user(user_id, post.uploader_id, tag.negated);
                 }
                 TagType::Score(ordering, score) => {

@@ -100,10 +100,22 @@ fn initialize_logger() {
     config.add_filter_allow_str("e621_downloader");
     
     // Use buffered file writer for better reliability and performance
-    let buffered_file_writer = BufferedFileWriter::new()
-        .expect("Failed to create buffered file writer");
+    let buffered_file_writer = match BufferedFileWriter::new() {
+        Ok(writer) => writer,
+        Err(e) => {
+            eprintln!("Failed to create buffered file writer: {}. Logging will only output to terminal.", e);
+            // Continue with only terminal logging
+            let _ = TermLogger::init(
+                LevelFilter::Info,
+                Config::default(),
+                TerminalMode::Mixed,
+                ColorChoice::Auto,
+            );
+            return;
+        }
+    };
     
-    CombinedLogger::init(vec![
+    if let Err(e) = CombinedLogger::init(vec![
         TermLogger::new(
             LevelFilter::Info,
             Config::default(),
@@ -115,8 +127,15 @@ fn initialize_logger() {
             config.build(),
             buffered_file_writer,
         ),
-    ])
-    .unwrap();
+    ]) {
+        eprintln!("Failed to initialize combined logger: {}. Falling back to terminal-only logging.", e);
+        let _ = TermLogger::init(
+            LevelFilter::Info,
+            Config::default(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        );
+    }
 }
 
 /// Sets up graceful shutdown handling to ensure logs are flushed on exit

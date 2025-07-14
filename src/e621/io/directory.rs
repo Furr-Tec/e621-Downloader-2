@@ -1029,10 +1029,19 @@ let mut results_guard = match results.lock() {
                 }
             });
                 
-            let files = Arc::try_unwrap(results)
-                .expect("Failed to unwrap Arc")
-                .into_inner()
-                .expect("Failed to unwrap Mutex");
+            let files = match Arc::try_unwrap(results) {
+                Ok(mutex) => match mutex.into_inner() {
+                    Ok(files) => files,
+                    Err(e) => {
+                        error!("Failed to get files from Mutex: {}", e);
+                        return Err(anyhow!("Failed to extract files from thread pool results"));
+                    }
+                },
+                Err(_) => {
+                    error!("Failed to unwrap Arc - references still exist");
+                    return Err(anyhow!("Failed to unwrap Arc containing scan results"));
+                }
+            };
             
             let total_time = scan_start.elapsed();
             let speed = if total_time.as_secs() > 0 { files.len() as u64 / total_time.as_secs().max(1) } else { files.len() as u64 };

@@ -74,7 +74,13 @@ impl BaseParser {
     /// Returns current char and pushes `self.pos` to the next char.
     pub(crate) fn consume_char(&mut self) -> char {
         let mut iter = self.get_current_input().char_indices();
-        let (_, cur_char) = iter.next().unwrap();
+        let (_, cur_char) = match iter.next() {
+            Some(char_data) => char_data,
+            None => {
+                error!("Attempted to consume character at EOF (pos: {}, len: {})", self.pos, self.input.len());
+                emergency_exit("Parser error: Attempted to consume character at EOF");
+            }
+        };
         let (next_pos, next_char) = iter.next().unwrap_or((1, ' '));
 
         // If next char is a newline, increment the column count.
@@ -88,7 +94,13 @@ impl BaseParser {
 
     /// Read the current char without consuming it.
     pub(crate) fn next_char(&mut self) -> char {
-        self.get_current_input().chars().next().unwrap()
+        match self.get_current_input().chars().next() {
+            Some(ch) => ch,
+            None => {
+                error!("Attempted to read character at EOF (pos: {}, len: {})", self.pos, self.input.len());
+                emergency_exit("Parser error: Attempted to read character at EOF");
+            }
+        }
     }
 
     /// Checks if the current input starts with the given string.
