@@ -704,8 +704,23 @@ impl Grabber {
         
         // Calculate optimal batch size for concurrent processing
         let cpu_count = num_cpus::get();
-        let optimal_batch_size = std::cmp::min(10, std::cmp::max(4, cpu_count / 4)); // 4-10 tags per batch
-        let concurrent_batches = std::cmp::min(cpu_count / 2, 6); // Up to 6 concurrent batches
+        
+        // For large numbers of tags (like 88), use smaller batches to improve parallelism
+        let optimal_batch_size = if total_tags > 50 {
+            // For many tags, use smaller batches (2-4 tags per batch) to maximize parallelism
+            std::cmp::min(4, std::cmp::max(2, cpu_count / 8))
+        } else {
+            // For fewer tags, use larger batches (4-10 tags per batch)
+            std::cmp::min(10, std::cmp::max(4, cpu_count / 4))
+        };
+        
+        // Scale concurrent batches based on tag count and CPU cores
+        let concurrent_batches = if total_tags > 50 {
+            // For many tags, use more concurrent batch processors
+            std::cmp::min(cpu_count, 12) // Up to 12 concurrent batches for large tag sets
+        } else {
+            std::cmp::min(cpu_count / 2, 6) // Up to 6 concurrent batches for smaller tag sets
+        };
         
         // Create batches of tags for concurrent processing
         let tag_batches: Vec<Vec<&Tag>> = tags.chunks(optimal_batch_size).map(|chunk| chunk.to_vec()).collect();
@@ -810,7 +825,8 @@ impl Grabber {
                         debug!("Batch processor {} starting tag '{}' (index {})", batch_processor_id, tag_name, tag_index);
                         
                         // Stagger tag processing within the batch to respect rate limits
-                        let stagger_delay = Duration::from_millis((tag_index as u64 * 150) + (batch_processor_id as u64 * 50));
+                        // For large tag sets, use shorter delays to improve overall throughput
+                        let stagger_delay = Duration::from_millis((tag_index as u64 * 75) + (batch_processor_id as u64 * 25));
                         thread::sleep(stagger_delay);
                         
                         // Apply rate limiting with timeout protection
@@ -1857,7 +1873,7 @@ impl Grabber {
                     }
                     
                     // Log detailed batch results with cumulative post tracking
-                    info!("Pipeline batch completed: pages {}-{}, found {} posts (raw API responses, {} total raw), {} empty pages, {} total jobs queued so far", 
+                    info!("Pipeline batch completed: pages {}-{}, found {} posts this batch, {} total posts so far, {} empty pages this batch, {} total jobs queued so far", 
                           batch_start, batch_start + threads_spawned as u16 - 1, posts_in_batch, total_posts_found, empty_pages_in_batch, total_jobs_sent);
                     
                     // Log progress summary every few batches
