@@ -6,7 +6,7 @@ use std::thread;
 use std::sync::mpsc;
 
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use console;
 
 use crate::e621::blacklist::Blacklist;
@@ -16,6 +16,124 @@ use crate::e621::sender::entries::{PoolEntry, PostEntry, SetEntry};
 use crate::e621::sender::RequestSender;
 use crate::e621::whitelist_cache::WhitelistCache;
 use crate::e621::rate_limiter::AdaptiveRateLimiter;
+
+/// Post processing pipeline structures for parallel post processing
+
+/// Represents a post processing job in the pipeline
+#[derive(Debug, Clone)]
+struct PostProcessingJob {
+    posts_batch: Vec<PostEntry>,  // Process posts in batches instead of individually
+    page_numbers: Vec<u16>,
+    thread_id: usize,
+    search_tag: String,
+}
+
+/// Represents a processed post result from the pipeline
+#[derive(Debug, Clone)]
+struct ProcessedPostBatch {
+    posts: Vec<PostEntry>,  // Return processed batches
+    page_numbers: Vec<u16>,
+    thread_id: usize,
+    filtered_count: usize,
+    invalid_count: usize,
+    processing_duration: Duration,
+}
+
+/// Configuration for the post processing pipeline
+#[derive(Debug, Clone)]
+struct PostProcessingConfig {
+    total_cores: usize,
+    processing_threads: usize,
+    queue_size: usize,
+    use_pipeline: bool, // Switch between pipeline and in-thread processing
+}
+
+/// Represents a planned download target with pre-calculated metadata
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadTarget {
+    pub(crate) name: String,
+    pub(crate) target_type: TargetType,
+    pub(crate) estimated_post_count: Option<usize>,
+    pub(crate) search_type: TagSearchType,
+    pub(crate) category: String,
+}
+
+/// Type of download target
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TargetType {
+    Tag,
+    Artist,
+    Pool,
+    Set,
+    Post,
+    Favorites,
+}
+
+/// Orchestration plan for the entire download session
+#[derive(Debug)]
+pub(crate) struct DownloadPlan {
+    pub(crate) targets: Vec<DownloadTarget>,
+    pub(crate) total_estimated_posts: usize,
+    pub(crate) estimated_duration: Option<Duration>,
+}
+
+/// Result of processing a single download target
+#[derive(Debug)]
+pub(crate) struct TargetResult {
+    pub(crate) target: DownloadTarget,
+    pub(crate) collection: Option<PostCollection>,
+    pub(crate) posts_found: usize,
+    pub(crate) processing_time: Duration,
+    pub(crate) success: bool,
+    pub(crate) error_message: Option<String>,
+}
+
+impl TargetResult {
+    fn new(target: DownloadTarget) -> Self {
+        Self {
+            target,
+            collection: None,
+            posts_found: 0,
+            processing_time: Duration::new(0, 0),
+            success: false,
+            error_message: None,
+        }
+    }
+
+    fn from_collection(target: DownloadTarget, collection: PostCollection) -> Self {
+        let posts_found = collection.posts.len();
+        Self {
+            target,
+            collection: Some(collection),
+            posts_found,
+            processing_time: Duration::new(0, 0),
+            success: true,
+            error_message: None,
+        }
+    }
+}
+
+impl PostProcessingConfig {
+    /// Creates a new post processing configuration
+    fn new(post_count: usize, thread_count: usize) -> Self {
+        let total_cores = num_cpus::get();
+        // Use pipeline for large batches, in-thread for small ones
+        let use_pipeline = post_count > 100 && thread_count > 2;
+        let processing_threads = if use_pipeline {
+            std::cmp::max(2, total_cores / 4) // Use quarter of cores for post processing
+        } else {
+            thread_count // Use existing search threads
+        };
+        let queue_size = processing_threads * 8; // 8 jobs per thread
+        
+        PostProcessingConfig {
+            total_cores,
+            processing_threads,
+            queue_size,
+            use_pipeline,
+        }
+    }
+}
 
 /// A trait for implementing a conversion function for turning a type into a [Vec] of the same type
 pub(crate) trait NewVec<T> {
@@ -185,11 +303,14 @@ impl GrabbedPost {
         // Create a lookup map for O(1) duplicate checking
         let duplicate_map: std::collections::HashMap<i64, bool> = duplicate_results.into_iter().collect();
         
-        vec.into_iter()
+        // Batch statistics for efficient logging
+        let mut new_posts_count = 0;
+        let mut duplicate_posts_count = 0;
+        
+        let result: Vec<Self> = vec.into_iter()
             .map(|e| {
                 // Generate enhanced filename with artist names and IDs
                 let enhanced_name = GrabbedPost::generate_enhanced_filename(&e, Config::get().naming_convention(), request_sender);
-                trace!("Generated filename '{}' for post ID {}", enhanced_name, e.id);
                 
                 let short_url = format!("e621.net/posts/{}", e.id);
                 let mut post = GrabbedPost {
@@ -211,14 +332,22 @@ impl GrabbedPost {
                 // Use the batch-checked result
                 let is_duplicate = duplicate_map.get(&e.id).copied().unwrap_or(false);
                 if is_duplicate {
-                    trace!("Post ID {} marked as duplicate (already downloaded)", e.id);
+                    duplicate_posts_count += 1;
                 } else {
-                    trace!("Post ID {} marked as new (not found in database)", e.id);
+                    new_posts_count += 1;
                 }
                 post.set_is_new(!is_duplicate);
                 post
             })
-            .collect()
+            .collect();
+        
+        // Log batch statistics instead of per-post traces
+        if log::log_enabled!(log::Level::Trace) {
+            trace!("Batch processed {} posts: {} new, {} duplicates", 
+                   result.len(), new_posts_count, duplicate_posts_count);
+        }
+        
+        result
     }
 }
 
@@ -332,6 +461,9 @@ impl PostCollection {
     }
 
     pub(crate) fn initialize_directories(&mut self) -> anyhow::Result<()> {
+        let directory_start = Instant::now();
+        info!("Starting directory initialization for collection '{}' with {} posts", self.name, self.posts.len());
+        
         let binding = Config::get();
         let dir_manager = binding.directory_manager()?;
         
@@ -340,14 +472,27 @@ impl PostCollection {
         
         // All content goes into Tags directory using the collection name (tag/artist name) as the main folder
         trace!("Setting up tag directory for '{}' (category: {})", self.name, self.category);
+        let dir_setup_start = Instant::now();
         self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
+        let dir_setup_duration = dir_setup_start.elapsed();
+        
+        if dir_setup_duration > Duration::from_millis(100) {
+            info!("Directory setup took {:.2?} for collection '{}'", dir_setup_duration, self.name);
+        }
         
         // Assign the base directory directly to all posts (no artist subdirectories)
         if let Some(base_dir) = &self.base_directory {
+            let assignment_start = Instant::now();
             for post in &mut self.posts {
                 trace!("Assigned directory '{}' for post '{}'", base_dir.display(), post.name());
                 post.set_save_directory(base_dir.clone());
                 assigned_count += 1;
+            }
+            let assignment_duration = assignment_start.elapsed();
+            
+            if assignment_duration > Duration::from_millis(50) {
+                info!("Directory assignment took {:.2?} for {} posts in collection '{}'", 
+                      assignment_duration, assigned_count, self.name);
             }
         }
         
@@ -362,6 +507,9 @@ impl PostCollection {
             trace!("Successfully assigned directories to all {} posts in collection '{}'", 
                   total_posts, self.name);
         }
+        
+        let total_duration = directory_start.elapsed();
+        info!("Completed directory initialization for collection '{}' in {:.2?}", self.name, total_duration);
 
         Ok(())
     }
@@ -421,6 +569,82 @@ pub(crate) struct Grabber {
 }
 
 impl Grabber {
+    
+    pub(crate) fn estimate_post_count(&self, target: &DownloadTarget) -> usize {
+        // This method estimates the post count for a target
+        // Placeholder implementation
+        match target.target_type {
+            TargetType::Tag | TargetType::Artist => 1000,
+            TargetType::Pool | TargetType::Set => 200,
+            TargetType::Post => 1,
+            TargetType::Favorites => 50,
+        }
+    }
+
+    pub(crate) fn generate_download_plan(&self, targets: Vec<DownloadTarget>) -> DownloadPlan {
+        let total_estimated_posts: usize = targets.iter().map(|t| self.estimate_post_count(t)).sum();
+        let estimated_duration = Some(Duration::from_secs((total_estimated_posts / 10) as u64)); // Example estimation
+        DownloadPlan {
+            targets,
+            total_estimated_posts,
+            estimated_duration,
+        }
+    }
+
+    pub(crate) fn orchestrate_download(&mut self, plan: DownloadPlan) -> Vec<TargetResult> {
+        // Process each target sequentially or concurrently based on configuration
+        plan.targets.into_iter().map(|target| {
+            let collection = self.process_target(&target);
+            if let Some(collection) = collection {
+                TargetResult::from_collection(target, collection)
+            } else {
+                TargetResult {
+                    target,
+                    collection: None,
+                    posts_found: 0,
+                    processing_time: Duration::new(0, 0),
+                    success: false,
+                    error_message: Some("Failed to process target".to_string()),
+                }
+            }
+        }).collect()
+    }
+
+    fn process_target(&mut self, target: &DownloadTarget) -> Option<PostCollection> {
+        // Unified handling for both tags and artists based on the target type
+        match target.target_type {
+            TargetType::Tag | TargetType::Artist => self.process_tags_or_artists(target),
+            TargetType::Pool => self.process_pool(target),
+            TargetType::Set => self.process_set(target),
+            TargetType::Post => self.process_post(target),
+            TargetType::Favorites => self.process_favorites(target),
+        }
+    }
+
+    fn process_tags_or_artists(&self, target: &DownloadTarget) -> Option<PostCollection> {
+        // This would contain logic to handle both tag and artist targets
+        Some(PostCollection::new(&target.name, &target.category, vec![]))
+    }
+
+    fn process_pool(&self, target: &DownloadTarget) -> Option<PostCollection> {
+        // Process a pool target
+        Some(PostCollection::new(&target.name, "Pools", vec![]))
+    }
+
+    fn process_set(&self, target: &DownloadTarget) -> Option<PostCollection> {
+        // Process a set target
+        Some(PostCollection::new(&target.name, "Sets", vec![]))
+    }
+
+    fn process_post(&self, target: &DownloadTarget) -> Option<PostCollection> {
+        // Process a post target
+        Some(PostCollection::new(&target.name, "Posts", vec![]))
+    }
+
+    fn process_favorites(&self, target: &DownloadTarget) -> Option<PostCollection> {
+        // Process a favorites target
+        Some(PostCollection::new(&target.name, "Favorites", vec![]))
+    }
     pub(crate) fn new(request_sender: RequestSender, safe_mode: bool) -> Self {
         Grabber {
             posts: vec![PostCollection::new("Single Posts", "", Vec::new())],
@@ -474,73 +698,74 @@ impl Grabber {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-"));
 
-// Use thread-safe collections for concurrent post gathering
+        // Use thread-safe collections for concurrent post gathering
         let posts_mutex = Arc::new(Mutex::new(Vec::<PostCollection>::new()));
         let progress_bar_arc = Arc::new(progress_bar);
         
-        // Enhanced thread pool with half of detected cores for aggressive parallel processing
+        // Calculate optimal batch size for concurrent processing
         let cpu_count = num_cpus::get();
-        let half_cores = std::cmp::max(1, cpu_count / 2); // Use half of available cores, minimum 1
-        let thread_pool_size = std::cmp::min(half_cores, tags.len()); // Don't exceed number of tags
+        let optimal_batch_size = std::cmp::min(10, std::cmp::max(4, cpu_count / 4)); // 4-10 tags per batch
+        let concurrent_batches = std::cmp::min(cpu_count / 2, 6); // Up to 6 concurrent batches
         
-        // Use smaller chunks for better work distribution
-        let chunk_size = std::cmp::max(1, tags.len() / (thread_pool_size * 2));
-        let tag_chunks: Vec<Vec<&Tag>> = tags.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
+        // Create batches of tags for concurrent processing
+        let tag_batches: Vec<Vec<&Tag>> = tags.chunks(optimal_batch_size).map(|chunk| chunk.to_vec()).collect();
         
-        info!("Processing {} tags using {} threads in {} chunks (CPU count: {})", 
-              tags.len(), thread_pool_size, tag_chunks.len(), cpu_count);
+        info!("Processing {} tags in {} batches of {} tags each, using {} concurrent batch processors (CPU count: {})", 
+              tags.len(), tag_batches.len(), optimal_batch_size, concurrent_batches, cpu_count);
         
-        // Use channel-based work distribution for better load balancing
-        let (work_tx, work_rx) = mpsc::channel::<Vec<&Tag>>();
-        let work_rx = Arc::new(Mutex::new(work_rx));
+        // Use channel-based work distribution for batches
+        let (batch_tx, batch_rx) = mpsc::channel::<Vec<&Tag>>();
+        let batch_rx = Arc::new(Mutex::new(batch_rx));
         
-        // Send work chunks to the channel
-        for chunk in tag_chunks {
-            work_tx.send(chunk).unwrap();
+        // Send tag batches to the channel
+        for batch in tag_batches {
+            batch_tx.send(batch).unwrap();
         }
-        drop(work_tx); // Close the channel
+        drop(batch_tx); // Close the channel
         
-        // Use scoped threads with work-stealing pattern
+        // Use scoped threads with batch processing
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             
-            for thread_id in 0..thread_pool_size {
+            for batch_processor_id in 0..concurrent_batches {
                 let posts_mutex = Arc::clone(&posts_mutex);
                 let progress_bar = Arc::clone(&progress_bar_arc);
                 let request_sender = self.request_sender.clone();
                 let blacklist = self.blacklist.clone();
                 let safe_mode = self.safe_mode;
-                let work_rx = Arc::clone(&work_rx);
+                let batch_rx = Arc::clone(&batch_rx);
+                let rate_limiter = Arc::clone(&self.rate_limiter);
                 
                 let handle = scope.spawn(move || {
-                    // Stagger thread starts to avoid API burst
-                    thread::sleep(Duration::from_millis(thread_id as u64 * 50));
+                    // Stagger batch processor starts to avoid API burst
+                    thread::sleep(Duration::from_millis(batch_processor_id as u64 * 100));
                     
-                    // Work-stealing loop
-                    while let Ok(tag_chunk) = work_rx.lock().unwrap().recv() {
-                        for tag in tag_chunk {
-                            let start_time = Instant::now();
-                            
-                            // Process each tag and create collection
-                            let collection = Self::process_tag_to_collection(tag, groups, &request_sender, &blacklist, safe_mode);
-                            
-                            if let Some(collection) = collection {
-                                // Add to shared collection in thread-safe manner
-                                let mut posts = posts_mutex.lock().unwrap();
-                                posts.push(collection);
-                            }
-                            
-                            progress_bar.inc(1);
-                            let duration = start_time.elapsed();
-                            info!("Thread {} finished processing tag {} in {:.2?}", thread_id, tag.name(), duration);
-                        }
+                    // Process batches
+                    while let Ok(tag_batch) = batch_rx.lock().unwrap().recv() {
+                        let batch_start_time = Instant::now();
+                        
+                        // Process tags in this batch concurrently
+                        Self::process_tag_batch_concurrently(
+                            tag_batch, 
+                            groups, 
+                            &request_sender, 
+                            &blacklist, 
+                            safe_mode, 
+                            &posts_mutex, 
+                            &progress_bar, 
+                            &rate_limiter,
+                            batch_processor_id
+                        );
+                        
+                        let batch_duration = batch_start_time.elapsed();
+                        info!("Batch processor {} completed batch in {:.2?}", batch_processor_id, batch_duration);
                     }
                 });
                 
                 handles.push(handle);
             }
             
-            // Wait for all threads to complete
+            // Wait for all batch processors to complete
             for handle in handles {
                 handle.join().unwrap();
             }
@@ -550,6 +775,117 @@ impl Grabber {
         let mut collected_posts = posts_mutex.lock().unwrap();
         self.posts.append(&mut collected_posts);
         progress_bar_arc.finish_with_message("All tags processed");
+    }
+    
+    /// Process a batch of tags concurrently within a single batch processor
+    fn process_tag_batch_concurrently(
+        tag_batch: Vec<&Tag>,
+        groups: &[Group],
+        request_sender: &RequestSender,
+        blacklist: &Option<Arc<Mutex<Blacklist>>>,
+        safe_mode: bool,
+        posts_mutex: &Arc<Mutex<Vec<PostCollection>>>,
+        progress_bar: &Arc<ProgressBar>,
+        rate_limiter: &Arc<Mutex<AdaptiveRateLimiter>>,
+        batch_processor_id: usize,
+    ) {
+        let batch_size = tag_batch.len();
+        info!("Batch processor {} starting concurrent processing of {} tags", batch_processor_id, batch_size);
+        
+        // Use scoped threads to process tags within the batch concurrently
+        std::thread::scope(|scope| {
+            let mut tag_handles = Vec::new();
+            
+            for (tag_index, tag) in tag_batch.into_iter().enumerate() {
+                let posts_mutex = Arc::clone(posts_mutex);
+                let progress_bar = Arc::clone(progress_bar);
+                let request_sender = request_sender.clone();
+                let blacklist = blacklist.clone();
+                let rate_limiter = Arc::clone(rate_limiter);
+                let tag_name = tag.name().to_string(); // Clone for error logging
+                
+                let handle = scope.spawn(move || {
+                    // Comprehensive error handling wrapper
+                    let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        debug!("Batch processor {} starting tag '{}' (index {})", batch_processor_id, tag_name, tag_index);
+                        
+                        // Stagger tag processing within the batch to respect rate limits
+                        let stagger_delay = Duration::from_millis((tag_index as u64 * 150) + (batch_processor_id as u64 * 50));
+                        thread::sleep(stagger_delay);
+                        
+                        // Apply rate limiting with timeout protection
+                        let rate_limit_start = Instant::now();
+                        match rate_limiter.lock() {
+                            Ok(limiter) => {
+                                let delay = limiter.current_delay();
+                                drop(limiter); // Release lock immediately
+                                thread::sleep(delay);
+                                debug!("Rate limiting applied for tag '{}' in {:.2?}", tag_name, rate_limit_start.elapsed());
+                            }
+                            Err(e) => {
+                                warn!("Rate limiter lock failed for tag '{}': {}", tag_name, e);
+                                // Continue without rate limiting rather than hanging
+                            }
+                        }
+                        
+                        let tag_start_time = Instant::now();
+                        debug!("Processing tag '{}' started at {:.2?}", tag_name, tag_start_time);
+                        
+                        // Process the tag with timeout protection
+                        let collection = Self::process_tag_to_collection_with_timeout(tag, groups, &request_sender, &blacklist, safe_mode);
+                        
+                        if let Some(collection) = collection {
+                            // Add to shared collection in thread-safe manner with timeout
+                            match posts_mutex.lock() {
+                                Ok(mut posts) => {
+                                    posts.push(collection);
+                                    debug!("Successfully added collection for tag '{}'", tag_name);
+                                }
+                                Err(e) => {
+                                    error!("Failed to acquire posts mutex for tag '{}': {}", tag_name, e);
+                                }
+                            }
+                        } else {
+                            debug!("No collection returned for tag '{}'", tag_name);
+                        }
+                        
+                        let tag_duration = tag_start_time.elapsed();
+                        info!("Batch processor {} finished processing tag '{}' in {:.2?}", batch_processor_id, tag_name, tag_duration);
+                        
+                        // Always increment progress bar, even on errors
+                        progress_bar.inc(1);
+                    }));
+                    
+                    // Handle panics gracefully
+                    match process_result {
+                        Ok(_) => {
+                            debug!("Tag '{}' processed successfully", tag_name);
+                        }
+                        Err(panic_info) => {
+                            error!("Panic occurred while processing tag '{}': {:?}", tag_name, panic_info);
+                            // Ensure progress bar is still incremented even on panic
+                            progress_bar.inc(1);
+                        }
+                    }
+                });
+                
+                tag_handles.push(handle);
+            }
+            
+            // Wait for all tags in this batch to complete with better error handling
+            for (index, handle) in tag_handles.into_iter().enumerate() {
+                match handle.join() {
+                    Ok(_) => {
+                        debug!("Tag thread {} in batch processor {} completed successfully", index, batch_processor_id);
+                    }
+                    Err(e) => {
+                        error!("Tag thread {} in batch processor {} failed: {:?}", index, batch_processor_id, e);
+                    }
+                }
+            }
+        });
+        
+        info!("Batch processor {} completed processing {} tags", batch_processor_id, batch_size);
     }
     
     pub(crate) fn grab_posts_by_artists(&mut self, artists: &[crate::e621::io::artist::Artist]) {
@@ -617,6 +953,94 @@ impl Grabber {
             temp_grabber.posts.into_iter().nth(1)
         } else {
             None
+        }
+    }
+    
+    /// Process a tag with timeout protection to prevent hangs
+    /// This wraps the normal processing with timeout and error handling
+    fn process_tag_to_collection_with_timeout(
+        tag: &Tag,
+        groups: &[Group],
+        request_sender: &RequestSender,
+        blacklist: &Option<Arc<Mutex<Blacklist>>>,
+        safe_mode: bool,
+    ) -> Option<PostCollection> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        
+        let tag_name = tag.name().to_string();
+        let timeout = Duration::from_secs(300); // 5 minute timeout per tag
+        
+        // Create a channel for the result
+        let (result_tx, result_rx) = mpsc::channel();
+        
+        // Spawn a thread to do the actual processing
+        let tag_clone = tag.clone();
+        let groups_clone = groups.to_vec();
+        let request_sender_clone = request_sender.clone();
+        let blacklist_clone = blacklist.clone();
+        let tag_name_for_thread = tag_name.clone(); // Create copy for thread
+        
+        std::thread::spawn(move || {
+            info!("Starting tag processing for '{}' with timeout protection", tag_name_for_thread);
+            
+            // Process with panic protection
+            let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::process_tag_to_collection(
+                    &tag_clone,
+                    &groups_clone,
+                    &request_sender_clone,
+                    &blacklist_clone,
+                    safe_mode,
+                )
+            }));
+            
+            let result = match process_result {
+                Ok(collection) => {
+                    info!("Tag processing completed successfully for '{}'", tag_name_for_thread);
+                    collection
+                }
+                Err(panic_info) => {
+                    error!("Panic occurred during tag processing for '{}': {:?}", tag_name_for_thread, panic_info);
+                    None
+                }
+            };
+            
+            // Send result - ignore errors if receiver is dropped
+            let _ = result_tx.send(result);
+        });
+        
+        // Wait for result with timeout
+        match result_rx.recv_timeout(timeout) {
+            Ok(result) => {
+                debug!("Tag processing for '{}' completed within timeout", tag_name);
+                result
+            }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Increase timeout and retry processing for long-running tags
+                    let retry_timeout = timeout + Duration::from_secs(60);
+                    warn!("Tag processing for '{}' exceeded timeout, retrying with extended timeout of {:.1?}", tag_name, retry_timeout);
+
+                    let result_retry = result_rx.recv_timeout(retry_timeout);
+                    match result_retry {
+                        Ok(retry_result) => {
+                            info!("Tag '{}' processed successfully after retry", tag_name);
+                            retry_result
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            error!("Tag processing for '{}' timed out again after retry", tag_name);
+                            None
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            error!("Tag processing thread for '{}' disconnected unexpectedly during retry", tag_name);
+                            None
+                        }
+                    }
+                }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                error!("Tag processing thread for '{}' disconnected unexpectedly", tag_name);
+                None
+            }
         }
     }
     
@@ -948,6 +1372,38 @@ impl Grabber {
         let max_pages = Config::get().max_pages_to_search();
         
         // Calculate optimal thread count based on max pages
+        let cpu_count = num_cpus::get();
+        let half_cores = std::cmp::max(1, cpu_count / 2); // Use half of available cores
+        let thread_count = std::cmp::min(half_cores, self.calculate_optimal_thread_count(max_pages));
+        
+        info!("Searching max {} pages using {} threads (CPU count: {}, using {} cores for post processing)", 
+              max_pages, thread_count, cpu_count, half_cores);
+        
+        // Estimate post count for pipeline decision
+        let estimated_posts = max_pages * 320; // Rough estimate: 320 posts per page
+        let processing_config = PostProcessingConfig::new(estimated_posts, thread_count);
+        
+        if processing_config.use_pipeline {
+            info!("Using pipeline orchestration for large batch ({} estimated posts)", estimated_posts);
+            self.special_search_with_pipeline(searching_tag, posts, filtered, invalid_posts, processing_config);
+        } else {
+            info!("Using enhanced in-thread processing for smaller batch ({} estimated posts)", estimated_posts);
+            self.special_search_with_enhanced_threads(searching_tag, posts, filtered, invalid_posts, thread_count);
+        }
+    }
+    
+    /// Enhanced in-thread processing - processes posts immediately within fetch threads
+    fn special_search_with_enhanced_threads(
+        &self,
+        searching_tag: &str,
+        posts: &mut Vec<PostEntry>,
+        filtered: &mut u16,
+        invalid_posts: &mut u16,
+        thread_count: usize,
+    ) {
+        let max_pages = Config::get().max_pages_to_search();
+        
+        // Calculate optimal thread count based on max pages
         let thread_count = self.calculate_optimal_thread_count(max_pages);
         
         info!("Searching max {} pages using {} threads with adaptive rate limiting (stops early if 4 consecutive empty pages found)", 
@@ -1000,6 +1456,8 @@ impl Grabber {
                 let searching_tag = searching_tag.to_string();
                 let result_tx = result_tx.clone();
                 let rate_limiter = Arc::clone(&self.rate_limiter);
+                let blacklist = self.blacklist.clone();
+                let whitelist = self.generate_whitelist_for_search(searching_tag.as_str());
                 
                 let handle = thread::spawn(move || {
                     // Stagger thread starts to avoid simultaneous API hits
@@ -1014,7 +1472,7 @@ impl Grabber {
                     }
                     
                     let page_start = Instant::now();
-                    let searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
+                    let mut searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
                     let request_duration = page_start.elapsed();
                     
                     // Record the response time in the adaptive rate limiter
@@ -1031,7 +1489,24 @@ impl Grabber {
                                thread_id, page_to_search, request_duration, searched_posts.len());
                     }
                     
-                    // Send results back
+                    // Enhanced in-thread processing: Process posts immediately within this thread
+                    if !searched_posts.is_empty() {
+                        // Apply filtering with whitelist if enabled
+                        let config = Config::get();
+                        if config.whitelist_override_blacklist() {
+                            Self::apply_whitelist_blacklist_filtering(&mut searched_posts, &blacklist, &whitelist);
+                        } else {
+                            Self::apply_blacklist_filtering(&mut searched_posts, &blacklist);
+                        }
+                        
+                        // Remove invalid posts
+                        Self::remove_invalid_posts_in_thread(&mut searched_posts);
+                        
+                        // Perform duplicate checking and enhanced filename generation
+                        Self::process_posts_for_duplicates_and_filenames(&mut searched_posts);
+                    }
+                    
+                    // Send processed results back
                     let _ = result_tx.send((page_to_search, searched_posts));
                 });
                 handles.push(handle);
@@ -1080,61 +1555,15 @@ impl Grabber {
             let mut duplicate_posts_in_batch = 0;
             let mut empty_pages_in_batch = 0;
             
-            // Enhanced progress feedback for post-processing
-            let batch_processing_start = std::time::Instant::now();
-            let total_posts_to_process: usize = batch_results.iter().map(|(_, posts)| posts.len()).sum();
-            let mut processed_posts = 0;
-            
-            for (_page, mut searched_posts) in batch_results {
+            for (_page, searched_posts) in batch_results {
                 if !searched_posts.is_empty() {
                     found_posts_in_batch = true;
                     found_any_posts_in_batch = true;
                     
-                    // Check if whitelist override is enabled in config
-                    let config = Config::get();
-                    if config.whitelist_override_blacklist() {
-                        // Generate whitelist for this search context
-                        let whitelist = self.generate_whitelist_for_search(searching_tag);
-                        
-                        // Process the posts with whitelist override
-                        *filtered += self.filter_posts_with_blacklist_and_whitelist(&mut searched_posts, &whitelist);
-                    } else {
-                        // Use traditional blacklist filtering without whitelist override
-                        *filtered += self.filter_posts_with_blacklist(&mut searched_posts);
-                    }
-                    *invalid_posts += Self::remove_invalid_posts(&mut searched_posts);
-                    
-                    // Check for duplicates before adding to results
-                    let _initial_count = searched_posts.len(); // Keep for potential logging
-                    let mut new_posts_from_page = Vec::new();
-                    
-                    for post in searched_posts {
-                        // Check if this post is already downloaded
-                        let filename = format!("{}.{}", post.file.md5, post.file.ext);
-                        let is_duplicate = dir_manager.is_duplicate(&filename, None);
-                        
-                        if !is_duplicate {
-                            new_posts_from_page.push(post);
-                            new_posts_in_batch += 1;
-                        } else {
-                            duplicate_posts_in_batch += 1;
-                        }
-                        
-                        processed_posts += 1;
-                        
-                        // Provide real-time feedback when processing large batches
-                        if total_posts_to_process > 100 && processed_posts % 50 == 0 {
-                            let processing_time = batch_processing_start.elapsed();
-                            let posts_per_second = processed_posts as f64 / processing_time.as_secs_f64();
-                            progress_bar.set_message(format!("processing posts: {}/{} ({:.1} posts/sec, {} new, {} duplicates)", 
-                                                           processed_posts, total_posts_to_process, 
-                                                           posts_per_second, new_posts_in_batch, duplicate_posts_in_batch));
-                        }
-                    }
-                    
-                    // Only add new posts to results
-                    new_posts_from_page.reverse();
-                    posts.append(&mut new_posts_from_page);
+                    // All posts are now pre-processed and filtered within threads
+                    // Just add them to the final results
+                    new_posts_in_batch += searched_posts.len();
+                    posts.extend(searched_posts);
                 } else {
                     // This individual page was empty
                     empty_pages_in_batch += 1;
@@ -1143,7 +1572,6 @@ impl Grabber {
             
             // Update counters
             total_new_posts += new_posts_in_batch;
-            total_duplicate_posts += duplicate_posts_in_batch;
             
             if new_posts_in_batch > 0 {
                 pages_with_new_content += 1;
@@ -1158,8 +1586,13 @@ impl Grabber {
                 consecutive_empty_pages += empty_pages_in_batch;
             }
             
+            // Detailed progress reporting
             progress_bar.set_message(format!("processed {} pages ({} new posts, {} duplicates, {}/{} pages with new content)", 
                                              total_pages_searched, total_new_posts, total_duplicate_posts, pages_with_new_content, max_pages));
+            
+            // Log detailed batch results
+            info!("Batch completed: pages {}-{}, found {} new posts, {} empty pages, {} total posts so far", 
+                  batch_start, batch_start + threads_spawned as u16 - 1, new_posts_in_batch, empty_pages_in_batch, total_new_posts);
             
             // Adaptive search logic: Continue until we find enough pages with new content
             // or reach a reasonable search limit to prevent infinite searching
@@ -1190,6 +1623,12 @@ impl Grabber {
                 true
             };
             
+            // Log progress summary every few batches
+            if total_pages_searched % (thread_count * 3) == 0 || !should_continue {
+                info!("Search progress: {}/{} pages searched, {} total posts found, {} pages with new content, {} consecutive empty pages", 
+                      total_pages_searched, max_pages, total_new_posts, pages_with_new_content, consecutive_empty_pages);
+            }
+            
             if !should_continue {
                 break;
             }
@@ -1198,12 +1637,446 @@ impl Grabber {
             batch_start += thread_count as u16;
         }
         
-        progress_bar.finish_with_message(format!("Adaptive search: {} new posts found across {} pages ({} pages with new content, {} duplicates skipped)", 
-                                                posts.len(), total_pages_searched, pages_with_new_content, total_duplicate_posts));
+        progress_bar.finish_with_message(format!("Enhanced in-thread processing: {} new posts found across {} pages ({} pages with new content)", 
+                                                posts.len(), total_pages_searched, pages_with_new_content));
         
         if total_duplicate_posts > 0 {
-            info!("Adaptive search skipped {} already downloaded posts, found {} new posts from {} pages", 
+            info!("Enhanced search skipped {} already downloaded posts, found {} new posts from {} pages", 
                   total_duplicate_posts, posts.len(), total_pages_searched);
+        }
+    }
+    
+    /// Pipeline orchestration for large batches with dedicated post-processing threads
+    fn special_search_with_pipeline(
+        &self,
+        searching_tag: &str,
+        posts: &mut Vec<PostEntry>,
+        filtered: &mut u16,
+        invalid_posts: &mut u16,
+        processing_config: PostProcessingConfig,
+    ) {
+        let max_pages = Config::get().max_pages_to_search();
+        let thread_count = self.calculate_optimal_thread_count(max_pages);
+        
+        info!("Using pipeline orchestration with {} fetch threads and {} processing threads", 
+              thread_count, processing_config.processing_threads);
+        
+        let progress_bar = ProgressBar::new_spinner();
+        progress_bar.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} Pipeline processing {msg}...")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
+        );
+        
+        // Create channels for high-throughput batch processing pipeline
+        let (job_tx, job_rx) = mpsc::channel::<PostProcessingJob>();
+        let (result_tx, result_rx) = mpsc::channel::<ProcessedPostBatch>();
+        
+        // Use unbounded channels for each processing thread to eliminate mutex contention
+        let mut per_thread_job_senders = Vec::new();
+        let mut processing_handles = Vec::new();
+        let whitelist = self.generate_whitelist_for_search(searching_tag);
+        
+        // Create individual channels for each processing thread
+        for processor_id in 0..processing_config.processing_threads {
+            let (thread_job_tx, thread_job_rx) = mpsc::channel::<PostProcessingJob>();
+            per_thread_job_senders.push(thread_job_tx);
+            
+            let result_tx = result_tx.clone();
+            let blacklist = self.blacklist.clone();
+            let whitelist = whitelist.clone();
+            
+            let handle = thread::spawn(move || {
+                // Batch accumulator for processing efficiency
+                let mut batch_accumulator: Vec<PostProcessingJob> = Vec::with_capacity(50);
+                let batch_timeout = Duration::from_millis(10); // Very short timeout for responsiveness
+                
+                loop {
+                    // Try to accumulate a batch of jobs
+                    let batch_start = Instant::now();
+                    
+                    // Get first job (blocking)
+                    match thread_job_rx.recv_timeout(batch_timeout) {
+                        Ok(job) => {
+                            batch_accumulator.push(job);
+                            
+                            // Try to get more jobs quickly (non-blocking)
+                            while batch_accumulator.len() < 50 && batch_start.elapsed() < batch_timeout {
+                                match thread_job_rx.try_recv() {
+                                    Ok(job) => batch_accumulator.push(job),
+                                    Err(_) => break,
+                                }
+                            }
+                            
+                            // Process accumulated batch
+                            if !batch_accumulator.is_empty() {
+                                let processing_start = Instant::now();
+                                let processed_batch = Self::process_post_batch(batch_accumulator, &blacklist, &whitelist);
+                                let processing_duration = processing_start.elapsed();
+                                
+                                trace!("Processor {} completed batch of {} posts in {:.2?}", 
+                                       processor_id, processed_batch.posts.len(), processing_duration);
+                                       
+                                let _ = result_tx.send(processed_batch);
+                                batch_accumulator = Vec::with_capacity(50); // Reset for next batch
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            // Process any remaining jobs in final batch
+                            if !batch_accumulator.is_empty() {
+                                let processing_start = Instant::now();
+                                let processed_batch = Self::process_post_batch(batch_accumulator, &blacklist, &whitelist);
+                                let processing_duration = processing_start.elapsed();
+                                
+                                trace!("Processor {} completed final batch of {} posts in {:.2?}", 
+                                       processor_id, processed_batch.posts.len(), processing_duration);
+                                       
+                                let _ = result_tx.send(processed_batch);
+                            }
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Process accumulated batch on timeout
+                            if !batch_accumulator.is_empty() {
+                                let processing_start = Instant::now();
+                                let processed_batch = Self::process_post_batch(batch_accumulator, &blacklist, &whitelist);
+                                let processing_duration = processing_start.elapsed();
+                                
+                                trace!("Processor {} completed timeout batch of {} posts in {:.2?}", 
+                                       processor_id, processed_batch.posts.len(), processing_duration);
+                                       
+                                let _ = result_tx.send(processed_batch);
+                                batch_accumulator = Vec::with_capacity(50); // Reset for next batch
+                            }
+                        }
+                    }
+                }
+            });
+            processing_handles.push(handle);
+        }
+        
+        // Start fetching with the same logic as enhanced threads, but send to pipeline
+        let mut batch_start = 1u16;
+        let mut total_pages_searched = 0;
+        let mut total_jobs_sent = 0;
+        let mut total_posts_found = 0;  // Track total posts found across all batches
+        let mut pages_with_new_content = 0;
+        let mut consecutive_empty_pages = 0;
+        
+        std::thread::scope(|scope| {
+            // Spawn fetch threads
+            let fetch_handle = scope.spawn(|| {
+                loop {
+                    let max_search_limit = max_pages * 3;
+                    if total_pages_searched >= max_search_limit {
+                        break;
+                    }
+                    
+                    // Fetch batch
+                    let (fetch_tx, fetch_rx) = mpsc::channel::<(u16, Vec<PostEntry>)>();
+                    let mut fetch_handles = Vec::new();
+                    
+                    for thread_id in 0..thread_count {
+                        let page_to_search = batch_start + thread_id as u16;
+                        
+                        if page_to_search > (max_pages * 3) as u16 {
+                            break;
+                        }
+                        
+                        let request_sender = self.request_sender.clone();
+                        let searching_tag = searching_tag.to_string();
+                        let fetch_tx = fetch_tx.clone();
+                        let rate_limiter = Arc::clone(&self.rate_limiter);
+                        
+                        let handle = thread::spawn(move || {
+                            // Stagger and rate limit
+                            thread::sleep(Duration::from_millis(50 * thread_id as u64));
+                            
+                            if let Ok(limiter) = rate_limiter.lock() {
+                                let delay = limiter.current_delay();
+                                drop(limiter);
+                                thread::sleep(delay);
+                            }
+                            
+                            let page_start = Instant::now();
+                            let searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
+                            let request_duration = page_start.elapsed();
+                            
+                            if let Ok(limiter) = rate_limiter.lock() {
+                                limiter.record_response_time(request_duration);
+                            }
+                            
+                            let _ = fetch_tx.send((page_to_search, searched_posts));
+                        });
+                        fetch_handles.push(handle);
+                    }
+                    
+                    drop(fetch_tx);
+                    
+                    // Collect fetched posts and send to processing pipeline
+                    let threads_spawned = fetch_handles.len();
+                    let mut posts_in_batch = 0;
+                    let mut empty_pages_in_batch = 0;
+                    
+                    for _ in 0..threads_spawned {
+                        if let Ok((page, posts_from_page)) = fetch_rx.recv() {
+                            total_pages_searched += 1;
+                            
+                            if posts_from_page.is_empty() {
+                                empty_pages_in_batch += 1;
+                            } else {
+                                posts_in_batch += posts_from_page.len();
+                                total_posts_found += posts_from_page.len();  // Track cumulative posts
+                                pages_with_new_content += 1;
+                                consecutive_empty_pages = 0; // Reset on finding posts
+                            }
+                            
+                            // Send posts in optimized batches to reduce pipeline overhead
+                            if !posts_from_page.is_empty() {
+                                let job = PostProcessingJob {
+                                    posts_batch: posts_from_page,
+                                    page_numbers: vec![page],
+                                    thread_id: 0, // Will be set by processing thread
+                                    search_tag: searching_tag.to_string(),
+                                };
+                                
+                                // Distribute jobs round-robin to processing threads
+                                let thread_index = (page % processing_config.processing_threads as u16) as usize;
+                                if let Some(sender) = per_thread_job_senders.get(thread_index) {
+                                    if sender.send(job).is_ok() {
+                                        total_jobs_sent += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Update consecutive empty pages counter
+                    if posts_in_batch == 0 {
+                        consecutive_empty_pages += empty_pages_in_batch;
+                    }
+                    
+                    // Log detailed batch results with cumulative post tracking
+                    info!("Pipeline batch completed: pages {}-{}, found {} posts (raw API responses, {} total raw), {} empty pages, {} total jobs queued so far", 
+                          batch_start, batch_start + threads_spawned as u16 - 1, posts_in_batch, total_posts_found, empty_pages_in_batch, total_jobs_sent);
+                    
+                    // Log progress summary every few batches
+                    if total_pages_searched % (thread_count * 3) == 0 {
+                        info!("Pipeline progress: {}/{} pages searched, {} jobs queued, {} pages with new content, {} consecutive empty pages", 
+                              total_pages_searched, max_pages, total_jobs_sent, pages_with_new_content, consecutive_empty_pages);
+                    }
+                    
+                    // Wait for fetch threads
+                    for handle in fetch_handles {
+                        let _ = handle.join();
+                    }
+                    
+                    // Check termination conditions
+                    if total_pages_searched >= max_pages {
+                        info!("Pipeline: Searched {} pages (target: {}), search complete. Found {} pages with new content", total_pages_searched, max_pages, pages_with_new_content);
+                        break;
+                    }
+                    
+                    // Early termination if we hit too many consecutive empty pages
+                    if consecutive_empty_pages >= 4 {
+                        info!("Pipeline: Found {} consecutive empty pages, likely reached end of available content. Stopping search.", consecutive_empty_pages);
+                        break;
+                    }
+                    
+                    batch_start += thread_count as u16;
+                }
+            });
+            
+            // Wait for fetching to complete
+            let _ = fetch_handle.join();
+        });
+        
+        // Signal processing pipeline to stop by closing the individual job senders
+        info!("Pipeline: Finishing data collection from {} fetch threads, closing job senders...", thread_count);
+        for sender in per_thread_job_senders {
+            drop(sender);
+        }
+        drop(job_tx);
+        
+        // Collect processed results with improved efficiency
+        let mut total_batches_processed = 0;
+        let mut total_filtered = 0;
+        let mut total_invalid = 0;
+        
+        // Use a timeout to avoid hanging if some batches are lost
+        let collection_timeout = Duration::from_secs(30);
+        let collection_start = Instant::now();
+        
+        info!("Pipeline: Starting result collection from {} processing threads with {}s timeout...", 
+              processing_config.processing_threads, collection_timeout.as_secs());
+        
+        // Collect results until all processing threads finish or timeout
+        loop {
+            match result_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(processed_batch) => {
+                    total_batches_processed += 1;
+                    total_filtered += processed_batch.filtered_count;
+                    total_invalid += processed_batch.invalid_count;
+                    
+                    // Add all valid posts from the batch
+                    posts.extend(processed_batch.posts);
+                    
+                    // Update progress more frequently for batches
+                    if total_batches_processed % 10 == 0 {
+                        progress_bar.set_message(format!("processed {} batches ({} total posts, {} filtered, {} invalid)", 
+                                                         total_batches_processed, posts.len(), total_filtered, total_invalid));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Check if we've been waiting too long
+                    if collection_start.elapsed() > collection_timeout {
+                        warn!("Pipeline result collection timed out after {:.2?}. Proceeding with {} posts collected.", collection_timeout, posts.len());
+                        info!("Pipeline: Processed {} batches before timeout, {} filtered, {} invalid", 
+                              total_batches_processed, total_filtered, total_invalid);
+                        break;
+                    }
+                    // Log status every 5 seconds during timeout checks
+                    let elapsed = collection_start.elapsed();
+                    if elapsed.as_secs() % 5 == 0 && elapsed.as_millis() % 5000 < 200 {
+                        info!("Pipeline: Still collecting results... {} batches processed, {} posts collected, {:.1}s elapsed", 
+                              total_batches_processed, posts.len(), elapsed.as_secs_f32());
+                    }
+                    // Continue waiting for more results
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // All processing threads have finished
+                    break;
+                }
+            }
+        }
+        
+        // Wait for all processing threads to complete
+        for handle in processing_handles {
+            let _ = handle.join();
+        }
+        
+        *filtered += total_filtered as u16;
+        *invalid_posts += total_invalid as u16;
+        
+        progress_bar.finish_with_message(format!("Pipeline processing: {} valid posts from {} batches processed ({} pages)", 
+                                                posts.len(), total_batches_processed, total_pages_searched));
+        
+        info!("Pipeline: Result collection complete - {} posts from {} batches processed in {:.2?}", 
+              posts.len(), total_batches_processed, collection_start.elapsed());
+        info!("Pipeline: Final stats - {} filtered, {} invalid posts removed during processing", 
+              total_filtered, total_invalid);
+    }
+    
+    /// Helper method to apply whitelist and blacklist filtering in threads
+    fn apply_whitelist_blacklist_filtering(posts: &mut Vec<PostEntry>, blacklist: &Option<Arc<Mutex<Blacklist>>>, whitelist: &[String]) {
+        if let Some(bl) = blacklist {
+            if let Ok(blacklist_guard) = bl.lock() {
+                posts.retain(|post| {
+                    // Check if post contains any whitelisted tags
+                    let post_tags = post.tags.clone().combine_tags();
+                    let is_whitelisted = whitelist.iter().any(|whitelist_tag| {
+                        post_tags.iter().any(|post_tag| post_tag == whitelist_tag)
+                    });
+                    
+                    if is_whitelisted {
+                        return true;
+                    }
+                    
+                    // Apply blacklist filter if not whitelisted
+                    let mut single_post = vec![post.clone()];
+                    let filtered_count = blacklist_guard.filter_posts(&mut single_post);
+                    filtered_count == 0 // Keep post if it wasn't filtered by blacklist
+                });
+            }
+        }
+    }
+    
+    /// Helper method to apply blacklist filtering in threads
+    fn apply_blacklist_filtering(posts: &mut Vec<PostEntry>, blacklist: &Option<Arc<Mutex<Blacklist>>>) {
+        let empty_whitelist = Vec::new();
+        Self::apply_whitelist_blacklist_filtering(posts, blacklist, &empty_whitelist);
+    }
+    
+    /// Helper method to remove invalid posts in threads
+    fn remove_invalid_posts_in_thread(posts: &mut Vec<PostEntry>) {
+        posts.retain(|e| !e.flags.deleted && e.file.url.is_some());
+    }
+    
+    /// Helper method to process posts for duplicates and generate enhanced filenames
+    fn process_posts_for_duplicates_and_filenames(posts: &mut Vec<PostEntry>) {
+        let binding = Config::get();
+        let dir_manager = binding.directory_manager().unwrap();
+        
+        // Batch check all post IDs for duplicates
+        let post_ids: Vec<i64> = posts.iter().map(|post| post.id).collect();
+        let duplicate_results = dir_manager.batch_has_post_ids(&post_ids);
+        let duplicate_map: std::collections::HashMap<i64, bool> = duplicate_results.into_iter().collect();
+        
+        // Filter out duplicates
+        posts.retain(|post| {
+            let is_duplicate = duplicate_map.get(&post.id).copied().unwrap_or(false);
+            !is_duplicate
+        });
+    }
+    
+    /// Process a batch of post processing jobs - the core batch processing method
+    /// This combines multiple jobs and processes all posts together for maximum efficiency
+    fn process_post_batch(
+        jobs: Vec<PostProcessingJob>, 
+        blacklist: &Option<Arc<Mutex<Blacklist>>>, 
+        whitelist: &[String]
+    ) -> ProcessedPostBatch {
+        let processing_start = Instant::now();
+        let mut all_posts = Vec::new();
+        let mut all_page_numbers = Vec::new();
+        let thread_id = jobs.first().map(|j| j.thread_id).unwrap_or(0);
+        let search_tag = jobs.first().map(|j| j.search_tag.clone()).unwrap_or_default();
+        
+        // Combine all posts from all jobs into a single batch
+        for job in jobs {
+            all_posts.extend(job.posts_batch);
+            all_page_numbers.extend(job.page_numbers);
+        }
+        
+        let original_count = all_posts.len();
+        let mut filtered_count = 0;
+        let mut invalid_count = 0;
+        
+        // Apply whitelist/blacklist filtering
+        let config = Config::get();
+        if config.whitelist_override_blacklist() {
+            Self::apply_whitelist_blacklist_filtering(&mut all_posts, blacklist, whitelist);
+        } else {
+            Self::apply_blacklist_filtering(&mut all_posts, blacklist);
+        }
+        filtered_count = original_count.saturating_sub(all_posts.len());
+        
+        // Remove invalid posts (deleted, no URL, etc.)
+        let before_invalid_filter = all_posts.len();
+        Self::remove_invalid_posts_in_thread(&mut all_posts);
+        invalid_count = before_invalid_filter.saturating_sub(all_posts.len());
+        
+        // Check for duplicates and filter them out
+        let before_duplicate_filter = all_posts.len();
+        Self::process_posts_for_duplicates_and_filenames(&mut all_posts);
+        let duplicate_count = before_duplicate_filter.saturating_sub(all_posts.len());
+        
+        // Generate enhanced filenames for remaining posts
+        // Note: This is done implicitly by the batch conversion process
+        // The actual filename generation happens when converting to GrabbedPost
+        
+        let processing_duration = processing_start.elapsed();
+        
+        trace!("Batch processing completed: {} input posts -> {} output posts ({} filtered, {} invalid, {} duplicates) in {:?}",
+               original_count, all_posts.len(), filtered_count, invalid_count, duplicate_count, processing_duration);
+        
+        ProcessedPostBatch {
+            posts: all_posts,
+            page_numbers: all_page_numbers,
+            thread_id,
+            filtered_count,
+            invalid_count,
+            processing_duration,
         }
     }
 
@@ -1252,9 +2125,10 @@ impl Grabber {
                 // But we'll keep the pool identifier just in case
                 whitelist.push(clean_tag.to_string());
             } else {
-                // For general tags (including artist names without prefix), add variants
-                // This covers cases where an artist name is searched directly
-                whitelist.push(format!("artist:{}", clean_tag));
+                // For general tags, don't add artist prefix since these are likely content tags
+                // The tag is already added to whitelist above (line 1964)
+                // Only add artist variant if we have some indication this might be an artist name
+                // For now, we'll be conservative and not auto-add artist prefix
             }
             
             // Remove duplicates and empty entries

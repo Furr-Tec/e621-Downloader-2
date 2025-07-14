@@ -158,26 +158,34 @@ impl AdaptiveRateLimiter {
                 self.config.backoff_multiplier
             };
             
-            state.current_delay = std::cmp::min(
+            let new_delay = std::cmp::min(
                 Duration::from_secs_f64(state.current_delay.as_secs_f64() * multiplier),
                 self.config.max_delay
             );
             
-            info!(
-                "API response slow, increasing delay from {:?} to {:?}",
-                old_delay, state.current_delay
-            );
+            // Only log if delay actually changed
+            if new_delay != old_delay {
+                state.current_delay = new_delay;
+                info!(
+                    "API response slow, increasing delay from {:.1}s to {:.1}s",
+                    old_delay.as_secs_f32(), state.current_delay.as_secs_f32()
+                );
+            }
         } else if state.consecutive_fast_requests >= self.config.fast_request_tolerance {
             // Decrease delay for fast requests
-            state.current_delay = std::cmp::max(
+            let new_delay = std::cmp::max(
                 Duration::from_secs_f64(state.current_delay.as_secs_f64() * self.config.recovery_multiplier),
                 self.config.min_delay
             );
             
-            debug!(
-                "API response fast, decreasing delay from {:?} to {:?}",
-                old_delay, state.current_delay
-            );
+            // Only log if delay actually changed
+            if new_delay != old_delay {
+                state.current_delay = new_delay;
+                debug!(
+                    "API response fast, decreasing delay from {:.1}s to {:.1}s",
+                    old_delay.as_secs_f32(), state.current_delay.as_secs_f32()
+                );
+            }
         }
     }
 
