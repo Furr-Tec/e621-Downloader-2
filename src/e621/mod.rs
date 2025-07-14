@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::fs::{create_dir_all, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -34,6 +34,8 @@ pub(crate) mod rate_limiter;
 pub(crate) mod sender;
 pub(crate) mod streaming;
 pub(crate) mod tag_fetcher;
+pub(crate) mod tag_metadata;
+pub(crate) mod tag_validator;
 pub(crate) mod tui;
 pub(crate) mod whitelist_cache;
 
@@ -949,7 +951,7 @@ impl E621WebConnector {
                 println!("\nChecking database repair status...");
                 
                 // Get status from DirectoryManager
-                match DirectoryManager::new(".") {
+                match DirectoryManager::new(".", true) {
                     Ok(manager) => {
                         let status = manager.get_repair_status();
                         println!("{}", status);
@@ -978,7 +980,7 @@ impl E621WebConnector {
                     info!("User requested on-demand database repair");
 
                     // Trigger the repair directly via DirectoryManager
-                    match DirectoryManager::new(".") {
+                    match DirectoryManager::new(".", true) {
                         Ok(mut manager) => {
                             match manager.repair_missing_database_fields() {
                                 Ok(_) => {
@@ -1218,8 +1220,19 @@ impl E621WebConnector {
             (new_post_count, approx_total, total_cols)
         };
 
-        // Configure batch information
-        self.total_batches = (total_collections + self.batch_size - 1) / self.batch_size;
+        // Configure batch information with safe arithmetic per NASA standards
+        if self.batch_size == 0 {
+            error!("Invalid batch size: 0. Setting to default value of 1.");
+            self.batch_size = 1;
+        }
+        
+        // Use saturating arithmetic to prevent overflow
+        self.total_batches = total_collections.saturating_add(self.batch_size.saturating_sub(1)) / self.batch_size;
+        
+        // Ensure we have at least one batch
+        if self.total_batches == 0 {
+            self.total_batches = 1;
+        }
 
         // Check if we should use memory-efficient mode
         
@@ -1373,19 +1386,27 @@ impl E621WebConnector {
                 let start_idx = batch_idx * self.batch_size;
                 let end_idx = (start_idx + self.batch_size).min(collection_infos.len());
 
-                // Create batch description
-                let batch_desc = if end_idx - start_idx > 1 {
-                    let collection_names: Vec<String> = collection_infos[start_idx..end_idx]
-                        .iter()
-                        .map(|c| c.name.clone())
-                        .collect();
-                    format!("Batch {}/{}: {}", self.current_batch, self.total_batches,
-                            collection_names.join(", "))
-                } else if end_idx > start_idx {
-                    format!("Batch {}/{}: {}", self.current_batch, self.total_batches,
-                            collection_infos[start_idx].name)
+                // Create batch description with safe arithmetic
+                let batch_desc = if end_idx > start_idx {
+                    // Safe to compute difference since we checked end_idx > start_idx
+                    let collection_count = end_idx.saturating_sub(start_idx);
+                    
+                    if collection_count > 1 {
+                        let collection_names: Vec<String> = collection_infos[start_idx..end_idx]
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                        format!("Batch {}/{}: {}", self.current_batch, self.total_batches,
+                                collection_names.join(", "))
+                    } else {
+                        // Exactly one collection in this batch
+                        format!("Batch {}/{}: {}", self.current_batch, self.total_batches,
+                                collection_infos[start_idx].name)
+                    }
                 } else {
-                    format!("Batch {}/{}", self.current_batch, self.total_batches)
+                    // Empty batch - this shouldn't happen but handle it gracefully
+                    warn!("Empty batch detected: start_idx={}, end_idx={}", start_idx, end_idx);
+                    format!("Batch {}/{} (empty)", self.current_batch, self.total_batches)
                 };
 
                 info!("Processing {}", batch_desc);

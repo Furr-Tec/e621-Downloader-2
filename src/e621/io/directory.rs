@@ -484,16 +484,13 @@ pub(crate) struct DirectoryManager {
 
 impl DirectoryManager {
     /// Creates a new DirectoryManager with the specified root directory and folder preferences
-    pub(crate) fn new(root_dir: &str) -> Result<Self> {
+    pub(crate) fn new(root_dir: &str, simplified_folders: bool) -> Result<Self> {
         let root = PathBuf::from(root_dir);
         let artists = root.join("Artists");
         let tags = root.join("Tags");
         let pools = root.join("Pools");
         let hash_db_path = root.join("hash_database.json");
         let blacklist_path = root.join("fileblacklist.json");
-        
-        // Use simplified folders by default (only Tags folder)
-        let simplified_folders = true;
         
         // Create a manager with empty downloaded files initially
         let mut manager = DirectoryManager {

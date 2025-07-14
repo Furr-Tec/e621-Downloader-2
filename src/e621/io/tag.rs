@@ -23,6 +23,7 @@ use crate::e621::io::{emergency_exit, Config};
 use crate::e621::io::parser::BaseParser;
 use crate::e621::sender::entries::TagEntry;
 use crate::e621::sender::RequestSender;
+use crate::e621::tag_metadata::TagMetadataManager;
 
 /// Constant of the tag file's name.
 pub(crate) const TAG_NAME: &str = "tags.txt";
@@ -150,6 +151,7 @@ impl Group {
 }
 
 /// Parses the tag file and returns the serialized form of it.
+/// Also validates tags and updates metadata tracking.
 ///
 /// # Arguments
 ///
@@ -163,11 +165,19 @@ pub(crate) fn parse_tag_file(request_sender: &RequestSender) -> Result<Vec<Group
             "Possible I/O block when trying to read tag file..."
         })?;
     
-    TagParser {
+    let groups = TagParser {
         parser: BaseParser::new(file_contents),
         request_sender: request_sender.clone(),
     }
-    .parse_groups()
+    .parse_groups()?;
+    
+    // Validate and update tag metadata
+    if let Err(e) = validate_and_update_tag_metadata(&groups, request_sender) {
+        warn!("Failed to update tag metadata: {}", e);
+        // Continue even if metadata update fails - it's not critical for operation
+    }
+    
+    Ok(groups)
 }
 
 /// Identifier to help categorize tags.
@@ -499,4 +509,134 @@ fn valid_comment(c: char) -> bool {
         ' '..='~' => true,
         _ => c.is_alphanumeric(),
     }
+}
+
+/// Validates tags from parsed groups and updates tag metadata tracking.
+/// This function extracts all general and artist tags, validates them,
+/// and updates the metadata store with current post counts.
+///
+/// # Arguments
+///
+/// * `groups`: The parsed tag groups from tags.txt
+/// * `request_sender`: The sender to use for API calls
+///
+/// returns: Result<(), Error>
+fn validate_and_update_tag_metadata(
+    groups: &[Group],
+    request_sender: &RequestSender,
+) -> Result<(), Error> {
+    info!("Validating and updating tag metadata...");
+    
+    // Create metadata manager
+    let mut metadata_manager = TagMetadataManager::new(request_sender.clone())?;
+    
+    // Load existing metadata if available
+    metadata_manager.load()?;
+    
+    // Extract all tags that need validation (general and artist tags)
+    let mut tags_to_validate: Vec<String> = Vec::new();
+    
+    for group in groups {
+        match group.name() {
+            "general" | "artists" => {
+                for tag in group.tags() {
+                    // Only validate general type tags (not pools, sets, or posts)
+                    if matches!(tag.tag_type(), TagType::General | TagType::Artist) {
+                        tags_to_validate.push(tag.name().to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    if tags_to_validate.is_empty() {
+        info!("No tags to validate");
+        return Ok(());
+    }
+    
+    info!("Validating {} tags from tags.txt", tags_to_validate.len());
+    
+    // Validate each tag and update metadata
+    let mut validated_count = 0;
+    let mut invalid_count = 0;
+    
+    for tag_name in &tags_to_validate {
+        // Check if we need to validate (skip if recently validated)
+        if metadata_manager.is_recently_validated(tag_name) {
+            trace!("Tag '{}' was recently validated, skipping", tag_name);
+            continue;
+        }
+        
+        // Validate tag with API
+        match request_sender.get_tags_by_name(tag_name).first() {
+            Some(tag_entry) => {
+                // Tag is valid, update metadata
+                metadata_manager.update_tag(
+                    tag_name.clone(),
+                    true,
+                    tag_entry.post_count as u64,
+                );
+                validated_count += 1;
+                trace!("Tag '{}' validated with {} posts", tag_name, tag_entry.post_count);
+            }
+            None => {
+                // Check if it might be an alias
+                if let Some(aliases) = request_sender.query_aliases(tag_name) {
+                    if let Some(alias) = aliases.first() {
+                        // It's an alias, mark as valid and get post count for target
+                        if let Some(target_tag) = request_sender
+                            .get_tags_by_name(&alias.consequent_name)
+                            .first()
+                        {
+                            metadata_manager.update_tag(
+                                tag_name.clone(),
+                                true,
+                                target_tag.post_count as u64,
+                            );
+                            validated_count += 1;
+                            trace!(
+                                "Tag '{}' is alias for '{}' with {} posts",
+                                tag_name,
+                                alias.consequent_name,
+                                target_tag.post_count
+                            );
+                        } else {
+                            // Alias target not found
+                            metadata_manager.update_tag(tag_name.clone(), false, 0);
+                            invalid_count += 1;
+                            warn!("Tag '{}' is alias but target '{}' not found", tag_name, alias.consequent_name);
+                        }
+                    } else {
+                        // No alias found
+                        metadata_manager.update_tag(tag_name.clone(), false, 0);
+                        invalid_count += 1;
+                        warn!("Tag '{}' is not valid and has no aliases", tag_name);
+                    }
+                } else {
+                    // Tag is invalid
+                    metadata_manager.update_tag(tag_name.clone(), false, 0);
+                    invalid_count += 1;
+                    warn!("Tag '{}' is not valid on e621", tag_name);
+                }
+            }
+        }
+    }
+    
+    // Save updated metadata
+    metadata_manager.save()?;
+    
+    info!(
+        "Tag validation complete: {} validated, {} invalid",
+        validated_count, invalid_count
+    );
+    
+    if invalid_count > 0 {
+        warn!(
+            "Found {} invalid tags. These tags will be skipped during download.",
+            invalid_count
+        );
+    }
+    
+    Ok(())
 }

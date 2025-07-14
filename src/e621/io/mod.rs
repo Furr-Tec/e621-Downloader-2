@@ -158,7 +158,7 @@ impl Config {
         
         // Initialize directory manager if needed
         if config.directory_manager.is_none() {
-            config.directory_manager = Some(DirectoryManager::new(&config.download_directory)?);
+            config.directory_manager = Some(DirectoryManager::new(&config.download_directory, config.simplified_folders)?);
         }
         
         // Save back to file
@@ -234,8 +234,8 @@ impl Config {
             emergency_exit("Naming convention is incorrect!");
         }
 
-        // Initialize the directory manager
-        config.directory_manager = Some(DirectoryManager::new(&config.download_directory)?);
+        // Initialize the directory manager with the configured folder preference
+        config.directory_manager = Some(DirectoryManager::new(&config.download_directory, config.simplified_folders)?);
 
         Ok(config)
     }

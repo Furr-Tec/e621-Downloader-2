@@ -15,6 +15,7 @@ use crate::e621::io::{emergency_exit, Config, Login};
 use crate::e621::sender::entries::{PoolEntry, PostEntry, SetEntry};
 use crate::e621::sender::RequestSender;
 use crate::e621::whitelist_cache::WhitelistCache;
+use crate::e621::tag_validator::TagValidator;
 use crate::e621::rate_limiter::AdaptiveRateLimiter;
 
 /// Post processing pipeline structures for parallel post processing
@@ -67,6 +68,19 @@ pub(crate) enum TargetType {
     Set,
     Post,
     Favorites,
+}
+
+impl std::fmt::Display for TargetType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetType::Tag => write!(f, "Tag"),
+            TargetType::Artist => write!(f, "Artist"),
+            TargetType::Pool => write!(f, "Pool"),
+            TargetType::Set => write!(f, "Set"),
+            TargetType::Post => write!(f, "Post"),
+            TargetType::Favorites => write!(f, "Favorites"),
+        }
+    }
 }
 
 /// Orchestration plan for the entire download session
@@ -504,10 +518,14 @@ impl PostCollection {
         // Track how many posts were assigned directories
         let mut assigned_count = 0;
         
-        // All content goes into Tags directory using the collection name (tag/artist name) as the main folder
-        trace!("Setting up tag directory for '{}' (category: {})", self.name, self.category);
+        // Choose directory based on category
+        trace!("Setting up directory for '{}' (category: {})", self.name, self.category);
         let dir_setup_start = Instant::now();
-        self.base_directory = Some(dir_manager.get_tag_directory(&self.name)?);
+        self.base_directory = Some(match self.category.as_str() {
+            "Artists" => dir_manager.get_artist_directory(&self.name)?,
+            "Pools" => dir_manager.get_pool_directory(&self.name)?,
+            _ => dir_manager.get_tag_directory(&self.name)?, // Default to Tags for "General Searches" and others
+        });
         let dir_setup_duration = dir_setup_start.elapsed();
         
         if dir_setup_duration > Duration::from_millis(100) {
@@ -600,6 +618,8 @@ pub(crate) struct Grabber {
     whitelist_cache: WhitelistCache,
     /// Adaptive rate limiter for managing API request intervals
     rate_limiter: Arc<Mutex<AdaptiveRateLimiter>>,
+    /// Tag validator for cleaning and validating tags before API calls
+    tag_validator: TagValidator,
 }
 
 impl Grabber {
@@ -632,14 +652,9 @@ impl Grabber {
             if let Some(collection) = collection {
                 TargetResult::from_collection(target, collection)
             } else {
-                TargetResult {
-                    target,
-                    collection: None,
-                    posts_found: 0,
-                    processing_time: Duration::new(0, 0),
-                    success: false,
-                    error_message: Some("Failed to process target".to_string()),
-                }
+                let mut result = TargetResult::new(target);
+                result.error_message = Some("Failed to process target".to_string());
+                result
             }
         }).collect()
     }
@@ -655,9 +670,62 @@ impl Grabber {
         }
     }
 
-    fn process_tags_or_artists(&self, target: &DownloadTarget) -> Option<PostCollection> {
-        // This would contain logic to handle both tag and artist targets
-        Some(PostCollection::new(&target.name, &target.category, vec![]))
+    fn process_tags_or_artists(&mut self, target: &DownloadTarget) -> Option<PostCollection> {
+        info!("Processing {} target: {}", target.target_type, target.name);
+        
+        // Search for posts using the target name
+        let search_tag = match target.target_type {
+            TargetType::Artist => {
+                // For artists, we might need to add "artist:" prefix depending on configuration
+                // For now, just use the name directly
+                target.name.clone()
+            },
+            TargetType::Tag => target.name.clone(),
+            _ => {
+                error!("process_tags_or_artists called with non-tag/artist target type");
+                return None;
+            }
+        };
+        
+        // For now, skip tag validation in this method since it requires mutable reference
+        // The tag validation is already done in the search methods
+        let validated_tag = search_tag.clone();
+        
+        info!("Searching for posts with tag: {}", validated_tag);
+        let posts = self.search(&validated_tag, &TagSearchType::Special);
+        
+        if posts.is_empty() {
+            warn!("No posts found for {}: {}", target.target_type, target.name);
+            return None;
+        }
+        
+        info!("Found {} posts for {}: {}", posts.len(), target.target_type, target.name);
+        
+        // Convert PostEntry to GrabbedPost with enhanced filenames
+        let grabbed_posts = GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender);
+        
+        // Create collection with proper category
+        let category = match target.target_type {
+            TargetType::Artist => "Artists",
+            TargetType::Tag => "Tags",
+            _ => "General",
+        };
+        
+        let mut collection = PostCollection::new(&target.name, category, grabbed_posts);
+        
+        // Initialize directories for the collection
+        if let Err(e) = collection.initialize_directories() {
+            error!("Failed to initialize directories for {}: {}", target.target_type, e);
+            return None;
+        }
+        
+        // Log statistics about new vs duplicate posts
+        let new_count = collection.new_posts_count();
+        let total_count = collection.posts().len();
+        info!("{} '{}': {} new posts out of {} total", 
+              target.target_type, target.name, new_count, total_count);
+        
+        Some(collection)
     }
 
     fn process_pool(&self, target: &DownloadTarget) -> Option<PostCollection> {
@@ -687,6 +755,7 @@ impl Grabber {
             safe_mode,
             whitelist_cache: WhitelistCache::new(),
             rate_limiter: Arc::new(Mutex::new(AdaptiveRateLimiter::new())),
+            tag_validator: TagValidator::new(),
         }
     }
 
@@ -976,7 +1045,7 @@ impl Grabber {
         let posts = self.search(search_tag, &TagSearchType::Special);
         let mut collection = PostCollection::new(
             search_tag,
-            "General Searches", // Use same category as tags to put them in Tags folder
+            "Artists", // Use Artists category to put them in Artists folder
             GrabbedPost::new_vec_with_artist_ids(posts, &self.request_sender),
         );
         if let Err(e) = collection.initialize_directories() {
@@ -1007,6 +1076,7 @@ impl Grabber {
             safe_mode,
             whitelist_cache: WhitelistCache::new(),
             rate_limiter: Arc::new(Mutex::new(AdaptiveRateLimiter::new())),
+            tag_validator: TagValidator::new(),
         };
         
         // Process the tag using existing logic
@@ -1552,6 +1622,7 @@ impl Grabber {
                 let rate_limiter = Arc::clone(&self.rate_limiter);
                 let blacklist = self.blacklist.clone();
                 let whitelist = self.generate_whitelist_for_search(searching_tag.as_str());
+                let mut tag_validator = self.tag_validator.clone();
                 
                 let handle = thread::spawn(move || {
                     // Stagger thread starts to avoid simultaneous API hits
@@ -1566,7 +1637,9 @@ impl Grabber {
                     }
                     
                     let page_start = Instant::now();
-                    let mut searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
+                    let valid_tag = tag_validator.validate_and_clean_tag(&searching_tag);
+                    let tag_to_search = valid_tag.as_deref().unwrap_or(&searching_tag);
+                    let mut searched_posts = request_sender.safe_bulk_post_search(tag_to_search, page_to_search).posts;
                     let request_duration = page_start.elapsed();
                     
                     // Record the response time in the adaptive rate limiter
@@ -1881,6 +1954,7 @@ impl Grabber {
                         let searching_tag = searching_tag.to_string();
                         let fetch_tx = fetch_tx.clone();
                         let rate_limiter = Arc::clone(&self.rate_limiter);
+                        let mut tag_validator = self.tag_validator.clone();
                         
                         let handle = thread::spawn(move || {
                             // Stagger and rate limit
@@ -1893,7 +1967,9 @@ impl Grabber {
                             }
                             
                             let page_start = Instant::now();
-                            let searched_posts = request_sender.safe_bulk_post_search(&searching_tag, page_to_search).posts;
+                            let valid_tag = tag_validator.validate_and_clean_tag(&searching_tag);
+                            let tag_to_search = valid_tag.as_deref().unwrap_or(&searching_tag);
+                            let searched_posts = request_sender.safe_bulk_post_search(tag_to_search, page_to_search).posts;
                             let request_duration = page_start.elapsed();
                             
                             if let Ok(limiter) = rate_limiter.lock() {
