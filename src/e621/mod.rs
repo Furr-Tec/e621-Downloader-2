@@ -1666,12 +1666,52 @@ impl E621WebConnector {
 
         // Use a function pointer for stateless remove_invalid_chars
         fn remove_invalid_chars(text: &str) -> String {
-            text.chars()
+            // Windows MAX_PATH is 260, but we need to account for the path prefix
+            // and potential parent directories, so we'll use a conservative limit
+            const MAX_FILENAME_LENGTH: usize = 180;
+
+            // First, replace invalid characters
+            let sanitized: String = text.chars()
                 .map(|e| match e {
                     '?' | ':' | '*' | '<' | '>' | '"' | '|' => '_',
                     _ => e,
                 })
-                .collect()
+                .collect();
+
+            // If the filename is already short enough, return it as is
+            if sanitized.len() <= MAX_FILENAME_LENGTH {
+                return sanitized;
+            }
+
+            // For long filenames, we need to truncate while preserving uniqueness
+            // Extract the extension (if any)
+            let (name_part, ext_part) = match sanitized.rfind('.') {
+                Some(pos) => (&sanitized[..pos], &sanitized[pos..]),
+                None => (sanitized.as_str(), ""),
+            };
+
+            // Create a hash of the original name to ensure uniqueness
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            name_part.hash(&mut hasher);
+            let name_hash = hasher.finish();
+
+            // Calculate how much space we have for the truncated name
+            // Format: [truncated_name]_[hash][extension]
+            // The "_" and hash will take up 1 + 16 = 17 characters
+            let hash_str = format!("_{:x}", name_hash);
+            let available_space = MAX_FILENAME_LENGTH - hash_str.len() - ext_part.len();
+
+            // Truncate the name part to fit within the available space
+            let truncated_name = if name_part.len() > available_space {
+                &name_part[..available_space]
+            } else {
+                name_part
+            };
+
+            // Combine the truncated name, hash, and extension
+            format!("{}{}{}", truncated_name, hash_str, ext_part)
         }
 
         // Count new files that will be downloaded
@@ -1750,10 +1790,14 @@ impl E621WebConnector {
         // Pipeline coordination loop
         let mut files_completed = 0;
         let mut files_processing = 0;
+        let mut had_activity = false;
 
         loop {
+            had_activity = false;
+
             // Process completed downloads
             if let Ok(downloaded_file) = completed_rx.try_recv() {
+                had_activity = true;
                 files_processing += 1;
 
                 // Create hashing job
@@ -1783,6 +1827,7 @@ impl E621WebConnector {
 
             // Process completed hashes
             if let Ok(processed_file) = processed_rx.try_recv() {
+                had_activity = true;
                 files_completed += 1;
                 files_processing -= 1;
 
@@ -1828,8 +1873,11 @@ impl E621WebConnector {
                 break;
             }
 
-            // Small delay to prevent busy waiting
-            std::thread::sleep(Duration::from_millis(10));
+            // If no activity in this iteration, add a small delay to prevent busy waiting
+            // This allows the CPU to be used for other tasks, including the actual download threads
+            if !had_activity {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
 
         // Wait for all threads to complete
@@ -2090,8 +2138,11 @@ impl E621WebConnector {
     /// Process collections using streaming functionality for memory-efficient large downloads
     pub(crate) async fn process_collection_stream(
         &self,
-        stream_config: StreamingConfig,
+        mut stream_config: StreamingConfig,
     ) -> Result<(), anyhow::Error> {
+        // Apply user's concurrency setting to the streaming config
+        stream_config = stream_config.with_concurrency(self.max_download_concurrency);
+
         info!("Starting streaming collection processing with config: {:?}", stream_config);
 
         // Create a streaming processor with the configuration

@@ -41,6 +41,15 @@ impl Default for StreamingConfig {
     }
 }
 
+impl StreamingConfig {
+    /// Creates a new StreamingConfig with the specified concurrency level
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        // Ensure concurrency is at least 1
+        self.concurrent_workers = concurrency.max(1);
+        self
+    }
+}
+
 /// Represents a chunk of posts to be processed
 #[derive(Debug, Clone)]
 pub struct PostChunk {
@@ -65,7 +74,7 @@ impl MemoryStats {
     pub fn is_under_pressure(&self, threshold: f64) -> bool {
         self.memory_pressure > threshold
     }
-    
+
     /// Format memory statistics for display
     pub fn format_stats(&self) -> String {
         format!(
@@ -100,7 +109,7 @@ impl StreamingProcessor {
     pub fn new(config: StreamingConfig) -> Self {
         let memory_manager = Arc::new(Mutex::new(MemoryManager::new()));
         let global_progress = Arc::new(AtomicUsize::new(0));
-        
+
         let memory_stats = Arc::new(RwLock::new(MemoryStats {
             total_memory: 0,
             used_memory: 0,
@@ -108,7 +117,7 @@ impl StreamingProcessor {
             memory_pressure: 0.0,
             last_checked: Instant::now(),
         }));
-        
+
         Self {
             config,
             memory_manager,
@@ -118,60 +127,60 @@ impl StreamingProcessor {
             memory_stats,
         }
     }
-    
+
     /// Set the request sender for the processor
     pub fn set_request_sender(&mut self, request_sender: RequestSender) {
         self.request_sender = request_sender;
     }
-    
+
     /// Set the progress bar for visual feedback
     pub fn set_progress_bar(&mut self, progress_bar: ProgressBar) {
         self.progress_bar = Some(progress_bar);
     }
-    
+
     /// Process collections using streaming with async support
     pub async fn process_collection_stream(&self, grabber: &Grabber) -> Result<(), anyhow::Error> {
         let collections = grabber.posts();
-        
+
         if collections.is_empty() {
             info!("No collections to process");
             return Ok(());
         }
-        
+
         info!("Starting streaming processing for {} collections", collections.len());
-        
+
         // Start memory monitoring task
         let memory_monitor_handle = self.start_memory_monitor().await;
-        
+
         // Create channels for streaming
         let (chunk_tx, chunk_rx) = mpsc::channel::<PostChunk>(self.config.max_buffered_chunks);
         let (result_tx, mut result_rx) = mpsc::channel::<ProcessingResult>(1000);
-        
+
         // Start chunk producer
         let producer_handle = self.start_chunk_producer(collections, chunk_tx).await;
-        
+
         // Start processing workers
         let worker_handles = self.start_processing_workers(chunk_rx, result_tx).await;
-        
+
         // Process results
         let mut total_processed = 0;
         let mut successful_downloads = 0;
         let mut failed_downloads = 0;
-        
+
         // Wait for results
         while let Some(result) = result_rx.recv().await {
             match result {
                 ProcessingResult::Success { file_name, .. } => {
                     successful_downloads += 1;
                     total_processed += 1;
-                    
+
                     if let Some(pb) = &self.progress_bar {
                         pb.set_position(total_processed);
                         pb.set_message(format!("Downloaded: {}", file_name));
                     }
-                    
+
                     self.global_progress.fetch_add(1, Ordering::SeqCst);
-                    
+
                     // Check memory pressure periodically
                     if total_processed % 10 == 0 {
                         let stats = self.memory_stats.read().await;
@@ -186,7 +195,7 @@ impl StreamingProcessor {
                     failed_downloads += 1;
                     total_processed += 1;
                     warn!("Processing error: {}", error);
-                    
+
                     if let Some(pb) = &self.progress_bar {
                         pb.set_position(total_processed);
                         pb.set_message(format!("Error: {}", error));
@@ -198,63 +207,63 @@ impl StreamingProcessor {
                 }
             }
         }
-        
+
         // Wait for all tasks to complete
         let _ = producer_handle.await;
         for handle in worker_handles {
             let _ = handle.await;
         }
         memory_monitor_handle.abort();
-        
+
         info!(
             "Streaming processing completed: {} successful, {} failed, {} total",
             successful_downloads, failed_downloads, total_processed
         );
-        
+
         Ok(())
     }
-    
+
     /// Process collections using the simplified interface
     pub async fn process_collections(&self, collections: Vec<Collection>) -> Result<(), anyhow::Error> {
         if collections.is_empty() {
             info!("No collections to process");
             return Ok(());
         }
-        
+
         info!("Starting streaming processing for {} collections", collections.len());
-        
+
         // Start memory monitoring task
         let memory_monitor_handle = self.start_memory_monitor().await;
-        
+
         // Create channels for streaming
         let (chunk_tx, chunk_rx) = mpsc::channel::<PostChunk>(self.config.max_buffered_chunks);
         let (result_tx, mut result_rx) = mpsc::channel::<ProcessingResult>(1000);
-        
+
         // Start chunk producer for simplified collections
         let producer_handle = self.start_simple_chunk_producer(collections, chunk_tx).await;
-        
+
         // Start processing workers
         let worker_handles = self.start_processing_workers(chunk_rx, result_tx).await;
-        
+
         // Process results
         let mut total_processed = 0;
         let mut successful_downloads = 0;
         let mut failed_downloads = 0;
-        
+
         // Wait for results
         while let Some(result) = result_rx.recv().await {
             match result {
                 ProcessingResult::Success { file_name, .. } => {
                     successful_downloads += 1;
                     total_processed += 1;
-                    
+
                     if let Some(pb) = &self.progress_bar {
                         pb.set_position(total_processed);
                         pb.set_message(format!("Downloaded: {}", file_name));
                     }
-                    
+
                     self.global_progress.fetch_add(1, Ordering::SeqCst);
-                    
+
                     // Check memory pressure periodically
                     if total_processed % 10 == 0 {
                         let stats = self.memory_stats.read().await;
@@ -269,7 +278,7 @@ impl StreamingProcessor {
                     failed_downloads += 1;
                     total_processed += 1;
                     warn!("Processing error: {}", error);
-                    
+
                     if let Some(pb) = &self.progress_bar {
                         pb.set_position(total_processed);
                         pb.set_message(format!("Error: {}", error));
@@ -281,37 +290,37 @@ impl StreamingProcessor {
                 }
             }
         }
-        
+
         // Wait for all tasks to complete
         let _ = producer_handle.await;
         for handle in worker_handles {
             let _ = handle.await;
         }
         memory_monitor_handle.abort();
-        
+
         info!(
             "Streaming processing completed: {} successful, {} failed, {} total",
             successful_downloads, failed_downloads, total_processed
         );
-        
+
         Ok(())
     }
-    
+
     /// Start memory monitoring task
     async fn start_memory_monitor(&self) -> JoinHandle<()> {
         let memory_stats = Arc::clone(&self.memory_stats);
         let check_interval = self.config.memory_check_interval;
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(check_interval);
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // Get memory information (platform-specific)
                 let (total, used, available) = get_memory_info();
                 let pressure = used as f64 / total as f64;
-                
+
                 let stats = MemoryStats {
                     total_memory: total,
                     used_memory: used,
@@ -319,12 +328,12 @@ impl StreamingProcessor {
                     memory_pressure: pressure,
                     last_checked: Instant::now(),
                 };
-                
+
                 {
                     let mut memory_stats = memory_stats.write().await;
                     *memory_stats = stats;
                 }
-                
+
                 // Log memory pressure warnings
                 if pressure > 0.9 {
                     warn!("Critical memory pressure: {:.1}%", pressure * 100.0);
@@ -334,7 +343,7 @@ impl StreamingProcessor {
             }
         })
     }
-    
+
     /// Start chunk producer task
     async fn start_chunk_producer(
         &self,
@@ -345,26 +354,26 @@ impl StreamingProcessor {
             .iter()
             .map(|c| (c.name().to_string(), c.posts().clone()))
             .collect();
-        
+
         let chunk_size = self.config.chunk_size;
         let memory_stats = Arc::clone(&self.memory_stats);
-        
+
         tokio::spawn(async move {
             for (collection_name, posts) in collections_data {
                 let new_posts: Vec<GrabbedPost> = posts
                     .into_iter()
                     .filter(|post| post.is_new())
                     .collect();
-                
+
                 if new_posts.is_empty() {
                     continue;
                 }
-                
+
                 let total_chunks = (new_posts.len() + chunk_size - 1) / chunk_size;
-                
+
                 info!("Processing collection '{}': {} new posts in {} chunks", 
                       collection_name, new_posts.len(), total_chunks);
-                
+
                 // Process posts in chunks
                 for (chunk_index, chunk_posts) in new_posts.chunks(chunk_size).enumerate() {
                     let chunk = PostChunk {
@@ -373,29 +382,29 @@ impl StreamingProcessor {
                         chunk_index,
                         total_chunks,
                     };
-                    
+
                     // Check memory pressure before sending chunk
                     loop {
                         let stats = memory_stats.read().await;
                         if !stats.is_under_pressure(0.85) {
                             break;
                         }
-                        
+
                         warn!("Memory pressure too high, waiting... {}", stats.format_stats());
                         sleep(Duration::from_millis(500)).await;
                     }
-                    
+
                     if chunk_tx.send(chunk).await.is_err() {
                         error!("Failed to send chunk to processor");
                         break;
                     }
                 }
             }
-            
+
             trace!("Chunk producer completed");
         })
     }
-    
+
     /// Start chunk producer task for simplified Collection interface
     async fn start_simple_chunk_producer(
         &self,
@@ -404,23 +413,23 @@ impl StreamingProcessor {
     ) -> JoinHandle<()> {
         let chunk_size = self.config.chunk_size;
         let memory_stats = Arc::clone(&self.memory_stats);
-        
+
         tokio::spawn(async move {
             for collection in collections {
                 let new_posts: Vec<GrabbedPost> = collection.posts
                     .into_iter()
                     .filter(|post| post.is_new())
                     .collect();
-                
+
                 if new_posts.is_empty() {
                     continue;
                 }
-                
+
                 let total_chunks = (new_posts.len() + chunk_size - 1) / chunk_size;
-                
+
                 info!("Processing collection '{}': {} new posts in {} chunks", 
                       collection.name, new_posts.len(), total_chunks);
-                
+
                 // Process posts in chunks
                 for (chunk_index, chunk_posts) in new_posts.chunks(chunk_size).enumerate() {
                     let chunk = PostChunk {
@@ -429,29 +438,29 @@ impl StreamingProcessor {
                         chunk_index,
                         total_chunks,
                     };
-                    
+
                     // Check memory pressure before sending chunk
                     loop {
                         let stats = memory_stats.read().await;
                         if !stats.is_under_pressure(0.85) {
                             break;
                         }
-                        
+
                         warn!("Memory pressure too high, waiting... {}", stats.format_stats());
                         sleep(Duration::from_millis(500)).await;
                     }
-                    
+
                     if chunk_tx.send(chunk).await.is_err() {
                         error!("Failed to send chunk to processor");
                         break;
                     }
                 }
             }
-            
+
             trace!("Simple chunk producer completed");
         })
     }
-    
+
     /// Start processing worker tasks
     async fn start_processing_workers(
         &self,
@@ -459,25 +468,25 @@ impl StreamingProcessor {
         result_tx: mpsc::Sender<ProcessingResult>,
     ) -> Vec<JoinHandle<()>> {
         let mut handles = Vec::new();
-        
+
         // Wrap the receiver in Arc<Mutex<>> to share it among workers
         let chunk_rx = Arc::new(Mutex::new(chunk_rx));
-        
+
         for worker_id in 0..self.config.concurrent_workers {
             let chunk_rx = Arc::clone(&chunk_rx);
             let result_tx = result_tx.clone();
             let request_sender = self.request_sender.clone();
-            
+
             let handle = tokio::spawn(async move {
                 Self::worker_process_chunks(worker_id, chunk_rx, result_tx, request_sender).await;
             });
-            
+
             handles.push(handle);
         }
-        
+
         handles
     }
-    
+
     /// Worker task for processing chunks
     async fn worker_process_chunks(
         worker_id: usize,
@@ -486,7 +495,7 @@ impl StreamingProcessor {
         request_sender: RequestSender,
     ) {
         debug!("Worker {} started", worker_id);
-        
+
         loop {
             let chunk = {
                 let mut rx = chunk_rx.lock().await;
@@ -495,20 +504,20 @@ impl StreamingProcessor {
                     None => break, // Channel closed
                 }
             };
-            
+
             debug!("Worker {} processing chunk {}/{} from collection '{}'", 
                    worker_id, chunk.chunk_index + 1, chunk.total_chunks, chunk.collection_name);
-            
+
             for post in &chunk.posts {
                 let result = process_single_post(post, &request_sender).await;
-                
+
                 if result_tx.send(result).await.is_err() {
                     error!("Worker {} failed to send result", worker_id);
                     break;
                 }
             }
         }
-        
+
         debug!("Worker {} completed", worker_id);
     }
 }
@@ -533,7 +542,7 @@ pub enum ProcessingResult {
 async fn process_single_post(post: &GrabbedPost, request_sender: &RequestSender) -> ProcessingResult {
     let start_time = Instant::now();
     let file_name = post.name().to_string();
-    
+
     let save_dir = match post.save_directory() {
         Some(dir) => dir,
         None => {
@@ -543,19 +552,19 @@ async fn process_single_post(post: &GrabbedPost, request_sender: &RequestSender)
             };
         }
     };
-    
+
     let file_path = save_dir.join(remove_invalid_chars(&file_name));
-    
+
     // Download the file
     match download_file_async(post.url(), &file_path, request_sender).await {
         Ok(file_size) => {
             let download_time = start_time.elapsed();
-            
+
             // Update database
             if let Err(e) = update_database_entry(post, &file_path).await {
                 warn!("Failed to update database for {}: {}", file_name, e);
             }
-            
+
             ProcessingResult::Success {
                 file_name,
                 file_path,
@@ -580,18 +589,18 @@ async fn download_file_async(
     if let Some(parent) = file_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    
+
     // Download in background thread to avoid blocking async runtime
     let url = url.to_string();
     let file_path = file_path.clone();
     let request_sender = request_sender.clone();
-    
+
     let result = tokio::task::spawn_blocking(move || {
         let bytes = request_sender.get_bytes_from_url(&url)?;
         std::fs::write(&file_path, &bytes)?;
         Ok::<u64, anyhow::Error>(bytes.len() as u64)
     }).await??;
-    
+
     Ok(result)
 }
 
@@ -600,39 +609,85 @@ async fn update_database_entry(post: &GrabbedPost, file_path: &PathBuf) -> Resul
     // This would normally update the DirectoryManager database
     // For now, we'll just log the operation
     trace!("Would update database for file: {}", file_path.display());
-    
+
     // In a real implementation, this would:
     // 1. Calculate file hash
     // 2. Update DirectoryManager with file info
     // 3. Store post metadata
-    
+
     Ok(())
 }
 
-/// Remove invalid characters from filename
+/// Remove invalid characters from filename and handle long file names
+/// 
+/// This function:
+/// 1. Replaces invalid Windows characters with underscores
+/// 2. Truncates long file names to fit within Windows path limits
+/// 3. Preserves file extensions
+/// 4. Ensures uniqueness by including a hash of the original name when truncating
 fn remove_invalid_chars(text: &str) -> String {
-    text.chars()
+    // Windows MAX_PATH is 260, but we need to account for the path prefix
+    // and potential parent directories, so we'll use a conservative limit
+    const MAX_FILENAME_LENGTH: usize = 180;
+
+    // First, replace invalid characters
+    let sanitized: String = text.chars()
         .map(|c| match c {
             '?' | ':' | '*' | '<' | '>' | '"' | '|' => '_',
             _ => c,
         })
-        .collect()
+        .collect();
+
+    // If the filename is already short enough, return it as is
+    if sanitized.len() <= MAX_FILENAME_LENGTH {
+        return sanitized;
+    }
+
+    // For long filenames, we need to truncate while preserving uniqueness
+    // Extract the extension (if any)
+    let (name_part, ext_part) = match sanitized.rfind('.') {
+        Some(pos) => (&sanitized[..pos], &sanitized[pos..]),
+        None => (sanitized.as_str(), ""),
+    };
+
+    // Create a hash of the original name to ensure uniqueness
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    name_part.hash(&mut hasher);
+    let name_hash = hasher.finish();
+
+    // Calculate how much space we have for the truncated name
+    // Format: [truncated_name]_[hash][extension]
+    // The "_" and hash will take up 1 + 16 = 17 characters
+    let hash_str = format!("_{:x}", name_hash);
+    let available_space = MAX_FILENAME_LENGTH - hash_str.len() - ext_part.len();
+
+    // Truncate the name part to fit within the available space
+    let truncated_name = if name_part.len() > available_space {
+        &name_part[..available_space]
+    } else {
+        name_part
+    };
+
+    // Combine the truncated name, hash, and extension
+    format!("{}{}{}", truncated_name, hash_str, ext_part)
 }
 
 /// Get system memory information (platform-specific)
 fn get_memory_info() -> (usize, usize, usize) {
     // This is a simplified implementation
     // In a real system, this would query actual system memory
-    
+
     #[cfg(target_os = "windows")]
     {
         use std::mem;
         use winapi::um::sysinfoapi::{GetPhysicallyInstalledSystemMemory, GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        
+
         unsafe {
             let mut mem_status: MEMORYSTATUSEX = mem::zeroed();
             mem_status.dwLength = mem::size_of::<MEMORYSTATUSEX>() as u32;
-            
+
             if GlobalMemoryStatusEx(&mut mem_status) != 0 {
                 let total = mem_status.ullTotalPhys as usize;
                 let available = mem_status.ullAvailPhys as usize;
@@ -641,13 +696,13 @@ fn get_memory_info() -> (usize, usize, usize) {
             }
         }
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
             let mut total = 0;
             let mut available = 0;
-            
+
             for line in contents.lines() {
                 if line.starts_with("MemTotal:") {
                     if let Some(kb) = line.split_whitespace().nth(1) {
@@ -659,17 +714,17 @@ fn get_memory_info() -> (usize, usize, usize) {
                     }
                 }
             }
-            
+
             let used = total - available;
             return (total, used, available);
         }
     }
-    
+
     // Fallback for other platforms or if system calls fail
     let total = 8 * 1024 * 1024 * 1024; // 8GB default
     let used = total / 2; // Assume 50% used
     let available = total - used;
-    
+
     (total, used, available)
 }
 
@@ -677,7 +732,7 @@ fn get_memory_info() -> (usize, usize, usize) {
 mod tests {
     use super::*;
     use tokio::test;
-    
+
     #[test]
     async fn test_memory_stats_creation() {
         let stats = MemoryStats {
@@ -687,14 +742,14 @@ mod tests {
             memory_pressure: 0.5,
             last_checked: Instant::now(),
         };
-        
+
         assert!(!stats.is_under_pressure(0.8));
         assert!(stats.is_under_pressure(0.3));
-        
+
         let formatted = stats.format_stats();
         assert!(formatted.contains("50.0% used"));
     }
-    
+
     #[test]
     async fn test_streaming_config_default() {
         let config = StreamingConfig::default();
@@ -703,11 +758,34 @@ mod tests {
         assert_eq!(config.memory_pressure_threshold, 0.8);
         assert_eq!(config.concurrent_workers, 4);
     }
-    
+
     #[test]
     async fn test_remove_invalid_chars() {
+        // Test basic invalid character replacement
         let input = "file:with*invalid<chars>\"test|.jpg";
         let expected = "file_with_invalid_chars__test_.jpg";
         assert_eq!(remove_invalid_chars(input), expected);
+
+        // Test handling of long file names
+        let long_name = "a".repeat(200) + ".png";
+        let result = remove_invalid_chars(&long_name);
+
+        // Verify the result is shorter than the input
+        assert!(result.len() < long_name.len());
+
+        // Verify the extension is preserved
+        assert!(result.ends_with(".png"));
+
+        // Verify the result contains a hash (indicated by an underscore followed by hex digits)
+        let has_hash = result.matches('_').count() > 0 && 
+                      result.chars().any(|c| c.is_ascii_hexdigit());
+        assert!(has_hash);
+
+        // Test another long name to ensure different inputs produce different outputs
+        let long_name2 = "b".repeat(200) + ".png";
+        let result2 = remove_invalid_chars(&long_name2);
+
+        // Verify the results are different (uniqueness)
+        assert_ne!(result, result2);
     }
 }
