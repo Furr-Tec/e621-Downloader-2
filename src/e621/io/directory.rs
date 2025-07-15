@@ -363,6 +363,166 @@ struct FileCache {
     blacklist_cache: DashMap<String, ()>,
 }
 
+/// Comprehensive file map for efficient file existence checking
+#[derive(Debug, Clone)]
+struct FileMap {
+    /// Map of filenames to their full paths (can be multiple paths per filename)
+    filename_to_paths: DashMap<String, Vec<PathBuf>>,
+    /// Map of relative paths to their full paths
+    relative_to_full_paths: DashMap<String, PathBuf>,
+}
+
+impl FileMap {
+    /// Create a new empty FileMap
+    fn new() -> Self {
+        Self {
+            filename_to_paths: DashMap::new(),
+            relative_to_full_paths: DashMap::new(),
+        }
+    }
+
+    /// Add a file to the map
+    fn add_file(&self, full_path: PathBuf, root_dir: &Path) {
+        if let Some(filename) = full_path.file_name().and_then(|n| n.to_str()) {
+            // Add to filename_to_paths map
+            let filename_str = filename.to_string();
+            match self.filename_to_paths.entry(filename_str) {
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(full_path.clone());
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(vec![full_path.clone()]);
+                }
+            }
+
+            // Add to relative_to_full_paths map
+            if let Ok(relative_path) = full_path.strip_prefix(root_dir) {
+                let relative_path_str = relative_path.to_string_lossy().to_string();
+                self.relative_to_full_paths.insert(relative_path_str, full_path);
+            }
+        }
+    }
+
+    /// Check if a file exists by filename
+    fn file_exists_by_filename(&self, filename: &str) -> bool {
+        self.filename_to_paths.contains_key(filename)
+    }
+
+    /// Check if a file exists by relative path
+    fn file_exists_by_relative_path(&self, relative_path: &str) -> bool {
+        self.relative_to_full_paths.contains_key(relative_path)
+    }
+
+    /// Get all paths for a filename
+    fn get_paths_for_filename(&self, filename: &str) -> Option<Vec<PathBuf>> {
+        self.filename_to_paths.get(filename).map(|paths| paths.clone())
+    }
+
+    /// Check if a file exists by either filename or relative path
+    fn file_exists(&self, filename: &str) -> bool {
+        // First check by filename and relative path (fast path)
+        if self.file_exists_by_filename(filename) || self.file_exists_by_relative_path(filename) {
+            trace!("File '{}' found by direct filename or relative path lookup", filename);
+            return true;
+        }
+
+        // If the filename contains path separators, try to check by path components
+        if filename.contains('/') || filename.contains('\\') {
+            // Extract the actual filename from the path
+            let path = std::path::Path::new(filename);
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                trace!("Checking file '{}' by extracted filename '{}'", filename, file_name);
+
+                // Check if any path in the map contains this filename
+                if let Some(paths) = self.filename_to_paths.get(file_name) {
+                    // Check if any of the paths contain the same path components
+                    for full_path in paths.value() {
+                        let full_path_str = full_path.to_string_lossy().to_string();
+                        if full_path_str.contains(filename) {
+                            trace!("File '{}' found in path '{}'", filename, full_path_str);
+                            return true;
+                        }
+                    }
+                }
+
+                // Also check all paths for any filename that matches
+                for entry in self.filename_to_paths.iter() {
+                    for full_path in entry.value() {
+                        let full_path_str = full_path.to_string_lossy().to_string();
+                        if full_path_str.ends_with(filename) {
+                            trace!("File '{}' found at end of path '{}'", filename, full_path_str);
+                            return true;
+                        }
+                    }
+                }
+
+                // Check if the filename exists in any path (ignoring case and normalizing special characters)
+                let normalized_filename = file_name.to_lowercase();
+                for entry in self.filename_to_paths.iter() {
+                    let entry_key = entry.key().to_lowercase();
+                    if entry_key == normalized_filename {
+                        trace!("File '{}' found by normalized filename '{}'", filename, file_name);
+                        return true;
+                    }
+
+                    for full_path in entry.value() {
+                        let full_path_str = full_path.to_string_lossy().to_string().to_lowercase();
+                        if full_path_str.contains(&normalized_filename) {
+                            trace!("File '{}' found in normalized path '{}'", filename, full_path_str);
+                            return true;
+                        }
+                    }
+                }
+            }
+        } else {
+            // For simple filenames without path separators, do additional checks
+            let normalized_filename = filename.to_lowercase();
+
+            // Check all paths for any filename that matches (case-insensitive)
+            for entry in self.filename_to_paths.iter() {
+                let entry_key = entry.key().to_lowercase();
+                if entry_key == normalized_filename {
+                    trace!("File '{}' found by case-insensitive filename match", filename);
+                    return true;
+                }
+            }
+        }
+
+        // As a final fallback, check if the file exists directly on disk
+        // This is more expensive but ensures we don't miss any files
+        let direct_path = std::path::Path::new(filename);
+        if direct_path.exists() {
+            trace!("File '{}' found by direct filesystem check", filename);
+            return true;
+        }
+
+        // Try to find the file in common directories
+        let common_dirs = ["Tags", "Artists", "Pools"];
+        for dir in &common_dirs {
+            let potential_path = std::path::Path::new(dir).join(filename);
+            if potential_path.exists() {
+                trace!("File '{}' found in common directory '{}'", filename, dir);
+                return true;
+            }
+
+            // Check for the file in subdirectories of common directories
+            if filename.contains('/') || filename.contains('\\') {
+                let path = std::path::Path::new(filename);
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    let potential_path = std::path::Path::new(dir).join(file_name);
+                    if potential_path.exists() {
+                        trace!("File '{}' found by filename '{}' in common directory '{}'", filename, file_name, dir);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        trace!("File '{}' not found after all checks", filename);
+        false
+    }
+}
+
 impl FileCache {
     fn new() -> Self {
         Self {
@@ -484,6 +644,65 @@ pub(crate) struct DirectoryManager {
 }
 
 impl DirectoryManager {
+    /// Build a comprehensive file map for efficient file existence checking
+    fn build_file_map(&self) -> Result<FileMap> {
+        let file_map = FileMap::new();
+        let subdirs = [&self.artists_dir, &self.tags_dir, &self.pools_dir];
+        let root_dir = &self.root_dir;
+
+        // Create a progress bar for the file scan
+        let progress_bar = ProgressBarBuilder::new(0)
+            .style(
+                Self::create_progress_style(
+                    "{spinner:.green} FILE SCAN: {wide_msg} | {elapsed_precise} | {bar:40.cyan/blue} {pos}/{len} | {per_sec}",
+                    "=>-"
+                )
+            )
+            .draw_target(ProgressDrawTarget::stderr_with_hz(5))
+            .reset()
+            .steady_tick(Duration::from_millis(100))
+            .build();
+
+        progress_bar.set_message("Starting comprehensive file scan...");
+
+        // Collect all files in parallel
+        let collected_files = Arc::new(Mutex::new(Vec::new()));
+        let progress_arc = Arc::new(progress_bar);
+
+        // Use the walk_directories_parallel function from the walk module
+        let subdirs_owned: Vec<PathBuf> = subdirs.iter().map(|p| (*p).clone()).collect();
+        walk::walk_directories_parallel(&subdirs_owned, Arc::clone(&progress_arc), Arc::clone(&collected_files))
+            .with_context(|| "Failed to scan directories for files")?;
+
+        // Process collected files and build the file map
+        let files = match collected_files.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Mutex poisoned, recovering lock");
+                poisoned.into_inner()
+            }
+        };
+
+        progress_arc.set_message("Building file map...");
+        progress_arc.set_length(files.len() as u64);
+        progress_arc.set_position(0);
+
+        // Process files in parallel using rayon
+        let file_map_arc = Arc::new(file_map);
+        let root_dir_arc = Arc::new(root_dir.clone());
+
+        files.par_iter().enumerate().for_each(|(i, path)| {
+            file_map_arc.add_file(path.clone(), &root_dir_arc);
+            if i % 1000 == 0 {
+                progress_arc.set_position(i as u64);
+            }
+        });
+
+        progress_arc.finish_with_message(format!("File map built with {} files", files.len()));
+
+        Ok(Arc::try_unwrap(file_map_arc).unwrap_or_else(|arc| (*arc).clone()))
+    }
+
     /// Recursively search for a file in a directory and all its subdirectories
     /// Returns true if the file is found, false otherwise
     fn recursive_find_file(dir: &Path, file_name: &str) -> bool {
@@ -491,10 +710,42 @@ impl DirectoryManager {
             return false;
         }
 
-        // Check if the file exists directly in this directory
+        // Extract the base filename if it contains path separators
+        let base_file_name = if file_name.contains('/') || file_name.contains('\\') {
+            std::path::Path::new(file_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file_name)
+        } else {
+            file_name
+        };
+
+        // Check if the file exists directly in this directory (using both original and base filename)
         let direct_path = dir.join(file_name);
+        let base_path = dir.join(base_file_name);
+
         if direct_path.exists() {
+            trace!("File '{}' found directly at '{}'", file_name, direct_path.display());
             return true;
+        }
+
+        if base_path.exists() && base_path != direct_path {
+            trace!("File '{}' found by base filename '{}' at '{}'", file_name, base_file_name, base_path.display());
+            return true;
+        }
+
+        // Check for case-insensitive matches in the current directory
+        if let Ok(entries) = fs::read_dir(dir) {
+            let lowercase_filename = base_file_name.to_lowercase();
+            for entry in entries.flatten() {
+                if let Some(entry_name) = entry.file_name().to_str() {
+                    if entry_name.to_lowercase() == lowercase_filename {
+                        trace!("File '{}' found by case-insensitive match '{}' at '{}'", 
+                               file_name, entry_name, entry.path().display());
+                        return true;
+                    }
+                }
+            }
         }
 
         // Recursively check all subdirectories
@@ -504,6 +755,15 @@ impl DirectoryManager {
                 if path.is_dir() {
                     if Self::recursive_find_file(&path, file_name) {
                         return true;
+                    }
+
+                    // Also try with the base filename if different
+                    if base_file_name != file_name {
+                        if Self::recursive_find_file(&path, base_file_name) {
+                            trace!("File '{}' found using base filename '{}' in subdirectory", 
+                                   file_name, base_file_name);
+                            return true;
+                        }
                     }
                 }
             }
@@ -735,43 +995,110 @@ let mut manager_guard = match manager_arc.lock() {
                     error!("Failed to persist hash database after scan: {}", e);
                 }
             }
-            // Remove any DB entry no longer present on disk
-            // Use smarter logic to check both filename and relative path
-            let to_remove: Vec<_> = manager.downloaded_files
-                .iter()
-                .filter(|(f, _)| {
-                    // Check if file exists by filename OR by relative path
-                    let exists_by_filename = disk_files.contains(f);
-                    let exists_by_relative_path = disk_files_by_relative_path.contains(f);
+            // Build a comprehensive file map for efficient file existence checking
+            info!("Building comprehensive file map for thorough file existence checking...");
+            let file_map = match manager.build_file_map() {
+                Ok(map) => map,
+                Err(e) => {
+                    error!("Failed to build file map: {}. Falling back to basic file checking.", e);
+                    // Create an empty map as fallback
+                    FileMap::new()
+                }
+            };
 
-                    if !exists_by_filename && !exists_by_relative_path {
+            // Remove any DB entry no longer present on disk using the file map
+            let to_remove: Vec<_> = manager.downloaded_files
+                .par_iter() // Use parallel iterator for better performance
+                .filter(|(f, _)| {
+                    // Check if file exists using the file map
+                    let exists_in_map = file_map.file_exists(f);
+
+                    if exists_in_map {
+                        trace!("File '{}' found in file map, keeping in DB", f);
+                        false // Don't remove - file exists in map
+                    } else {
                         // Double-check by recursively searching for the file in all subdirectories
+                        // This is a fallback in case the file map missed something
                         let mut found_on_disk = false;
+
+                        // First, try direct path checks in all subdirectories
                         for dir in subdirs.iter() {
                             let potential_path = dir.join(f);
                             if potential_path.exists() {
                                 found_on_disk = true;
-                                trace!("File '{}' found at: {}", f, potential_path.display());
+                                trace!("File '{}' found at direct path: {}", f, potential_path.display());
                                 break;
                             }
 
-                            // Recursively search through all subdirectories
-                            found_on_disk = Self::recursive_find_file(dir, f);
-                            if found_on_disk {
-                                trace!("File '{}' found in subdirectory tree of: {}", f, dir.display());
-                                break;
+                            // Also check with just the filename part if it contains path separators
+                            if f.contains('/') || f.contains('\\') {
+                                if let Some(file_name) = std::path::Path::new(f).file_name().and_then(|n| n.to_str()) {
+                                    let base_path = dir.join(file_name);
+                                    if base_path.exists() {
+                                        found_on_disk = true;
+                                        trace!("File '{}' found by base filename '{}' at: {}", f, file_name, base_path.display());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // If not found by direct path, try recursive search
+                        if !found_on_disk {
+                            trace!("File '{}' not found by direct path checks, trying recursive search", f);
+                            for dir in subdirs.iter() {
+                                found_on_disk = Self::recursive_find_file(dir, f);
+                                if found_on_disk {
+                                    trace!("File '{}' found in subdirectory tree of: {}", f, dir.display());
+                                    break;
+                                }
+                            }
+                        }
+
+                        // If still not found, try one more check with common subdirectories
+                        if !found_on_disk {
+                            trace!("File '{}' not found in main directories, checking common subdirectories", f);
+                            // Check in common subdirectories like "Tags/blue_penis"
+                            let common_subdirs = [
+                                "Tags/blue_penis", 
+                                "Tags/fav_AetherCLion",
+                                // Add other common subdirectories here
+                            ];
+
+                            for subdir in &common_subdirs {
+                                let subdir_path = manager.root_dir.join(subdir);
+                                if subdir_path.exists() {
+                                    // Extract just the filename if it contains path separators
+                                    let file_to_check = if f.contains('/') || f.contains('\\') {
+                                        std::path::Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or(f)
+                                    } else {
+                                        f
+                                    };
+
+                                    let full_path = subdir_path.join(file_to_check);
+                                    if full_path.exists() {
+                                        found_on_disk = true;
+                                        trace!("File '{}' found in common subdir at: {}", f, full_path.display());
+                                        break;
+                                    }
+
+                                    // Try recursive search in this specific subdirectory
+                                    if Self::recursive_find_file(&subdir_path, file_to_check) {
+                                        found_on_disk = true;
+                                        trace!("File '{}' found by recursive search in common subdir: {}", f, subdir);
+                                        break;
+                                    }
+                                }
                             }
                         }
 
                         if found_on_disk {
-                            trace!("File '{}' exists on disk but wasn't found in initial scan, keeping in DB", f);
+                            info!("File '{}' exists on disk but wasn't found in file map, keeping in DB", f);
                             false // Don't remove - file exists
                         } else {
                             warn!("File '{}' not found on disk after thorough search, will remove from DB", f);
                             true // Remove - file truly doesn't exist
                         }
-                    } else {
-                        false // Don't remove - file exists
                     }
                 })
                 .cloned()
