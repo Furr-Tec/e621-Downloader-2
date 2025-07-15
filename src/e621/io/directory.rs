@@ -16,6 +16,7 @@ use serde::{Serialize, Deserialize};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use dashmap::DashMap;
 use crate::e621::tui::{ProgressBarBuilder, ProgressStyleBuilder};
+use super::Config;
 mod walk; // Declare the walk submodule
 /// Represents a file entry in the hash database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1641,8 +1642,24 @@ let mut files = match files_mutex.lock() {
 
     /// Adds a file entry with full metadata (URL, post ID, etc.) to the tracking system
     pub(crate) fn add_or_update_entry(&mut self, file_name: String, hash: Option<String>, short_url: Option<String>, post_id: Option<i64>) {
+        // Normalize the filename to prevent duplicate entries due to path differences
+        let normalized_name = file_name.replace('\\', "/").trim().to_string();
+
+        // Check if this exact entry already exists in downloaded_files
+        let entry_exists = self.downloaded_files.iter().any(|(name, h)| {
+            let binding = name.replace('\\', "/");
+            let normalized_existing = binding.trim();
+            normalized_existing == normalized_name && h == &hash
+        });
+
+        if entry_exists {
+            // Entry already exists with same hash, no need to add it again
+            trace!("Entry already exists for file '{}' with same hash, skipping", normalized_name);
+            return;
+        }
+
         // Add to the tracking set for compatibility with existing duplicate checking
-        self.downloaded_files.insert((file_name.clone(), hash.clone()));
+        self.downloaded_files.insert((normalized_name.clone(), hash.clone()));
 
         // Add post_id to cache if present
         if let Some(id) = post_id {
@@ -1664,14 +1681,38 @@ let mut files = match files_mutex.lock() {
         };
 
         // Check for duplicate entries before adding
-        let duplicate_entry = hash_db.entries.iter().any(|e| e.filename == file_name);
+        let duplicate_entry = hash_db.entries.iter().any(|e| {
+            let binding = e.filename.replace('\\', "/");
+            let normalized_existing = binding.trim();
+            normalized_existing == normalized_name
+        });
+
         if duplicate_entry {
-            trace!("Updating existing entry for file: {}", file_name);
+            trace!("Updating existing entry for file: {}", normalized_name);
+
+            // Log detailed information for debugging
+            if let Some(ref h) = hash {
+                let existing_entries: Vec<_> = hash_db.entries.iter()
+                    .filter(|e| {
+                        let binding = e.filename.replace('\\', "/");
+                        let normalized_existing = binding.trim();
+                        normalized_existing == normalized_name
+                    })
+                    .collect();
+
+                for entry in existing_entries {
+                    trace!("Existing entry: filename='{}', hash={:?}, post_id={:?}", 
+                           entry.filename, entry.hash, entry.post_id);
+                }
+
+                trace!("New entry: filename='{}', hash={}, post_id={:?}", 
+                       normalized_name, h, post_id);
+            }
         } else {
-            trace!("Adding new entry for file: {}", file_name);
+            trace!("Adding new entry for file: {}", normalized_name);
         }
 
-        hash_db.add_or_update_entry(file_name, hash, short_url, post_id);
+        hash_db.add_or_update_entry(normalized_name, hash, short_url, post_id);
 
         // Update cached database
         self.cached_database = Some(hash_db.clone());
@@ -1856,21 +1897,56 @@ let mut files = match files_mutex.lock() {
                 // Only check posts that aren't already marked as duplicates
                 if !*is_duplicate {
                     // Generate potential filenames based on naming convention
-                    let potential_filenames = match naming_convention {
+                    let mut potential_filenames = Vec::new();
+
+                    // Common image extensions - expanded list to cover more formats
+                    let extensions = [
+                        "jpg", "jpeg", "png", "gif", "webm", "mp4", "swf", 
+                        "webp", "avif", "heic", "tiff", "bmp"
+                    ];
+
+                    // Generate potential filenames based on naming convention
+                    match naming_convention {
                         "md5" => {
-                            // We can't easily generate md5 filenames without the actual post data
-                            // Skip this check for md5 naming convention
-                            Vec::new()
+                            // For md5 naming convention, we can't generate the exact md5 hash
+                            // But we can check if the post ID is in the blacklist in other formats
+                            for ext in extensions {
+                                potential_filenames.push(format!("{}.{}", post_id, ext));
+                            }
                         },
                         "id" => {
                             // For id naming convention, we can generate potential filenames
-                            // Common image extensions
-                            let extensions = ["jpg", "png", "gif", "webm", "mp4", "swf"];
-                            extensions.iter()
-                                .map(|ext| format!("{}.{}", post_id, ext))
-                                .collect()
+                            for ext in extensions {
+                                potential_filenames.push(format!("{}.{}", post_id, ext));
+                            }
+
+                            // Also check for common artist names with this post ID
+                            // Since we don't know the actual artist, we'll check some common prefixes
+                            let common_prefixes = [
+                                "artist", "unknown", "anonymous", "creator", "author",
+                                // Add some common artist name patterns
+                                "fluff", "fur", "paw", "fox", "wolf", "dragon", "cat", "dog",
+                                "bunny", "rabbit", "tiger", "lion", "horse", "pony", "deer",
+                                // Add some common username patterns
+                                "art", "draw", "sketch", "paint", "doodle", "commission",
+                                // Add some common style patterns
+                                "cute", "kawaii", "chibi", "anime", "manga", "cartoon",
+                                // Add some common theme patterns
+                                "nsfw", "adult", "mature", "explicit", "lewd", "nude"
+                            ];
+
+                            for prefix in common_prefixes {
+                                for ext in extensions {
+                                    potential_filenames.push(format!("{}_{}.{}", prefix, post_id, ext));
+                                }
+                            }
                         },
-                        _ => Vec::new(),
+                        _ => {
+                            // For other naming conventions, still check basic ID format
+                            for ext in extensions {
+                                potential_filenames.push(format!("{}.{}", post_id, ext));
+                            }
+                        },
                     };
 
                     // Check if any potential filename is blacklisted

@@ -75,28 +75,28 @@ impl<'a> LazyCollectionProcessor<'a> {
             current_post_idx: 0,
         }
     }
-    
+
     /// Gets the next batch of posts for processing, limiting memory usage
     fn next_batch(&mut self, batch_size: usize) -> Option<(String, SmallVec<&grabber::GrabbedPost, 32>)> {
         if self.current_collection_idx >= self.collection_indices.len() {
             return None;
         }
-        
+
         let collection_idx = self.collection_indices[self.current_collection_idx];
         let collection = &self.grabber.posts()[collection_idx];
         let posts = collection.posts();
-        
+
         if self.current_post_idx >= posts.len() {
             // Move to next collection
             self.current_collection_idx += 1;
             self.current_post_idx = 0;
             return self.next_batch(batch_size);
         }
-        
+
         // Collect up to batch_size new posts
         let mut batch: SmallVec<&grabber::GrabbedPost, 32> = SmallVec::new();
         let start_idx = self.current_post_idx;
-        
+
         for (idx, post) in posts[start_idx..].iter().enumerate() {
             if batch.len() >= batch_size {
                 break;
@@ -106,17 +106,17 @@ impl<'a> LazyCollectionProcessor<'a> {
             }
             self.current_post_idx = start_idx + idx + 1;
         }
-        
+
         if batch.is_empty() {
             // No new posts in this collection, move to next
             self.current_collection_idx += 1;
             self.current_post_idx = 0;
             return self.next_batch(batch_size);
         }
-        
+
         Some((collection.name().to_string(), batch))
     }
-    
+
     /// Estimates the total number of new posts across all collections
     fn estimate_total_new_posts(&self) -> usize {
         self.collection_indices.iter()
@@ -214,11 +214,11 @@ impl PipelineConfig {
         let total_cores = num_cpus::get();
         let download_threads = std::cmp::max(1, total_cores / 2);
         let hash_threads = std::cmp::max(1, total_cores - download_threads);
-        
+
         // Queue sizes based on thread counts to prevent memory overflow
         let download_queue_size = download_threads * 4; // 4 jobs per thread
         let hash_queue_size = hash_threads * 4; // 4 jobs per thread
-        
+
         PipelineConfig {
             total_cores,
             download_threads,
@@ -227,18 +227,18 @@ impl PipelineConfig {
             hash_queue_size,
         }
     }
-    
+
     /// Adjusts the configuration based on user concurrency settings
     fn with_user_concurrency(mut self, user_concurrency: usize) -> Self {
         // Respect user's total concurrency preference but split intelligently
         let total_requested = user_concurrency;
         self.download_threads = std::cmp::max(1, total_requested / 2);
         self.hash_threads = std::cmp::max(1, total_requested - self.download_threads);
-        
+
         // Adjust queue sizes accordingly
         self.download_queue_size = self.download_threads * 4;
         self.hash_queue_size = self.hash_threads * 4;
-        
+
         self
     }
 }
@@ -297,6 +297,8 @@ pub(crate) struct E621WebConnector {
     memory_manager: MemoryManager,
     /// Global progress counter that tracks total files downloaded across all collections
     global_progress_counter: Arc<AtomicUsize>,
+    /// Selected download mode: 1 = Tags only, 2 = Artists only, 3 = Both
+    download_mode: usize,
 }
 
 impl E621WebConnector {
@@ -315,14 +317,14 @@ impl E621WebConnector {
                 // dialoguer failed (likely due to TTY detection), fall back to console input
                 use console::Term;
                 use std::io::Write;
-                
+
                 let term = Term::stdout();
                 let default_str = if default { "Y/n" } else { "y/N" };
-                
+
                 // Show the prompt with default indication
                 print!("{} [{}]: ", prompt, default_str);
                 std::io::stdout().flush()?;
-                
+
                 // Read line from terminal
                 match term.read_line() {
                     Ok(input) => {
@@ -337,12 +339,12 @@ impl E621WebConnector {
                                 default
                             }
                         };
-                        
+
                         // Echo the result back to confirm
                         if input.is_empty() {
                             println!("{}", if result { "yes" } else { "no" });
                         }
-                        
+
                         Ok(result)
                     },
                     Err(console_err) => {
@@ -356,7 +358,7 @@ impl E621WebConnector {
             }
         }
     }
-    
+
     /// Robust input prompt that works in both standalone terminals and IDE environments
     /// Falls back to console input when dialoguer fails due to TTY detection issues
     fn robust_input_prompt<T>(prompt: &str, default: T) -> Result<T, anyhow::Error> 
@@ -375,13 +377,13 @@ impl E621WebConnector {
                 // dialoguer failed (likely due to TTY detection), fall back to console input
                 use console::Term;
                 use std::io::Write;
-                
+
                 let term = Term::stdout();
-                
+
                 // Show the prompt with default indication
                 print!("{} [{}]: ", prompt, default);
                 std::io::stdout().flush()?;
-                
+
                 // Read line from terminal
                 match term.read_line() {
                     Ok(input) => {
@@ -412,7 +414,7 @@ impl E621WebConnector {
             }
         }
     }
-    
+
     /// Creates instance of `Self` for grabbing and downloading posts.
     pub(crate) fn new(request_sender: &RequestSender) -> Self {
         // Default caps: 20GB per file, 100GB total
@@ -432,6 +434,7 @@ impl E621WebConnector {
             total_batches: 0,
             memory_manager: MemoryManager::new(),
             global_progress_counter: Arc::new(AtomicUsize::new(0)),
+            download_mode: 1, // Default to Tags only
         }
     }
 
@@ -468,7 +471,7 @@ impl E621WebConnector {
     /// Asks the user to configure max pages to search and saves to config file
     pub(crate) fn configure_max_pages_to_search(&self) {
         let current_max_pages = Config::get().max_pages_to_search();
-        
+
         // Provide information about max pages to search
         println!("\nMaximum pages to search controls how deep the search goes for each tag.");
         println!("Recommended page limits:");
@@ -477,7 +480,7 @@ impl E621WebConnector {
         println!("   - Deep (15-25 pages): Thorough search, finds older content");
         println!("   - Exhaustive (50+ pages): Complete search, may take a long time");
         println!("The system will automatically choose optimal thread count based on pages.");
-        
+
         let pages_prompt = format!("Maximum pages to search per tag (default: {})", current_max_pages);
 
         let new_max_pages: usize = Self::robust_input_prompt(&pages_prompt, current_max_pages)
@@ -499,7 +502,7 @@ impl E621WebConnector {
 
         // Calculate and show the optimal thread count that will be used
         let optimal_threads = Self::calculate_optimal_thread_count(new_max_pages);
-        
+
         // Inform the user with appropriate messaging
         if new_max_pages <= 5 {
             println!("Max pages set to: {} (Quick search - {} threads)", new_max_pages, optimal_threads);
@@ -511,21 +514,21 @@ impl E621WebConnector {
             println!("CAUTION: Max pages set to: {} (Exhaustive search - {} threads)", new_max_pages, optimal_threads);
         }
     }
-    
+
     /// Asks the user to select download mode and manage tags or artists accordingly
-    pub(crate) fn configure_download_mode(&self) {
+    pub(crate) fn configure_download_mode(&mut self) {
         println!("\nDownload Mode Selection");
         println!("Choose how you want to download content:");
         println!("1. Download by Tags (Search by tags, pools, sets, and individual posts)");
         println!("2. Download by Artists (Download posts from specific artists)");
         println!("3. Download by Both (Manage both tags and artists)");
-        
+
         let selection = loop {
             let input: String = dialoguer::Input::new()
                 .with_prompt("Select download mode (1-3):")
                 .interact_text()
                 .unwrap_or_else(|_| "1".to_string());
-            
+
             if let Ok(num) = input.trim().parse::<usize>() {
                 if num > 0 && num <= 3 {
                     break num;
@@ -533,7 +536,10 @@ impl E621WebConnector {
             }
             println!("Invalid selection. Please enter a number between 1 and 3");
         };
-        
+
+        // Store the selected download mode
+        self.download_mode = selection;
+
         match selection {
             1 => {
                 // Tags only
@@ -554,32 +560,33 @@ impl E621WebConnector {
             _ => {
                 // Default to tags
                 println!("\nDefaulting to: Download by Tags");
+                self.download_mode = 1; // Ensure default is set correctly
                 self.configure_tag_fetching();
             }
         }
     }
-    
+
     /// Asks the user about tag fetching and manages tags.txt file
     pub(crate) fn configure_tag_fetching(&self) {
         println!("\nTag Management Options");
-        
+
         let tag_options = vec![
             "Interactive Tag Management (Search, discover, and curate tags)",
             "Auto-fetch Popular Tags (Quick setup with popular non-blacklisted tags)",
             "Skip tag setup (Use existing tags.txt or create manually later)"
         ];
-        
+
         println!("How would you like to manage your tags?");
         for (i, option) in tag_options.iter().enumerate() {
             println!("{}. {}", i + 1, option);
         }
-        
+
         let selection = loop {
             let input: String = dialoguer::Input::new()
                 .with_prompt(&format!("Select option (1-{}):", tag_options.len()))
                 .interact_text()
                 .unwrap_or_else(|_| "3".to_string());
-            
+
             if let Ok(num) = input.trim().parse::<usize>() {
                 if num > 0 && num <= tag_options.len() {
                     break num - 1;
@@ -587,7 +594,7 @@ impl E621WebConnector {
             }
             println!("Invalid selection. Please enter a number between 1 and {}", tag_options.len());
         };
-        
+
         match selection {
             0 => {
                 // Interactive mode
@@ -608,24 +615,24 @@ impl E621WebConnector {
                 // Check if tags.txt already exists
                 if TagFetcher::tags_file_exists() {
                     println!("\nFound existing tags.txt file.");
-                    
+
                     let refresh_tags = Self::robust_confirm_prompt(
                         "Would you like to refresh tags.txt with popular non-blacklisted tags from e621?",
                         false
                     ).unwrap_or(false);
-                    
+
                     if !refresh_tags {
                         info!("Using existing tags.txt file.");
                         return;
                     }
                 } else {
                     println!("\nNo tags.txt file found.");
-                    
+
                     let create_tags = Self::robust_confirm_prompt(
                         "Would you like to fetch popular non-blacklisted tags from e621 and create tags.txt?",
                         true
                     ).unwrap_or(true);
-                    
+
                     if !create_tags {
                         info!("Skipping tag fetching. You can manually create tags.txt with your desired tags.");
                         return;
@@ -638,10 +645,10 @@ impl E621WebConnector {
                 return;
             }
         }
-        
+
         // Get user preferences for tag fetching
         println!("\nTag fetching options:");
-        
+
         let tag_count_prompt = "Number of popular tags to fetch (default: 100)";
         let tag_count: usize = Self::robust_input_prompt(&tag_count_prompt, 100)
             .unwrap_or_else(|err| {
@@ -649,7 +656,7 @@ impl E621WebConnector {
                 warn!("Using default tag count: 100");
                 100
             });
-        
+
         let min_posts_prompt = "Minimum post count per tag (default: 1000)";
         let min_posts: i32 = Self::robust_input_prompt(&min_posts_prompt, 1000)
             .unwrap_or_else(|err| {
@@ -657,10 +664,10 @@ impl E621WebConnector {
                 warn!("Using default min posts: 1000");
                 1000
             });
-        
+
         // Create tag fetcher (it will fetch user blacklist internally)
         let mut tag_fetcher = TagFetcher::new(self.request_sender.clone());
-        
+
         // Fetch and save tags
         match tag_fetcher.refresh_tags(tag_count, min_posts) {
             Ok(()) => {
@@ -673,28 +680,28 @@ impl E621WebConnector {
             }
         }
     }
-    
+
     /// Asks the user about artist fetching and manages artists.json file
     pub(crate) fn configure_artist_fetching(&self) {
         println!("\nArtist Management Options");
-        
+
         let artist_options = vec![
             "Interactive Artist Management (Search, discover, and curate artists)",
             "Auto-fetch Popular Artists (Quick setup with popular artists)",
             "Skip artist setup (Use existing artists.json or create manually later)"
         ];
-        
+
         println!("How would you like to manage your artists?");
         for (i, option) in artist_options.iter().enumerate() {
             println!("{}. {}", i + 1, option);
         }
-        
+
         let selection = loop {
             let input: String = dialoguer::Input::new()
                 .with_prompt(&format!("Select option (1-{}):", artist_options.len()))
                 .interact_text()
                 .unwrap_or_else(|_| "3".to_string());
-            
+
             if let Ok(num) = input.trim().parse::<usize>() {
                 if num > 0 && num <= artist_options.len() {
                     break num - 1;
@@ -702,7 +709,7 @@ impl E621WebConnector {
             }
             println!("Invalid selection. Please enter a number between 1 and {}", artist_options.len());
         };
-        
+
         match selection {
             0 => {
                 // Interactive mode
@@ -723,24 +730,24 @@ impl E621WebConnector {
                 // Check if artists.json already exists
                 if ArtistFetcher::artists_file_exists() {
                     println!("\nFound existing artists.json file.");
-                    
+
                     let refresh_artists = Self::robust_confirm_prompt(
                         "Would you like to refresh artists.json with popular artists from e621?",
                         false
                     ).unwrap_or(false);
-                    
+
                     if !refresh_artists {
                         info!("Using existing artists.json file.");
                         return;
                     }
                 } else {
                     println!("\nNo artists.json file found.");
-                    
+
                     let create_artists = Self::robust_confirm_prompt(
                         "Would you like to fetch popular artists from e621 and create artists.json?",
                         true
                     ).unwrap_or(true);
-                    
+
                     if !create_artists {
                         info!("Skipping artist fetching. You can manually create artists.json with your desired artists.");
                         return;
@@ -753,10 +760,10 @@ impl E621WebConnector {
                 return;
             }
         }
-        
+
         // Get user preferences for artist fetching
         println!("\nArtist fetching options:");
-        
+
         let artist_count_prompt = "Number of popular artists to fetch (default: 50)";
         let artist_count: usize = Self::robust_input_prompt(&artist_count_prompt, 50)
             .unwrap_or_else(|err| {
@@ -764,7 +771,7 @@ impl E621WebConnector {
                 warn!("Using default artist count: 50");
                 50
             });
-        
+
         let min_posts_prompt = "Minimum post count per artist (default: 500)";
         let min_posts: i32 = Self::robust_input_prompt(&min_posts_prompt, 500)
             .unwrap_or_else(|err| {
@@ -772,10 +779,10 @@ impl E621WebConnector {
                 warn!("Using default min posts: 500");
                 500
             });
-        
+
         // Create artist fetcher
         let mut artist_fetcher = ArtistFetcher::new(self.request_sender.clone());
-        
+
         // Fetch and save artists
         match artist_fetcher.refresh_artists(artist_count, min_posts) {
             Ok(()) => {
@@ -788,7 +795,7 @@ impl E621WebConnector {
             }
         }
     }
-    
+
     /// Calculate optimal thread count based on the number of pages to search
     fn calculate_optimal_thread_count(max_pages: usize) -> usize {
         match max_pages {
@@ -800,7 +807,7 @@ impl E621WebConnector {
             _ => 6,              // Very large searches max out at 6 threads
         }
     }
-    
+
     /// Asks the user to configure the batch size for downloads.
     pub(crate) fn configure_batch_size(&mut self) {
         let batch_size_prompt = format!("Number of collections to download simultaneously (default: {})", self.batch_size);
@@ -915,28 +922,28 @@ impl E621WebConnector {
             }
         }
     }
-    
+
     /// Asks the user about database management options
     pub(crate) fn configure_database_management(&self) {
         println!("\nDatabase Management Options");
-        
+
         let db_options = vec![
             "Check repair status (View when database was last repaired)",
             "Repair database now (Fix missing post_id/short_url fields)",
             "Skip database management"
         ];
-        
+
         println!("How would you like to manage your database?");
         for (i, option) in db_options.iter().enumerate() {
             println!("{}. {}", i + 1, option);
         }
-        
+
         let selection = loop {
             let input: String = dialoguer::Input::new()
                 .with_prompt(&format!("Select option (1-{}):", db_options.len()))
                 .interact_text()
                 .unwrap_or_else(|_| "3".to_string());
-            
+
             if let Ok(num) = input.trim().parse::<usize>() {
                 if num > 0 && num <= db_options.len() {
                     break num - 1;
@@ -944,12 +951,12 @@ impl E621WebConnector {
             }
             println!("Invalid selection. Please enter a number between 1 and {}", db_options.len());
         };
-        
+
         match selection {
             0 => {
                 // Check repair status
                 println!("\nChecking database repair status...");
-                
+
                 // Get status from DirectoryManager
                 match DirectoryManager::new(".", true) {
                     Ok(manager) => {
@@ -962,18 +969,18 @@ impl E621WebConnector {
                         println!("✗ Could not check repair status: {}", e);
                     }
                 }
-                
+
                 info!("User requested database repair status check");
             },
             1 => {
                 // Repair database now
                 println!("\nPerforming on-demand database repair...");
-                
+
                 let confirm_repair = Self::robust_confirm_prompt(
                     "This will scan and repair missing post_id and short_url fields. Continue?",
                     true
                 ).unwrap_or(true);
-                
+
                 if confirm_repair {
                     println!("Starting database repair...");
                     println!("Extracting missing post_id and short_url fields from filenames.");
@@ -1053,7 +1060,7 @@ impl E621WebConnector {
     /// Gets input and enters safe depending on user choice.
     pub(crate) fn should_enter_safe_mode(&mut self) {
         trace!("Prompt for safe mode...");
-        
+
         let confirm_prompt = Self::robust_confirm_prompt("Should enter safe mode?", false)
             .unwrap_or_else(|err| {
                 warn!("Failed to setup confirmation prompt: {}", err);
@@ -1099,12 +1106,20 @@ impl E621WebConnector {
     pub(crate) fn grab_all(&mut self, groups: &[Group]) {
         trace!("Grabbing posts...");
         self.grabber.grab_favorites();
-        self.grabber.grab_posts_by_tags(groups);
-        
-        // Also grab by artists if any are configured
-        if let Ok(artists) = crate::e621::io::artist::parse_artist_file(&self.request_sender) {
-            if !artists.is_empty() {
-                self.grabber.grab_posts_by_artists(&artists);
+
+        // Always grab posts by tags if we're in mode 1 (Tags only) or 3 (Both)
+        if self.download_mode == 1 || self.download_mode == 3 {
+            trace!("Grabbing posts by tags (download mode: {})", self.download_mode);
+            self.grabber.grab_posts_by_tags(groups);
+        }
+
+        // Only grab by artists if we're in mode 2 (Artists only) or 3 (Both)
+        if self.download_mode == 2 || self.download_mode == 3 {
+            trace!("Grabbing posts by artists (download mode: {})", self.download_mode);
+            if let Ok(artists) = crate::e621::io::artist::parse_artist_file(&self.request_sender) {
+                if !artists.is_empty() {
+                    self.grabber.grab_posts_by_artists(&artists);
+                }
             }
         }
     }
@@ -1225,46 +1240,46 @@ impl E621WebConnector {
             error!("Invalid batch size: 0. Setting to default value of 1.");
             self.batch_size = 1;
         }
-        
+
         // Use saturating arithmetic to prevent overflow
         self.total_batches = total_collections.saturating_add(self.batch_size.saturating_sub(1)) / self.batch_size;
-        
+
         // Ensure we have at least one batch
         if self.total_batches == 0 {
             self.total_batches = 1;
         }
 
         // Check if we should use memory-efficient mode
-        
+
         let estimated_memory_per_post = estimate_collection_memory_usage(1, 1024 * 1024);  // Average 1MB per post
-        
+
         let avg_posts_per_collection = if total_collections > 0 {
             approx_total_posts / total_collections
         } else {
             1
         };
-        
+
         let batch_size_recommendation = self.memory_manager.calculate_optimal_batch_size(
             total_collections,
             avg_posts_per_collection,
             estimated_memory_per_post,
         );
-        
+
         self.batch_size = batch_size_recommendation.batch_size;
-        
+
         // Provide feedback about memory optimization
         if batch_size_recommendation.memory_info.is_warning() {
             warn!("High memory usage detected ({}). Using smaller batch sizes for safety.", 
                   batch_size_recommendation.memory_info.format_usage());
         }
-        
+
         info!("Optimized batch size: {} collections per batch (reasoning: {})", 
               self.batch_size, 
               match batch_size_recommendation.reasoning {
                   crate::e621::memory::BatchSizeReasoning::MemoryLimited => "memory limited",
                   crate::e621::memory::BatchSizeReasoning::CpuLimited => "CPU limited",
               });
-        
+
         // Process collections
         if approx_total_posts > self.batch_size * 2 {
             // For very large downloads, we'll process one collection at a time
@@ -1288,7 +1303,7 @@ impl E621WebConnector {
 
             // Initialize progress bar for large downloads with accurate count
             self.progress_bar = ProgressBar::new(post_count as u64);
-            
+
             // Configure progress bar to show file counts and download size
             let total_size_formatted = self.format_file_size(length * 1024); // Convert KB to bytes for formatting
             let progress_style = ProgressStyle::default_bar()
@@ -1296,7 +1311,7 @@ impl E621WebConnector {
                 .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("#>-");
             self.progress_bar.set_style(progress_style);
-            
+
             // Enable the progress bar to be displayed during downloads
             self.progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
 
@@ -1357,7 +1372,7 @@ impl E621WebConnector {
 
         // Set progress bar total to exact number of files to be downloaded (never over- or under-count)
         self.progress_bar = ProgressBar::new(new_post_count as u64);
-        
+
         // Configure progress bar to show file counts and download size
         let total_size_formatted = self.format_file_size(length * 1024); // Convert KB to bytes for formatting
         let progress_style = ProgressStyle::default_bar()
@@ -1365,7 +1380,7 @@ impl E621WebConnector {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-");
         self.progress_bar.set_style(progress_style);
-        
+
         // Enable the progress bar to be displayed during downloads
         self.progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
 
@@ -1390,7 +1405,7 @@ impl E621WebConnector {
                 let batch_desc = if end_idx > start_idx {
                     // Safe to compute difference since we checked end_idx > start_idx
                     let collection_count = end_idx.saturating_sub(start_idx);
-                    
+
                     if collection_count > 1 {
                         let collection_names: Vec<String> = collection_infos[start_idx..end_idx]
                             .iter()
@@ -1432,14 +1447,14 @@ impl E621WebConnector {
     fn download_single_collection(&mut self, collection_info: &CollectionInfo) {
         // Get pipeline configuration
         let pipeline_config = PipelineConfig::new().with_user_concurrency(self.max_download_concurrency);
-        
+
         info!("Multicore pipeline configured: {} download threads, {} hash threads (total: {} cores)", 
               pipeline_config.download_threads, pipeline_config.hash_threads, pipeline_config.total_cores);
-        
+
         // Use multicore pipeline for this collection
         self.download_collection_with_pipeline(collection_info, pipeline_config);
     }
-    
+
     /// Downloads a collection using the multicore pipeline system
     fn download_collection_with_pipeline(&mut self, collection_info: &CollectionInfo, pipeline_config: PipelineConfig) {
         // Get directory manager
@@ -1461,7 +1476,7 @@ impl E621WebConnector {
         // Queue for hashing jobs and completed processing
         let (hash_tx, hash_rx): (Sender<HashingJob>, Receiver<HashingJob>) = channel();
         let (processed_tx, processed_rx): (Sender<ProcessedFile>, Receiver<ProcessedFile>) = channel();
-        
+
         // Wrap receivers in Arc<Mutex<>> for sharing across threads
         let download_rx = Arc::new(Mutex::new(download_rx));
         let hash_rx = Arc::new(Mutex::new(hash_rx));
@@ -1470,7 +1485,7 @@ impl E621WebConnector {
         let mut download_queue = VecDeque::new();
 
         // Thread pool for downloads
-        let _download_pool = match ThreadPoolBuilder::new()
+        let download_pool = match ThreadPoolBuilder::new()
             .num_threads(pipeline_config.download_threads)
             .build()
         {
@@ -1484,7 +1499,7 @@ impl E621WebConnector {
         };
 
         // Thread pool for hashing
-        let _hash_pool = match ThreadPoolBuilder::new()
+        let hash_pool = match ThreadPoolBuilder::new()
             .num_threads(pipeline_config.hash_threads)
             .build()
         {
@@ -1505,15 +1520,19 @@ impl E621WebConnector {
         // Create cloneable functions for the threads
         let download_fn = self.clone_download_fn();
         let calculate_hash = self.clone_calculate_hash();
-        
-        // Spawn download threads
-        let mut download_handles = Vec::new();
+
+        // Use download thread pool
+        let download_rx = Arc::clone(&download_rx);
+        let completed_tx = Arc::new(Mutex::new(completed_tx));
+        let download_fn = Arc::clone(&download_fn);
+
+        // Execute download jobs in the thread pool
         for _ in 0..pipeline_config.download_threads {
             let download_rx = Arc::clone(&download_rx);
-            let completed_tx = completed_tx.clone();
+            let completed_tx = Arc::clone(&completed_tx);
             let download_fn = Arc::clone(&download_fn);
-        
-            let handle = thread::spawn(move || {
+
+            download_pool.spawn(move || {
                 loop {
                     let job = {
                         let rx = match download_rx.lock() {
@@ -1525,14 +1544,14 @@ impl E621WebConnector {
                         };
                         rx.recv()
                     };
-                    
+
                     match job {
                         Ok(job) => {
                             // Perform download
                             let start_time = Instant::now();
                             let download_result = download_fn(&job.url, &job.file_path);
                             let duration = start_time.elapsed();
-                            
+
                             match download_result {
                                 Ok(_) => {
                                     // Send completed download
@@ -1546,10 +1565,18 @@ impl E621WebConnector {
                                         short_url: job.short_url,
                                         post_id: job.post_id,
                                     };
-                                    let _ = completed_tx.send(completed_file);
+                                    let tx = match completed_tx.lock() {
+                                        Ok(tx) => tx,
+                                        Err(e) => {
+                                            error!("Failed to lock completed sender: {}", e);
+                                            return;
+                                        }
+                                    };
+                                    let _ = tx.send(completed_file);
                                 },
-                                Err(_) => {
-                                    // Handle download error - could log here
+                                Err(e) => {
+                                    // Handle download error
+                                    error!("Download error for {}: {}", job.post_name, e);
                                 }
                             }
                         },
@@ -1557,17 +1584,20 @@ impl E621WebConnector {
                     }
                 }
             });
-            download_handles.push(handle);
         }
 
-        // Spawn hashing threads
-        let mut hash_handles = Vec::new();
+        // Use hash thread pool
+        let hash_rx = Arc::clone(&hash_rx);
+        let processed_tx = Arc::new(Mutex::new(processed_tx));
+        let calculate_hash = Arc::clone(&calculate_hash);
+
+        // Execute hash jobs in the thread pool
         for _ in 0..pipeline_config.hash_threads {
             let hash_rx = Arc::clone(&hash_rx);
-            let processed_tx = processed_tx.clone();
+            let processed_tx = Arc::clone(&processed_tx);
             let calculate_hash = Arc::clone(&calculate_hash);
 
-            let handle = thread::spawn(move || {
+            hash_pool.spawn(move || {
                 loop {
                     let job = {
                         let rx = match hash_rx.lock() {
@@ -1579,7 +1609,7 @@ impl E621WebConnector {
                         };
                         rx.recv()
                     };
-                    
+
                     match job {
                         Ok(job) => {
                             // Perform hashing
@@ -1616,13 +1646,19 @@ impl E621WebConnector {
                                 },
                             };
 
-                            let _ = processed_tx.send(processed_file);
+                            let tx = match processed_tx.lock() {
+                                Ok(tx) => tx,
+                                Err(e) => {
+                                    error!("Failed to lock processed sender: {}", e);
+                                    return;
+                                }
+                            };
+                            let _ = tx.send(processed_file);
                         },
                         Err(_) => break, // Channel closed
                     }
                 }
             });
-            hash_handles.push(handle);
         }
 
         let progress_bar = self.progress_bar.clone();
@@ -1642,12 +1678,12 @@ impl E621WebConnector {
         let all_posts_count = collection_info.posts().len();
         let new_files: Vec<_> = collection_info.posts().iter().filter(|post| post.is_new()).collect();
         let total_files = new_files.len();
-        
+
         info!(
             "Collection '{}': {} total posts, {} marked as new",
             collection_info.name, all_posts_count, total_files
         );
-        
+
         if total_files == 0 {
             warn!(
                 "No new files to download in collection '{}' - all {} posts marked as duplicates",
@@ -1669,7 +1705,7 @@ impl E621WebConnector {
             collection_info.short_name.clone()
         };
         self.progress_bar.set_prefix(short_name);
-        
+
         // Prepare download jobs
         for post in &new_files {
             let save_dir = match post.save_directory() {
@@ -1682,9 +1718,9 @@ impl E621WebConnector {
                     continue;
                 }
             };
-            
+
             let file_path = save_dir.join(remove_invalid_chars(post.name()));
-            
+
             let download_job = DownloadJob {
                 url: post.url().to_string(),
                 file_path,
@@ -1695,13 +1731,13 @@ impl E621WebConnector {
                 short_url: post.short_url().map(|s| s.to_string()),
                 post_id: post.post_id(),
             };
-            
+
             download_queue.push_back(download_job);
         }
-        
+
         // Start pipeline processing
         info!("Starting pipeline: {} jobs queued for download", download_queue.len());
-        
+
         // Feed initial jobs to download threads
         for _ in 0..std::cmp::min(pipeline_config.download_queue_size, download_queue.len()) {
             if let Some(job) = download_queue.pop_front() {
@@ -1710,16 +1746,16 @@ impl E621WebConnector {
                 }
             }
         }
-        
+
         // Pipeline coordination loop
         let mut files_completed = 0;
         let mut files_processing = 0;
-        
+
         loop {
             // Process completed downloads
             if let Ok(downloaded_file) = completed_rx.try_recv() {
                 files_processing += 1;
-                
+
                 // Create hashing job
                 let hash_job = HashingJob {
                     file_path: downloaded_file.file_path,
@@ -1731,12 +1767,12 @@ impl E621WebConnector {
                     short_url: downloaded_file.short_url,
                     post_id: downloaded_file.post_id,
                 };
-                
+
                 // Send to hash queue
                 if let Err(e) = hash_tx.send(hash_job) {
                     error!("Failed to send hashing job: {}", e);
                 }
-                
+
                 // Feed more download jobs if available
                 if let Some(job) = download_queue.pop_front() {
                     if let Err(e) = download_tx.send(job) {
@@ -1744,18 +1780,18 @@ impl E621WebConnector {
                     }
                 }
             }
-            
+
             // Process completed hashes
             if let Ok(processed_file) = processed_rx.try_recv() {
                 files_completed += 1;
                 files_processing -= 1;
-                
+
                 // Update progress and database
                 let current = global_progress_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                
+
                 if processed_file.success {
                     let speed_kbps = processed_file.file_size as f64 / 1024.0 / processed_file.download_duration.as_secs_f64();
-                    
+
                     // Store hash with the downloaded file for future verification including URL metadata
                     let relpath = processed_file.save_directory.join(&processed_file.post_name);
                     let relpath_str = relpath
@@ -1775,7 +1811,7 @@ impl E621WebConnector {
                         processed_file.short_url.clone(),
                         Some(processed_file.post_id),
                     );
-                    
+
                     progress_bar.set_message(format!("Downloaded & verified: {} ({:.2} KB/s)", processed_file.post_name, speed_kbps));
                     trace!("Stored hash {} and URL {} for post ID {}", processed_file.calculated_hash, 
                            processed_file.short_url.as_deref().unwrap_or("N/A"), processed_file.post_id);
@@ -1783,23 +1819,23 @@ impl E621WebConnector {
                     warn!("Failed to process {}: {}", processed_file.post_name, processed_file.error_message.unwrap_or_else(|| "Unknown error".to_string()));
                     progress_bar.set_message(format!("Error processing: {}", processed_file.post_name));
                 }
-                
+
                 progress_bar.set_position(current as u64);
             }
-            
+
             // Check if all files are done
             if files_completed >= total_files {
                 break;
             }
-            
+
             // Small delay to prevent busy waiting
             std::thread::sleep(Duration::from_millis(10));
         }
-        
+
         // Wait for all threads to complete
         drop(download_tx);
         drop(hash_tx);
-        
+
         info!("Completed downloading {} files from collection: {}", total_files, collection_info.name);
         trace!("Collection {} is finished downloading...", collection_info.name);
     }
@@ -1820,7 +1856,7 @@ impl E621WebConnector {
 
         // Format size for display (convert KB to bytes for formatting)
         let formatted_size = self.format_file_size(total_size_kb * 1024);
-        
+
         info!("Large download detected: {} files totaling {}", post_count, formatted_size);
 
         // Display warning and options
@@ -1849,7 +1885,7 @@ impl E621WebConnector {
             Err(dialoguer_err) => {
                 warn!("dialoguer::Select failed: {}", dialoguer_err);
                 warn!("Falling back to simple confirmation prompt");
-                
+
                 // Fall back to simple yes/no prompt
                 let proceed = Self::robust_confirm_prompt(
                     &format!("Proceed with large download of {} ({} files)?", formatted_size, post_count),
@@ -1859,7 +1895,7 @@ impl E621WebConnector {
                     error!("Defaulting to cancel download for safety");
                     false
                 });
-                
+
                 if proceed {
                     info!("User confirmed to proceed with download");
                     Ok(0) // Proceed
@@ -1934,7 +1970,7 @@ impl E621WebConnector {
     /// Helper method to create a cloneable download function
     fn clone_download_fn(&self) -> Arc<dyn Fn(&str, &Path) -> Result<(), anyhow::Error> + Send + Sync> {
         let request_sender = self.request_sender.clone();
-        
+
         Arc::new(move |url: &str, path: &Path| -> Result<(), anyhow::Error> {
             // Create parent directory if it doesn't exist
             if let Some(parent) = path.parent() {
@@ -1958,7 +1994,7 @@ impl E621WebConnector {
             Ok(())
         })
     }
-    
+
     /// Helper method to create a cloneable hash calculation function
     fn clone_calculate_hash(&self) -> Arc<dyn Fn(&Path) -> Result<String, anyhow::Error> + Send + Sync> {
         Arc::new(|file_path: &Path| -> Result<String, anyhow::Error> {
@@ -2057,26 +2093,26 @@ impl E621WebConnector {
         stream_config: StreamingConfig,
     ) -> Result<(), anyhow::Error> {
         info!("Starting streaming collection processing with config: {:?}", stream_config);
-        
+
         // Create a streaming processor with the configuration
         let mut processor = StreamingProcessor::new(stream_config);
-        
+
         // Set the request sender for the processor
         processor.set_request_sender(self.request_sender.clone());
-        
+
         // Set the progress bar if available
         if !self.progress_bar.is_hidden() {
             processor.set_progress_bar(self.progress_bar.clone());
         }
-        
+
         // Get collections to process
         let collections = self.grabber.posts();
-        
+
         if collections.is_empty() {
             info!("No collections to process.");
             return Ok(());
         }
-        
+
         // Convert collections to streaming format
         let mut stream_collections = Vec::new();
         for collection in collections.iter() {
@@ -2085,7 +2121,7 @@ impl E621WebConnector {
                 .filter(|post| post.is_new())
                 .cloned()
                 .collect();
-            
+
             if !new_posts.is_empty() {
                 stream_collections.push(crate::e621::streaming::Collection {
                     name: collection.name().to_string(),
@@ -2093,19 +2129,18 @@ impl E621WebConnector {
                 });
             }
         }
-        
+
         if stream_collections.is_empty() {
             info!("No new posts to process.");
             return Ok(());
         }
-        
+
         info!("Processing {} collections with streaming processor", stream_collections.len());
-        
+
         // Process collections with the streaming processor
         processor.process_collections(stream_collections).await?;
-        
+
         info!("Streaming collection processing completed");
         Ok(())
     }
 }
-
