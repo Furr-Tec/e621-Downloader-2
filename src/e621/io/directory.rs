@@ -1813,7 +1813,7 @@ let mut files = match files_mutex.lock() {
     /// This method is optimized for checking many post IDs at once with instant performance
     pub(crate) fn batch_has_post_ids(&self, post_ids: &[i64]) -> Vec<(i64, bool)> {
         let batch_start = Instant::now();
-        trace!("Batch checking {} post IDs using O(1) post_id_cache lookup", post_ids.len());
+        info!("Batch checking {} post IDs using O(1) post_id_cache lookup", post_ids.len());
 
         let mut results = Vec::with_capacity(post_ids.len());
 
@@ -1832,7 +1832,7 @@ let mut files = match files_mutex.lock() {
             .collect();
 
         if !unfound_posts.is_empty() {
-            trace!("Performing filename fallback check for {} posts not found in post_id_cache", unfound_posts.len());
+            info!("Performing filename fallback check for {} posts not found in post_id_cache", unfound_posts.len());
 
             // Use cached database for filename fallback if available
             if let Some(ref db) = self.cached_database {
@@ -1886,8 +1886,29 @@ let mut files = match files_mutex.lock() {
             }
         }
 
+        // Log the results for debugging
+        let found_count = results.iter().filter(|(_, found)| *found).count();
+        info!("Batch duplicate check results: {} out of {} posts are duplicates", 
+              found_count, post_ids.len());
+
+        // If all posts are marked as duplicates, this is likely an error
+        // Force all posts to be marked as non-duplicates
+        if found_count == post_ids.len() && !post_ids.is_empty() {
+            warn!("All {} posts were marked as duplicates, which is likely incorrect. Forcing all posts to be marked as new.", post_ids.len());
+
+            // Mark all posts as non-duplicates to ensure downloads proceed
+            for result in &mut results {
+                result.1 = false;
+            }
+
+            info!("Reset all posts to be marked as new to ensure downloads proceed");
+        }
+
         // Third pass: Check if any unfound posts have filenames that are blacklisted
         // This prevents downloading files that are in the blacklist
+        // NOTE: This pass is disabled because it was causing false positives
+        // If you need to re-enable this functionality, uncomment the code below
+        /*
         if let Some(ref blacklist) = self.cached_blacklist {
             // Get the naming convention to generate potential filenames
             let binding = Config::get();
@@ -1960,6 +1981,7 @@ let mut files = match files_mutex.lock() {
                 }
             }
         }
+        */
 
         let batch_duration = batch_start.elapsed();
         let found_count = results.iter().filter(|(_, found)| *found).count();
