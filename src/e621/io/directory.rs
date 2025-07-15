@@ -484,6 +484,33 @@ pub(crate) struct DirectoryManager {
 }
 
 impl DirectoryManager {
+    /// Recursively search for a file in a directory and all its subdirectories
+    /// Returns true if the file is found, false otherwise
+    fn recursive_find_file(dir: &Path, file_name: &str) -> bool {
+        if !dir.is_dir() {
+            return false;
+        }
+
+        // Check if the file exists directly in this directory
+        let direct_path = dir.join(file_name);
+        if direct_path.exists() {
+            return true;
+        }
+
+        // Recursively check all subdirectories
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if Self::recursive_find_file(&path, file_name) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
     /// Creates a new DirectoryManager with the specified root directory and folder preferences
     pub(crate) fn new(root_dir: &str, simplified_folders: bool) -> Result<Self> {
         let root = PathBuf::from(root_dir);
@@ -718,7 +745,7 @@ let mut manager_guard = match manager_arc.lock() {
                     let exists_by_relative_path = disk_files_by_relative_path.contains(f);
 
                     if !exists_by_filename && !exists_by_relative_path {
-                        // Double-check by searching for the file in all subdirectories
+                        // Double-check by recursively searching for the file in all subdirectories
                         let mut found_on_disk = false;
                         for dir in subdirs.iter() {
                             let potential_path = dir.join(f);
@@ -728,19 +755,11 @@ let mut manager_guard = match manager_arc.lock() {
                                 break;
                             }
 
-                            // Also check subdirectories
-                            if let Ok(entries) = fs::read_dir(dir) {
-                                for entry in entries.flatten() {
-                                    if entry.path().is_dir() {
-                                        let subdir_path = entry.path().join(f);
-                                        if subdir_path.exists() {
-                                            found_on_disk = true;
-                                            trace!("File '{}' found in subdir: {}", f, subdir_path.display());
-                                            break;
-                                        }
-                                    }
-                                }
-                                if found_on_disk { break; }
+                            // Recursively search through all subdirectories
+                            found_on_disk = Self::recursive_find_file(dir, f);
+                            if found_on_disk {
+                                trace!("File '{}' found in subdirectory tree of: {}", f, dir.display());
+                                break;
                             }
                         }
 
