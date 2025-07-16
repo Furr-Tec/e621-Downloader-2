@@ -5,15 +5,19 @@
 //! 2. Including task ID, post ID, source, status, and timestamp
 //! 3. Writing logs to a rotating file in JSON or line format
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{debug, error, info, instrument, warn, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
-    fmt::{self, format::FmtSpan, time::UtcTime},
+    fmt::{self, format::FmtSpan, time::ChronoUtc},
     prelude::*,
     EnvFilter,
 };
@@ -37,30 +41,8 @@ pub enum LoggerError {
 /// Result type for logging operations
 pub type LoggerResult<T> = Result<T, LoggerError>;
 
-/// Log entry type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogEntryType {
-    Download,
-    Hash,
-    ApiFetch,
-    System,
-    Error,
-}
-
-impl std::fmt::Display for LogEntryType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogEntryType::Download => write!(f, "download"),
-            LogEntryType::Hash => write!(f, "hash"),
-            LogEntryType::ApiFetch => write!(f, "api_fetch"),
-            LogEntryType::System => write!(f, "system"),
-            LogEntryType::Error => write!(f, "error"),
-        }
-    }
-}
-
-/// Status of an operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Operation status for log entries
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationStatus {
     Started,
     InProgress,
@@ -81,86 +63,117 @@ impl std::fmt::Display for OperationStatus {
     }
 }
 
+/// Log entry type
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogEntryType {
+    Download,
+    Hash,
+    ApiFetch,
+    SystemEvent,
+    Error,
+}
+
+impl std::fmt::Display for LogEntryType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogEntryType::Download => write!(f, "download"),
+            LogEntryType::Hash => write!(f, "hash"),
+            LogEntryType::ApiFetch => write!(f, "api_fetch"),
+            LogEntryType::SystemEvent => write!(f, "system_event"),
+            LogEntryType::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// Log entry for structured logging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// Timestamp of the log entry
+    pub timestamp: String,
+    /// Type of log entry
+    pub entry_type: String,
+    /// Task ID (UUID)
+    pub task_id: Option<String>,
+    /// Post ID
+    pub post_id: Option<u32>,
+    /// Source URL or path
+    pub source: Option<String>,
+    /// Operation status
+    pub status: Option<String>,
+    /// Additional data (JSON object)
+    pub data: Option<serde_json::Value>,
+}
+
 /// Logger for structured logging
 pub struct Logger {
     config_manager: Arc<ConfigManager>,
     log_dir: PathBuf,
-    _guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    log_format: String,
 }
 
 impl Logger {
     /// Create a new logger
-    pub fn new(config_manager: Arc<ConfigManager>) -> LoggerResult<Self> {
-        // Get the app config
-        let app_config = config_manager.get_app_config()
-            .map_err(|e| LoggerError::Config(e.to_string()))?;
-        
-        // Create the log directory if it doesn't exist
-        let log_dir = PathBuf::from(&app_config.paths.log_directory);
-        if !log_dir.exists() {
-            std::fs::create_dir_all(&log_dir)?;
-        }
-        
-        // Initialize the logger
-        let guard = Self::init_logger(&log_dir, &app_config.logging.log_format, &app_config.logging.log_level)?;
-        
-        Ok(Self {
+    pub fn new(config_manager: Arc<ConfigManager>, log_dir: PathBuf, log_format: String) -> Self {
+        Self {
             config_manager,
             log_dir,
-            _guard: Some(guard),
-        })
+            log_format,
+        }
     }
     
-    /// Initialize the logger with proper configuration
-    fn init_logger(log_dir: &Path, format: &str, level: &str) -> LoggerResult<tracing_appender::non_blocking::WorkerGuard> {
-        // Create a rolling file appender
+    /// Initialize the logger
+    pub fn init(&self) -> LoggerResult<()> {
+        // Create the log directory if it doesn't exist
+        if !self.log_dir.exists() {
+            fs::create_dir_all(&self.log_dir)?;
+        }
+        
+        // Get the app config
+        let app_config = self.config_manager.get_app_config()
+            .map_err(|e| LoggerError::Config(e.to_string()))?;
+        
+        // Create a file appender that rolls daily
         let file_appender = RollingFileAppender::new(
             Rotation::DAILY,
-            log_dir,
+            &self.log_dir,
             "e621_downloader.log",
         );
         
-        // Create a non-blocking writer
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        // Create a formatting layer for the file
+        let file_layer = fmt::layer()
+            .with_writer(file_appender)
+            .with_ansi(false)
+            .json()
+            .with_span_events(FmtSpan::CLOSE);
         
         // Create a filter based on the log level
-        let filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new(level))
-            .map_err(|e| LoggerError::Logging(e.to_string()))?;
-        
-        // Determine the format
-        let layer = match format {
-            "json" => {
-                fmt::layer()
-                    .json()
-                    .with_writer(non_blocking)
-                    .with_timer(UtcTime::rfc_3339())
-                    .with_span_events(FmtSpan::CLOSE)
-                    .boxed()
-            }
-            _ => {
-                fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_timer(UtcTime::rfc_3339())
-                    .with_span_events(FmtSpan::CLOSE)
-                    .boxed()
-            }
+        let log_level = match app_config.logging.log_level.to_lowercase().as_str() {
+            "trace" => Level::TRACE,
+            "debug" => Level::DEBUG,
+            "info" => Level::INFO,
+            "warn" => Level::WARN,
+            "error" => Level::ERROR,
+            _ => Level::INFO,
         };
+        
+        let filter_layer = EnvFilter::from_default_env()
+            .add_directive(format!("e621_downloader={}", log_level).parse().unwrap());
         
         // Initialize the tracing subscriber
         tracing_subscriber::registry()
-            .with(filter)
-            .with(layer)
-            .try_init()
-            .map_err(|e| LoggerError::Logging(e.to_string()))?;
+            .with(filter_layer)
+            .with(file_layer)
+            .init();
         
-        info!(
-            log_format = format,
-            log_level = level,
-            message = "Logger initialized",
-        );
-        
-        Ok(guard)
+        info!("Logger initialized");
+        Ok(())
+    }
+    
+    /// Get the current timestamp as an ISO 8601 string
+    fn get_timestamp(&self) -> String {
+        let now = SystemTime::now();
+        let datetime: DateTime<Utc> = now.into();
+        datetime.to_rfc3339()
     }
     
     /// Log a download operation
@@ -170,18 +183,64 @@ impl Logger {
         post_id: u32,
         source: &str,
         status: OperationStatus,
-        file_size: Option<u64>,
+        bytes: Option<u64>,
     ) {
-        info!(
-            entry_type = %LogEntryType::Download,
-            task_id = %task_id,
-            post_id = post_id,
-            source = source,
-            status = %status,
-            file_size = file_size,
-            timestamp = %Utc::now().to_rfc3339(),
-            message = format!("Download {} for post {}", status, post_id),
-        );
+        let data = if let Some(bytes) = bytes {
+            Some(serde_json::json!({ "bytes": bytes }))
+        } else {
+            None
+        };
+        
+        let entry = LogEntry {
+            timestamp: self.get_timestamp(),
+            entry_type: LogEntryType::Download.to_string(),
+            task_id: Some(task_id.to_string()),
+            post_id: Some(post_id),
+            source: Some(source.to_string()),
+            status: Some(status.to_string()),
+            data,
+        };
+        
+        // Log the entry
+        match status {
+            OperationStatus::Started => info!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                "Download started"
+            ),
+            OperationStatus::InProgress => debug!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                bytes = bytes,
+                "Download in progress"
+            ),
+            OperationStatus::Completed => info!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                bytes = bytes,
+                "Download completed"
+            ),
+            OperationStatus::Failed => error!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                "Download failed"
+            ),
+            OperationStatus::Cancelled => warn!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                "Download cancelled"
+            ),
+        }
     }
     
     /// Log a hash operation
@@ -189,57 +248,163 @@ impl Logger {
         &self,
         task_id: Uuid,
         post_id: u32,
-        file_path: &str,
+        source: &str,
         status: OperationStatus,
         blake3_hash: Option<&str>,
         sha256_hash: Option<&str>,
     ) {
-        info!(
-            entry_type = %LogEntryType::Hash,
-            task_id = %task_id,
-            post_id = post_id,
-            file_path = file_path,
-            status = %status,
-            blake3_hash = blake3_hash,
-            sha256_hash = sha256_hash,
-            timestamp = %Utc::now().to_rfc3339(),
-            message = format!("Hash {} for post {}", status, post_id),
-        );
+        let data = if blake3_hash.is_some() || sha256_hash.is_some() {
+            let mut data_map = serde_json::Map::new();
+            if let Some(hash) = blake3_hash {
+                data_map.insert("blake3".to_string(), serde_json::Value::String(hash.to_string()));
+            }
+            if let Some(hash) = sha256_hash {
+                data_map.insert("sha256".to_string(), serde_json::Value::String(hash.to_string()));
+            }
+            Some(serde_json::Value::Object(data_map))
+        } else {
+            None
+        };
+        
+        let entry = LogEntry {
+            timestamp: self.get_timestamp(),
+            entry_type: LogEntryType::Hash.to_string(),
+            task_id: Some(task_id.to_string()),
+            post_id: Some(post_id),
+            source: Some(source.to_string()),
+            status: Some(status.to_string()),
+            data,
+        };
+        
+        // Log the entry
+        match status {
+            OperationStatus::Started => info!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                "Hash calculation started"
+            ),
+            OperationStatus::InProgress => debug!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                "Hash calculation in progress"
+            ),
+            OperationStatus::Completed => info!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                blake3 = blake3_hash,
+                sha256 = sha256_hash,
+                "Hash calculation completed"
+            ),
+            OperationStatus::Failed => error!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                "Hash calculation failed"
+            ),
+            OperationStatus::Cancelled => warn!(
+                task_id = %task_id,
+                post_id = %post_id,
+                source = %source,
+                status = %status,
+                "Hash calculation cancelled"
+            ),
+        }
     }
     
     /// Log an API fetch operation
     pub fn log_api_fetch(
         &self,
         task_id: Uuid,
-        endpoint: &str,
-        params: &str,
+        url: &str,
+        query: &str,
         status: OperationStatus,
-        response_code: Option<u16>,
+        http_status: Option<u16>,
     ) {
-        info!(
-            entry_type = %LogEntryType::ApiFetch,
-            task_id = %task_id,
-            endpoint = endpoint,
-            params = params,
-            status = %status,
-            response_code = response_code,
-            timestamp = %Utc::now().to_rfc3339(),
-            message = format!("API fetch {} for endpoint {}", status, endpoint),
-        );
+        let data = if let Some(status) = http_status {
+            Some(serde_json::json!({ "http_status": status }))
+        } else {
+            None
+        };
+        
+        let entry = LogEntry {
+            timestamp: self.get_timestamp(),
+            entry_type: LogEntryType::ApiFetch.to_string(),
+            task_id: Some(task_id.to_string()),
+            post_id: None,
+            source: Some(format!("{}?{}", url, query)),
+            status: Some(status.to_string()),
+            data,
+        };
+        
+        // Log the entry
+        match status {
+            OperationStatus::Started => info!(
+                task_id = %task_id,
+                url = %url,
+                query = %query,
+                status = %status,
+                "API fetch started"
+            ),
+            OperationStatus::InProgress => debug!(
+                task_id = %task_id,
+                url = %url,
+                query = %query,
+                status = %status,
+                "API fetch in progress"
+            ),
+            OperationStatus::Completed => info!(
+                task_id = %task_id,
+                url = %url,
+                query = %query,
+                status = %status,
+                http_status = http_status,
+                "API fetch completed"
+            ),
+            OperationStatus::Failed => error!(
+                task_id = %task_id,
+                url = %url,
+                query = %query,
+                status = %status,
+                http_status = http_status,
+                "API fetch failed"
+            ),
+            OperationStatus::Cancelled => warn!(
+                task_id = %task_id,
+                url = %url,
+                query = %query,
+                status = %status,
+                "API fetch cancelled"
+            ),
+        }
     }
     
     /// Log a system event
-    pub fn log_system_event(
-        &self,
-        event_type: &str,
-        details: &str,
-    ) {
+    pub fn log_system_event(&self, event_type: &str, message: &str) {
+        let entry = LogEntry {
+            timestamp: self.get_timestamp(),
+            entry_type: LogEntryType::SystemEvent.to_string(),
+            task_id: None,
+            post_id: None,
+            source: None,
+            status: None,
+            data: Some(serde_json::json!({
+                "event_type": event_type,
+                "message": message,
+            })),
+        };
+        
+        // Log the entry
         info!(
-            entry_type = %LogEntryType::System,
-            event_type = event_type,
-            details = details,
-            timestamp = %Utc::now().to_rfc3339(),
-            message = format!("System event: {}", event_type),
+            event_type = %event_type,
+            message = %message,
+            "System event"
         );
     }
     
@@ -251,22 +416,65 @@ impl Logger {
         message: &str,
         details: Option<&str>,
     ) {
-        error!(
-            entry_type = %LogEntryType::Error,
-            task_id = task_id.map(|id| id.to_string()),
-            error_type = error_type,
-            message = message,
-            details = details,
-            timestamp = %Utc::now().to_rfc3339(),
-            message = format!("Error: {}", message),
-        );
+        let data = if let Some(details) = details {
+            Some(serde_json::json!({
+                "error_type": error_type,
+                "details": details,
+            }))
+        } else {
+            Some(serde_json::json!({
+                "error_type": error_type,
+            }))
+        };
+        
+        let entry = LogEntry {
+            timestamp: self.get_timestamp(),
+            entry_type: LogEntryType::Error.to_string(),
+            task_id: task_id.map(|id| id.to_string()),
+            post_id: None,
+            source: None,
+            status: None,
+            data,
+        };
+        
+        // Log the entry
+        if let Some(task_id) = task_id {
+            error!(
+                task_id = %task_id,
+                error_type = %error_type,
+                message = %message,
+                details = details,
+                "Error occurred"
+            );
+        } else {
+            error!(
+                error_type = %error_type,
+                message = %message,
+                details = details,
+                "Error occurred"
+            );
+        }
     }
 }
 
-/// Create a new logger
-pub async fn init_logger(
-    config_manager: Arc<ConfigManager>,
-) -> LoggerResult<Arc<Logger>> {
-    let logger = Logger::new(config_manager)?;
+/// Initialize the logger
+pub async fn init_logger(config_manager: Arc<ConfigManager>) -> LoggerResult<Arc<Logger>> {
+    // Get the app config
+    let app_config = config_manager.get_app_config()
+        .map_err(|e| LoggerError::Config(e.to_string()))?;
+    
+    // Create the log directory
+    let log_dir = PathBuf::from(&app_config.paths.log_directory);
+    
+    // Create the logger
+    let logger = Logger::new(
+        config_manager.clone(),
+        log_dir,
+        app_config.logging.log_format.clone(),
+    );
+    
+    // Initialize the logger
+    logger.init()?;
+    
     Ok(Arc::new(logger))
 }

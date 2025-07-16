@@ -182,6 +182,26 @@ fn main() -> Result<(), Error> {
 
                 return run_system_monitor_main();
             },
+            "--logger" => {
+                // Run the logger example
+                #[tokio::main]
+                async fn run_logger_main() -> Result<(), Error> {
+                    v3::logger_example::logger_example().await?;
+                    Ok(())
+                }
+
+                return run_logger_main();
+            },
+            "--session-manager" => {
+                // Run the session manager example
+                #[tokio::main]
+                async fn run_session_manager_main() -> Result<(), Error> {
+                    v3::session_manager_example::session_manager_example().await?;
+                    Ok(())
+                }
+
+                return run_session_manager_main();
+            },
             _ => {
                 println!("Unknown argument: {}", args[1]);
                 println!("Available arguments:");
@@ -194,6 +214,8 @@ fn main() -> Result<(), Error> {
                 println!("  --blacklist-handler: Run the blacklist handling example");
                 println!("  --disk-verifier: Run the disk verification and file watching example");
                 println!("  --system-monitor: Run the system monitoring and adaptive control example");
+                println!("  --logger: Run the structured logging example");
+                println!("  --session-manager: Run the session management and graceful shutdown example");
                 return Ok(());
             }
         }

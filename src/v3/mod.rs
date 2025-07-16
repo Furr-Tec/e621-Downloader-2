@@ -21,6 +21,10 @@ pub mod disk_verifier;
 pub mod disk_verifier_example;
 pub mod system_monitor;
 pub mod system_monitor_example;
+pub mod logger;
+pub mod logger_example;
+pub mod session_manager;
+pub mod session_manager_example;
 
 // Re-export commonly used types for convenience
 pub use config_loader::{
@@ -83,6 +87,19 @@ pub use system_monitor::{
     SystemMonitor, SystemMonitorError, SystemMonitorResult,
     ResourceThresholds, ResourceStatus, ResourceMetrics, ResourceEvent,
     init_system_monitor,
+};
+
+// Re-export logger functionality
+pub use logger::{
+    Logger, LoggerError, LoggerResult,
+    OperationStatus, LogEntryType, LogEntry,
+    init_logger,
+};
+
+// Re-export session manager functionality
+pub use session_manager::{
+    SessionManager, SessionManagerError, SessionManagerResult,
+    SessionState, init_session_manager,
 };
 
 // Re-export CLI functionality
