@@ -132,11 +132,13 @@ pub struct DownloadEngine {
     original_concurrency: Arc<Mutex<usize>>,
     /// Current concurrency setting
     current_concurrency: Arc<Mutex<usize>>,
+    /// Configuration manager
+    config_manager: Arc<ConfigManager>,
 }
 
 impl DownloadEngine {
     /// Create a new download engine
-    pub fn new(config: DownloadEngineConfig, blacklist_handler: Arc<BlacklistHandler>) -> DownloadResult<Self> {
+    pub fn new(config: DownloadEngineConfig, blacklist_handler: Arc<BlacklistHandler>, config_manager: Arc<ConfigManager>) -> DownloadResult<Self> {
         // Create the HTTP client with a connection pool
         let client = Client::builder()
             .user_agent(&config.user_agent)
@@ -180,6 +182,7 @@ impl DownloadEngine {
             blacklist_handler,
             original_concurrency: Arc::new(Mutex::new(original_concurrency)),
             current_concurrency: Arc::new(Mutex::new(original_concurrency)),
+            config_manager,
         })
     }
 
@@ -187,6 +190,10 @@ impl DownloadEngine {
     pub fn from_config(config_manager: Arc<ConfigManager>) -> DownloadResult<Self> {
         // Get the app config
         let app_config = config_manager.get_app_config()
+            .map_err(|e| DownloadError::Config(e.to_string()))?;
+
+        // Get the e621 config
+        let e621_config = config_manager.get_e621_config()
             .map_err(|e| DownloadError::Config(e.to_string()))?;
 
         // Create the download engine config
@@ -197,7 +204,9 @@ impl DownloadEngine {
             download_dir: PathBuf::from(&app_config.paths.download_directory),
             blacklisted_dir: PathBuf::from("./blacklisted_downloads"),
             temp_dir: PathBuf::from(&app_config.paths.temp_directory),
-            user_agent: "e621_downloader/2.0 (by anonymous)".to_string(),
+            user_agent: format!("e621_downloader/{} (by {})", 
+                env!("CARGO_PKG_VERSION"), 
+                e621_config.auth.username),
             timeout_seconds: 30,
         };
 
@@ -205,7 +214,7 @@ impl DownloadEngine {
         let blacklist_handler = BlacklistHandler::from_config(config_manager.clone())
             .map_err(|e| DownloadError::Config(format!("Failed to create blacklist handler: {}", e)))?;
 
-        Self::new(config, Arc::new(blacklist_handler))
+        Self::new(config, Arc::new(blacklist_handler), config_manager)
     }
 
     /// Start the download engine
@@ -217,6 +226,14 @@ impl DownloadEngine {
         let config = self.config.clone();
         let job_rx = self.job_rx.clone();
         let shutdown_rx = self.shutdown_rx.clone();
+        let blacklist_handler = self.blacklist_handler.clone();
+
+        // Get the e621 config
+        let e621_config = match self.config_manager.get_e621_config() {
+            Ok(config) => config,
+            Err(e) => return Err(DownloadError::Config(format!("Failed to get e621 config: {}", e))),
+        };
+        let e621_config = Arc::new(e621_config);
 
         // Spawn the worker task
         tokio::spawn(async move {
@@ -240,6 +257,8 @@ impl DownloadEngine {
                         let client_clone = client.clone();
                         let stats_clone = stats.clone();
                         let config_clone = config.clone();
+                        let blacklist_handler_clone = blacklist_handler.clone();
+                        let e621_config_clone = e621_config.clone();
 
                         // Spawn a task to download the file
                         tokio::spawn(async move {
@@ -249,7 +268,8 @@ impl DownloadEngine {
                                 &job,
                                 &config_clone,
                                 stats_clone.clone(),
-                                self.blacklist_handler.clone(),
+                                blacklist_handler_clone,
+                                &e621_config_clone,
                             ).await;
 
                             // Log the result
@@ -361,13 +381,14 @@ impl DownloadEngine {
     }
 
     /// Download a file
-    #[instrument(skip(client, job, config, stats, blacklist_handler), fields(post_id = %job.post_id, md5 = %job.md5))]
+    #[instrument(skip(client, job, config, stats, blacklist_handler, e621_config), fields(post_id = %job.post_id, md5 = %job.md5))]
     async fn download_file(
         client: &Client,
         job: &DownloadJob,
         config: &DownloadEngineConfig,
         stats: Arc<Mutex<DownloadStats>>,
         blacklist_handler: Arc<BlacklistHandler>,
+        e621_config: &E621Config,
     ) -> DownloadResult<PathBuf> {
         // Create the file path
         let file_name = format!("{}_{}.{}", job.post_id, job.md5, job.file_ext);
@@ -426,8 +447,24 @@ impl DownloadEngine {
                 info!("Retry attempt {}/{} for post {}", attempts, max_attempts, job.post_id);
             }
 
+            // Create a request builder
+            let mut request_builder = client.get(&job.url)
+                .header("User-Agent", &config.user_agent);
+
+            // Add authentication if credentials are provided
+            if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty() 
+                && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
+                let auth = format!("Basic {}", base64::encode(format!("{}:{}", 
+                    e621_config.auth.username, 
+                    e621_config.auth.api_key)));
+                request_builder = request_builder.header("Authorization", auth);
+                debug!("Using authentication for download request");
+            } else {
+                debug!("No authentication credentials provided, making unauthenticated request");
+            }
+
             // Make the request
-            let response = match client.get(&job.url).send().await {
+            let response = match request_builder.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     warn!("Request error: {}", e);
@@ -463,21 +500,52 @@ impl DownloadEngine {
 
             // Check for other errors
             if !response.status().is_success() {
-                warn!("HTTP error: {}", response.status());
+                let status = response.status();
 
-                // Check if we've reached the maximum number of attempts
-                if attempts >= max_attempts {
-                    return Err(DownloadError::InvalidResponse(format!(
-                        "HTTP error: {}",
-                        response.status()
-                    )));
+                // Handle specific status codes
+                match status.as_u16() {
+                    401 => {
+                        warn!("Authentication failed (401 Unauthorized). Check your API credentials.");
+                        return Err(DownloadError::InvalidResponse(
+                            "Authentication failed (401 Unauthorized). Check your API credentials.".to_string()
+                        ));
+                    },
+                    403 => {
+                        warn!("Access forbidden (403 Forbidden). You may not have permission to access this resource.");
+                        return Err(DownloadError::InvalidResponse(
+                            "Access forbidden (403 Forbidden). You may not have permission to access this resource.".to_string()
+                        ));
+                    },
+                    404 => {
+                        warn!("Resource not found (404 Not Found). The file may have been deleted or never existed.");
+                        return Err(DownloadError::InvalidResponse(
+                            "Resource not found (404 Not Found). The file may have been deleted or never existed.".to_string()
+                        ));
+                    },
+                    451 => {
+                        warn!("Content unavailable for legal reasons (451). This content may be DMCA'd or otherwise legally restricted.");
+                        return Err(DownloadError::InvalidResponse(
+                            "Content unavailable for legal reasons (451). This content may be DMCA'd or otherwise legally restricted.".to_string()
+                        ));
+                    },
+                    _ => {
+                        warn!("HTTP error: {}", status);
+
+                        // Check if we've reached the maximum number of attempts
+                        if attempts >= max_attempts {
+                            return Err(DownloadError::InvalidResponse(format!(
+                                "HTTP error: {}",
+                                status
+                            )));
+                        }
+
+                        // Calculate the backoff duration
+                        let backoff = Self::calculate_backoff(attempts, config.base_retry_delay_ms);
+                        info!("Backing off for {}ms before retry", backoff);
+                        sleep(Duration::from_millis(backoff)).await;
+                        continue;
+                    }
                 }
-
-                // Calculate the backoff duration
-                let backoff = Self::calculate_backoff(attempts, config.base_retry_delay_ms);
-                info!("Backing off for {}ms before retry", backoff);
-                sleep(Duration::from_millis(backoff)).await;
-                continue;
             }
 
             // Stream the file to disk

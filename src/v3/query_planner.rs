@@ -335,11 +335,26 @@ impl QueryPlanner {
         // Build the URL
         let url = format!("https://e621.net/posts.json?limit=0&tags={}", tag_string);
 
+        // Create a request builder
+        let mut request_builder = self.client.get(&url)
+            .header("User-Agent", format!("e621_downloader/{} (by {})", 
+                env!("CARGO_PKG_VERSION"), 
+                e621_config.auth.username));
+
+        // Add authentication if credentials are provided
+        if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty() 
+            && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
+            let auth = format!("Basic {}", base64::encode(format!("{}:{}", 
+                e621_config.auth.username, 
+                e621_config.auth.api_key)));
+            request_builder = request_builder.header("Authorization", auth);
+            debug!("Using authentication for API request");
+        } else {
+            debug!("No authentication credentials provided, making unauthenticated request");
+        }
+
         // Make the request
-        let response = self.client.get(&url)
-            .header("User-Agent", "e621_downloader/2.0 (by anonymous)")
-            .send()
-            .await?;
+        let response = request_builder.send().await?;
 
         // Check for rate limiting
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -382,11 +397,26 @@ impl QueryPlanner {
             limit, page, tag_string
         );
 
+        // Create a request builder
+        let mut request_builder = self.client.get(&url)
+            .header("User-Agent", format!("e621_downloader/{} (by {})", 
+                env!("CARGO_PKG_VERSION"), 
+                e621_config.auth.username));
+
+        // Add authentication if credentials are provided
+        if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty() 
+            && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
+            let auth = format!("Basic {}", base64::encode(format!("{}:{}", 
+                e621_config.auth.username, 
+                e621_config.auth.api_key)));
+            request_builder = request_builder.header("Authorization", auth);
+            debug!("Using authentication for API request");
+        } else {
+            debug!("No authentication credentials provided, making unauthenticated request");
+        }
+
         // Make the request
-        let response = self.client.get(&url)
-            .header("User-Agent", "e621_downloader/2.0 (by anonymous)")
-            .send()
-            .await?;
+        let response = request_builder.send().await?;
 
         // Check for rate limiting
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
