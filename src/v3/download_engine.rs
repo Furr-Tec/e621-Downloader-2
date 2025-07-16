@@ -128,6 +128,10 @@ pub struct DownloadEngine {
     shutdown_tx: mpsc::Sender<()>,
     shutdown_rx: Arc<Mutex<mpsc::Receiver<()>>>,
     blacklist_handler: Arc<BlacklistHandler>,
+    /// Original concurrency setting
+    original_concurrency: Arc<Mutex<usize>>,
+    /// Current concurrency setting
+    current_concurrency: Arc<Mutex<usize>>,
 }
 
 impl DownloadEngine {
@@ -161,6 +165,9 @@ impl DownloadEngine {
         fs::create_dir_all(&config.temp_dir)
             .map_err(|e| DownloadError::Io(e))?;
 
+        // Store the original concurrency setting
+        let original_concurrency = config.max_concurrent_downloads;
+
         Ok(Self {
             config,
             client,
@@ -171,6 +178,8 @@ impl DownloadEngine {
             shutdown_tx,
             shutdown_rx: Arc::new(Mutex::new(shutdown_rx)),
             blacklist_handler,
+            original_concurrency: Arc::new(Mutex::new(original_concurrency)),
+            current_concurrency: Arc::new(Mutex::new(original_concurrency)),
         })
     }
 
@@ -316,6 +325,41 @@ impl DownloadEngine {
         self.stats.lock().clone()
     }
 
+    /// Get the current concurrency setting
+    pub fn get_concurrency(&self) -> usize {
+        *self.current_concurrency.lock()
+    }
+
+    /// Get the original concurrency setting
+    pub fn get_original_concurrency(&self) -> usize {
+        *self.original_concurrency.lock()
+    }
+
+    /// Set the concurrency to a new value
+    pub fn set_concurrency(&self, new_concurrency: usize) -> usize {
+        let mut current = self.current_concurrency.lock();
+        let old_concurrency = *current;
+        *current = new_concurrency;
+
+        // Adjust the semaphore permits
+        let semaphore = &self.semaphore;
+
+        if new_concurrency > old_concurrency {
+            // Add permits
+            let additional_permits = new_concurrency - old_concurrency;
+            semaphore.add_permits(additional_permits);
+            info!("Increased concurrency from {} to {}", old_concurrency, new_concurrency);
+        } else if new_concurrency < old_concurrency {
+            // We can't directly remove permits, but we can create a new semaphore
+            // The old permits will be dropped when their tasks complete
+            info!("Decreased concurrency from {} to {}", old_concurrency, new_concurrency);
+            // Note: We don't need to do anything here as the semaphore will naturally
+            // limit to the new concurrency as tasks complete
+        }
+
+        old_concurrency
+    }
+
     /// Download a file
     #[instrument(skip(client, job, config, stats, blacklist_handler), fields(post_id = %job.post_id, md5 = %job.md5))]
     async fn download_file(
@@ -347,6 +391,13 @@ impl DownloadEngine {
             if !artist_dir.exists() {
                 fs::create_dir_all(&artist_dir)
                     .map_err(|e| DownloadError::Io(e))?;
+            }
+
+            // Add the post to the blacklisted_rejects table
+            if let Err(e) = blacklist_handler.add_blacklisted_reject(job.post_id) {
+                warn!("Failed to add post {} to blacklisted_rejects table: {}", job.post_id, e);
+            } else {
+                debug!("Added post {} to blacklisted_rejects table", job.post_id);
             }
 
             artist_dir

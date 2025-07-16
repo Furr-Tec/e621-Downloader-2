@@ -15,6 +15,12 @@ pub mod file_processor;
 pub mod file_processor_example;
 pub mod metadata_store;
 pub mod metadata_store_example;
+pub mod blacklist_handler;
+pub mod blacklist_handling_example;
+pub mod disk_verifier;
+pub mod disk_verifier_example;
+pub mod system_monitor;
+pub mod system_monitor_example;
 
 // Re-export commonly used types for convenience
 pub use config_loader::{
@@ -57,6 +63,26 @@ pub use file_processor::{
 pub use metadata_store::{
     MetadataStore, MetadataStoreError, MetadataStoreResult,
     PostMetadata, init_metadata_store,
+};
+
+// Re-export blacklist handler functionality
+pub use blacklist_handler::{
+    BlacklistHandler, BlacklistHandlerError, BlacklistHandlerResult,
+    BlacklistedReject, init_blacklist_handler,
+};
+
+// Re-export disk verifier functionality
+pub use disk_verifier::{
+    DiskVerifier, DiskVerifierError, DiskVerifierResult,
+    FileStatus, FileVerificationResult, FileWatchEvent,
+    init_disk_verifier,
+};
+
+// Re-export system monitor functionality
+pub use system_monitor::{
+    SystemMonitor, SystemMonitorError, SystemMonitorResult,
+    ResourceThresholds, ResourceStatus, ResourceMetrics, ResourceEvent,
+    init_system_monitor,
 };
 
 // Re-export CLI functionality

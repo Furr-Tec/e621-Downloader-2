@@ -152,6 +152,36 @@ fn main() -> Result<(), Error> {
 
                 return run_metadata_store_main();
             },
+            "--blacklist-handler" => {
+                // Run the blacklist handling example
+                #[tokio::main]
+                async fn run_blacklist_handling_main() -> Result<(), Error> {
+                    v3::blacklist_handling_example::blacklist_handling_example().await?;
+                    Ok(())
+                }
+
+                return run_blacklist_handling_main();
+            },
+            "--disk-verifier" => {
+                // Run the disk verifier example
+                #[tokio::main]
+                async fn run_disk_verifier_main() -> Result<(), Error> {
+                    v3::disk_verifier_example::disk_verifier_example().await?;
+                    Ok(())
+                }
+
+                return run_disk_verifier_main();
+            },
+            "--system-monitor" => {
+                // Run the system monitor example
+                #[tokio::main]
+                async fn run_system_monitor_main() -> Result<(), Error> {
+                    v3::system_monitor_example::system_monitor_example().await?;
+                    Ok(())
+                }
+
+                return run_system_monitor_main();
+            },
             _ => {
                 println!("Unknown argument: {}", args[1]);
                 println!("Available arguments:");
@@ -161,6 +191,9 @@ fn main() -> Result<(), Error> {
                 println!("  --download-engine: Run the download engine example");
                 println!("  --file-processor: Run the file processor example");
                 println!("  --metadata-store: Run the metadata store example");
+                println!("  --blacklist-handler: Run the blacklist handling example");
+                println!("  --disk-verifier: Run the disk verification and file watching example");
+                println!("  --system-monitor: Run the system monitoring and adaptive control example");
                 return Ok(());
             }
         }
