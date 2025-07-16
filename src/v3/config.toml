@@ -1,0 +1,37 @@
+﻿# config.toml
+# Operational settings for E621 Downloader v2
+
+[paths]
+download_directory = "./downloads"
+database_file      = "./data/posts.sqlite"
+log_directory      = "./logs"
+temp_directory     = "./.tmp"
+
+[limits]
+posts_per_page    = 320
+max_page_number   = 750
+file_size_cap     = 20_971_520      # 20 MB per post (in bytes) (We should define the max size during setup)
+total_size_cap    = 104_857_600     # 100 MB total (in bytes)
+verify_sample_pct = 10              # Percent of files to randomly reverify
+
+[pools]
+max_download_concurrency = 8
+max_hash_concurrency     = 4
+max_api_concurrency      = 4
+batch_size               = 4
+
+[rate]
+requests_per_second = 3
+burst_capacity       = 3
+retry_backoff_secs   = 10
+
+[logging]
+log_level       = "info"      # "trace", "debug", "info", "warn", "error"
+log_format      = "json"      # "json" or "plain"
+log_to_terminal = true
+log_to_file     = true
+
+[verifier]
+enable_on_shutdown = true
+enable_on_startup  = true
+check_orphans      = true

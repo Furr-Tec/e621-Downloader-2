@@ -1,0 +1,43 @@
+﻿# e621.toml
+# Persistent user-defined sources to query and download from e621.net
+
+[auth]
+username = "your_username"
+api_key  = "your_api_key_here"
+
+[options]
+download_favorites = true
+safe_mode = false
+
+[query]
+# Tags are lowercased and validated against the API during input
+tags = [
+    "wolf",
+    "muscle",
+    "solo",
+    "rating:s"
+]
+
+# Artists are stored as e621 names (e.g., "nekoyasha")
+artists = [
+    "nekoyasha",
+    "dogbreath"
+]
+
+# Pools use numeric IDs from e621.net/pool/show/ID
+pools = [
+    12345,
+    99887
+]
+
+# Collections or Sets, also by numeric ID (e.g., e621.net/set/show/ID)
+collections = [
+    222,
+    444
+]
+
+# Specific post IDs to include manually (valid IDs only)
+posts = [
+    1883912,
+    1723001
+]

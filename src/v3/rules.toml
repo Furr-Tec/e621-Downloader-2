@@ -1,0 +1,40 @@
+﻿# rules.toml
+# Tag-based content filtering for E621 Downloader v2
+
+[whitelist]
+# Tags here will always be allowed, even if they match blacklist entries.
+# Use exact tag names as they appear on e621, lowercase only.
+
+tags = [
+    "dragon",
+    "muscle",
+    "male_focus"
+]
+
+[blacklist]
+# Tags here will be excluded from search results and downloads unless
+# explicitly whitelisted above.
+# These are checked against API metadata, tag matches, and inferred fields.
+
+tags = [
+    "scat",
+    "watersports",
+    "gore",
+    "loli",
+    "shota",
+    "cub",
+    "vore",
+    "inflation",
+    "hyper",
+    "feral",
+    "non_furry",
+    "feet",
+    "earth_pony",
+    "pony",
+    "equine_genitalia",
+    "scp_foundation",
+    "helltaker",
+    "sonic_the_hedgehog",
+    "amy_rose",
+    "pokemon"
+]
