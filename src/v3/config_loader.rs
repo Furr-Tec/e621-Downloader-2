@@ -1,7 +1,6 @@
 ﻿use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,9 @@ pub enum ConfigError {
     
     #[error("TOML parsing error: {0}")]
     Toml(#[from] toml::de::Error),
+    
+    #[error("TOML serialization error: {0}")]
+    TomlSer(String),
     
     #[error("Config file not found: {0}")]
     NotFound(String),
@@ -246,12 +248,10 @@ impl ConfigManager {
     pub async fn new(config_dir: impl AsRef<Path>) -> ConfigResult<Self> {
         let config_dir = config_dir.as_ref().to_path_buf();
         
-        // Check if the directory exists
+        // Create the directory if it doesn't exist
         if !config_dir.exists() {
-            return Err(ConfigError::NotFound(format!(
-                "Config directory not found: {}",
-                config_dir.display()
-            )));
+            log::info!("Creating config directory: {}", config_dir.display());
+            fs::create_dir_all(&config_dir)?;
         }
         
         // Load initial configurations
@@ -453,6 +453,138 @@ impl ConfigManager {
         let rules_path = self.config_dir.join("rules.toml");
         
         config_path.exists() && e621_path.exists() && rules_path.exists()
+    }
+    
+    // Save app config to file
+    pub fn save_app_config(&self, config: &AppConfig) -> ConfigResult<()> {
+        let config_path = self.config_dir.join("config.toml");
+        let toml_string = toml::to_string_pretty(config)
+            .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
+        fs::write(&config_path, toml_string)?;
+        
+        // Update the in-memory config
+        let mut app_config = self.app_config
+            .write()
+            .map_err(|e| ConfigError::LockError(e.to_string()))?;
+        *app_config = config.clone();
+        
+        Ok(())
+    }
+    
+    // Save e621 config to file
+    pub fn save_e621_config(&self, config: &E621Config) -> ConfigResult<()> {
+        let config_path = self.config_dir.join("e621.toml");
+        let toml_string = toml::to_string_pretty(config)
+            .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
+        fs::write(&config_path, toml_string)?;
+        
+        // Update the in-memory config
+        let mut e621_config = self.e621_config
+            .write()
+            .map_err(|e| ConfigError::LockError(e.to_string()))?;
+        *e621_config = config.clone();
+        
+        Ok(())
+    }
+    
+    // Check if e621 credentials are configured and valid
+    pub fn has_valid_e621_credentials(&self) -> bool {
+        match self.get_e621_config() {
+            Ok(config) => {
+                !config.auth.username.is_empty() &&
+                !config.auth.api_key.is_empty() &&
+                config.auth.username != "your_username" &&
+                config.auth.api_key != "your_api_key_here"
+            }
+            Err(_) => false,
+        }
+    }
+    
+    // Create all default config files if they don't exist
+    pub fn create_default_configs(&self) -> ConfigResult<()> {
+        // Create config.toml
+        let config_path = self.config_dir.join("config.toml");
+        if !config_path.exists() {
+            let default_config = AppConfig::default();
+            let toml_string = toml::to_string_pretty(&default_config)
+                .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
+            fs::write(&config_path, toml_string)?;
+            
+            // Update the in-memory config
+            let mut app_config = self.app_config
+                .write()
+                .map_err(|e| ConfigError::LockError(e.to_string()))?;
+            *app_config = default_config;
+        }
+        
+        // Create e621.toml
+        let e621_path = self.config_dir.join("e621.toml");
+        if !e621_path.exists() {
+            let default_config = E621Config::default();
+            let toml_string = toml::to_string_pretty(&default_config)
+                .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
+            fs::write(&e621_path, toml_string)?;
+            
+            // Update the in-memory config
+            let mut e621_config = self.e621_config
+                .write()
+                .map_err(|e| ConfigError::LockError(e.to_string()))?;
+            *e621_config = default_config;
+        }
+        
+        // Create rules.toml
+        let rules_path = self.config_dir.join("rules.toml");
+        if !rules_path.exists() {
+            let default_config = RulesConfig::default();
+            let toml_string = toml::to_string_pretty(&default_config)
+                .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
+            fs::write(&rules_path, toml_string)?;
+            
+            // Update the in-memory config
+            let mut rules_config = self.rules_config
+                .write()
+                .map_err(|e| ConfigError::LockError(e.to_string()))?;
+            *rules_config = default_config;
+        }
+        
+        Ok(())
+    }
+    
+    // Create e621.toml file if it doesn't exist (deprecated - use create_default_configs instead)
+    pub fn create_default_e621_config(&self) -> ConfigResult<()> {
+        let config_path = self.config_dir.join("e621.toml");
+        
+        // Only create if it doesn't exist
+        if !config_path.exists() {
+            let default_config = E621Config::default();
+            let toml_string = toml::to_string_pretty(&default_config)
+                .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
+            fs::write(&config_path, toml_string)?;
+            
+            // Update the in-memory config
+            let mut e621_config = self.e621_config
+                .write()
+                .map_err(|e| ConfigError::LockError(e.to_string()))?;
+            *e621_config = default_config;
+        }
+        
+        Ok(())
+    }
+    
+    // Save rules config to file
+    pub fn save_rules_config(&self, config: &RulesConfig) -> ConfigResult<()> {
+        let config_path = self.config_dir.join("rules.toml");
+        let toml_string = toml::to_string_pretty(config)
+            .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
+        fs::write(&config_path, toml_string)?;
+        
+        // Update the in-memory config
+        let mut rules_config = self.rules_config
+            .write()
+            .map_err(|e| ConfigError::LockError(e.to_string()))?;
+        *rules_config = config.clone();
+        
+        Ok(())
     }
 }
 

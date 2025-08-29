@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio;
 use tracing::info;
 use uuid::Uuid;
@@ -19,7 +20,7 @@ use crate::v3::{
 };
 
 /// Example function to demonstrate how to use the logger
-pub async fn logger_example() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn logger_example() -> Result<()> {
     // Initialize the config manager with the path to the config directory
     let config_manager = init_config(Path::new("src/v3")).await?;
     let config_manager = Arc::new(config_manager);
@@ -142,7 +143,7 @@ pub async fn logger_example() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run the example
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     logger_example().await
 }
 

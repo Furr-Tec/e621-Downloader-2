@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio;
 use tracing::info;
 
@@ -19,7 +20,7 @@ use crate::v3::{
 };
 
 /// Example function to demonstrate how to use the system monitor
-pub async fn system_monitor_example() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn system_monitor_example() -> Result<()> {
     // Initialize the config manager with the path to the config directory
     let config_manager = init_config(Path::new("src/v3")).await?;
     let config_manager = Arc::new(config_manager);
@@ -77,7 +78,7 @@ pub async fn system_monitor_example() -> Result<(), Box<dyn std::error::Error>> 
     
     // Simulate some work to generate system load
     info!("Simulating system load...");
-    let load_task = tokio::spawn(async {
+    let load_task = tokio::spawn(async move {
         // Create a vector to store data and consume memory
         let mut data = Vec::new();
         
@@ -148,7 +149,7 @@ pub async fn system_monitor_example() -> Result<(), Box<dyn std::error::Error>> 
 
 /// Run the example
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     system_monitor_example().await
 }
 

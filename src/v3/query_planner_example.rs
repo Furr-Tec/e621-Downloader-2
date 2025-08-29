@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio;
 use tracing::info;
 
@@ -20,7 +21,7 @@ use crate::v3::{
 };
 
 /// Example function to demonstrate how to use the query planning module
-pub async fn query_planner_example() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn query_planner_example() -> Result<()> {
     // Initialize the config manager with the path to the config directory
     let config_manager = init_config(Path::new("src/v3")).await?;
     let config_manager = Arc::new(config_manager);
@@ -46,7 +47,7 @@ pub async fn query_planner_example() -> Result<(), Box<dyn std::error::Error>> {
         info!("Processing query {}/{}: {:?}", i + 1, queries.len(), query.tags);
         
         // Fetch post count
-        let post_count = query_planner.fetch_post_count(query).await?;
+        let post_count = query_planner.estimate_post_count(query).await?;
         info!("Found {} posts for query", post_count);
         
         // Create a query plan
@@ -83,7 +84,7 @@ pub async fn query_planner_example() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run the example
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     query_planner_example().await
 }
 

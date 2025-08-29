@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio;
 use tracing::info;
 use uuid::Uuid;
@@ -21,7 +22,7 @@ use crate::v3::{
 };
 
 /// Example function to demonstrate how to use the blacklist handling functionality
-pub async fn blacklist_handling_example() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn blacklist_handling_example() -> Result<()> {
     // Initialize the config manager with the path to the config directory
     let config_manager = init_config(Path::new("src/v3")).await?;
     let config_manager = Arc::new(config_manager);
@@ -48,7 +49,7 @@ pub async fn blacklist_handling_example() -> Result<(), Box<dyn std::error::Erro
     info!("Waiting for downloads to complete...");
     for i in 1..=10 {
         // Get the current stats
-        let stats = download_engine.get_stats();
+        let stats = download_engine.get_stats().await;
         info!(
             "Download progress: {}/{} completed, {}/{} failed, {} bytes downloaded",
             stats.completed_jobs,
@@ -70,7 +71,7 @@ pub async fn blacklist_handling_example() -> Result<(), Box<dyn std::error::Erro
     
     // Get all blacklisted rejects
     info!("Getting all blacklisted rejects...");
-    let rejects = blacklist_handler.get_all_blacklisted_rejects()?;
+    let rejects = blacklist_handler.get_all_blacklisted_rejects().await?;
     info!("Found {} blacklisted rejects", rejects.len());
     for reject in &rejects {
         info!("Blacklisted reject: post_id={}, deleted_at={:?}", reject.post_id, reject.deleted_at);
@@ -80,10 +81,10 @@ pub async fn blacklist_handling_example() -> Result<(), Box<dyn std::error::Erro
     if !rejects.is_empty() {
         let post_id = rejects[0].post_id;
         info!("Marking post {} as deleted...", post_id);
-        blacklist_handler.mark_as_deleted(post_id)?;
+        blacklist_handler.mark_as_deleted(post_id).await?;
         
         // Check if the post is now marked as deleted
-        let is_deleted = blacklist_handler.is_deleted_blacklisted_reject(post_id)?;
+        let is_deleted = blacklist_handler.is_deleted_blacklisted_reject(post_id).await?;
         info!("Post {} is deleted: {}", post_id, is_deleted);
     }
     
@@ -139,7 +140,7 @@ fn create_example_jobs() -> Vec<DownloadJob> {
 
 /// Run the example
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     blacklist_handling_example().await
 }
 

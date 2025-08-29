@@ -2,6 +2,7 @@
 //! Contains the next generation of the downloader with improved architecture
 
 pub mod config_loader;
+pub mod e621_validator;
 pub mod example;
 pub mod cli;
 pub mod cli_example;
@@ -100,6 +101,12 @@ pub use logger::{
 pub use session_manager::{
     SessionManager, SessionManagerError, SessionManagerResult,
     SessionState, init_session_manager,
+};
+
+// Re-export e621 validator functionality
+pub use e621_validator::{
+    ValidationError, ValidationResult,
+    validate_e621_credentials, test_config_credentials,
 };
 
 // Re-export CLI functionality

@@ -13,15 +13,16 @@ use std::sync::Arc;
 
 use blake3::Hasher as Blake3Hasher;
 use parking_lot::RwLock;
-use rayon::prelude::*;
+use r2d2;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, Result as SqliteResult};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 use crate::v3::{
-    AppConfig, ConfigManager, ConfigResult,
-    DownloadJob, Post, PostFile, PostTags,
+    AppConfig, ConfigManager,
+    DownloadJob,
 };
 
 /// Error types for file processing
@@ -67,17 +68,25 @@ pub struct ProcessedFile {
 pub struct FileHashStore {
     blake3_store: std::collections::HashSet<String>,
     sha256_store: std::collections::HashSet<String>,
-    db_connection: Connection,
+    db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
 }
 
 impl FileHashStore {
     /// Create a new file hash store
     pub fn new(db_path: &Path) -> SqliteResult<Self> {
-        // Create the database connection
-        let db_connection = Connection::open(db_path)?;
+        // Create the connection manager
+        let manager = SqliteConnectionManager::file(db_path);
+        
+        // Create the connection pool
+        let pool = r2d2::Pool::new(manager)
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+        
+        // Get a connection to initialize the database
+        let conn = pool.get()
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
         
         // Create the table if it doesn't exist
-        db_connection.execute(
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS file_hashes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 post_id INTEGER NOT NULL,
@@ -90,36 +99,48 @@ impl FileHashStore {
             [],
         )?;
         
-        // Create the memory stores
-        let blake3_store = std::collections::HashSet::new();
-        let sha256_store = std::collections::HashSet::new();
-        
         // Load existing hashes into memory
-        let mut stmt = db_connection.prepare("SELECT blake3, sha256 FROM file_hashes")?;
-        let hash_iter = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let mut b3_store: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut sha_store: std::collections::HashSet<String> = std::collections::HashSet::new();
         
-        let mut b3_store = std::collections::HashSet::new();
-        let mut sha_store = std::collections::HashSet::new();
-        
-        for hash_result in hash_iter {
-            if let Ok((blake3, sha256)) = hash_result {
-                b3_store.insert(blake3);
-                sha_store.insert(sha256);
+        {
+            let mut stmt = conn.prepare("SELECT blake3, sha256 FROM file_hashes")?;
+            let hash_iter = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            
+            for hash_result in hash_iter {
+                if let Ok((blake3, sha256)) = hash_result {
+                    b3_store.insert(blake3);
+                    sha_store.insert(sha256);
+                }
             }
         }
         
         Ok(Self {
             blake3_store: b3_store,
             sha256_store: sha_store,
-            db_connection,
+            db_pool: pool,
         })
     }
     
     /// Check if a hash exists in the store
     pub fn contains(&self, hash: &FileHash) -> bool {
-        self.blake3_store.contains(&hash.blake3) || self.sha256_store.contains(&hash.sha256)
+        // First check the in-memory cache
+        if self.blake3_store.contains(&hash.blake3) || self.sha256_store.contains(&hash.sha256) {
+            return true;
+        }
+        
+        // If not found in cache, check the database
+        if let Ok(conn) = self.db_pool.get() {
+            if let Ok(mut stmt) = conn.prepare("SELECT 1 FROM file_hashes WHERE blake3 = ? OR sha256 = ? LIMIT 1") {
+                if let Ok(exists) = stmt.exists([&hash.blake3, &hash.sha256]) {
+                    return exists;
+                }
+            }
+        }
+        
+        false
     }
     
     /// Add a hash to the store
@@ -128,8 +149,12 @@ impl FileHashStore {
         self.blake3_store.insert(file.hashes.blake3.clone());
         self.sha256_store.insert(file.hashes.sha256.clone());
         
+        // Get a connection from the pool
+        let conn = self.db_pool.get()
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+        
         // Add to database
-        self.db_connection.execute(
+        conn.execute(
             "INSERT INTO file_hashes (post_id, blake3, sha256, file_path, file_size, processed_at) 
              VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
             [
@@ -296,6 +321,7 @@ impl FileProcessor {
         let general_tags = job.tags.iter()
             .filter(|tag| !tag.contains(":"))
             .take(3)
+            .map(|s| s.as_str())
             .collect::<Vec<_>>();
         
         // Create the artist part

@@ -13,23 +13,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream::{self, StreamExt};
-use parking_lot::Mutex;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures::stream::StreamExt;
+use tokio::sync::Mutex;
 use reqwest::{Client, Response, StatusCode};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
-use uuid::Uuid;
 
 use crate::v3::{
-    AppConfig, E621Config,
-    ConfigManager, ConfigResult,
-    DownloadJob, QueryPlannerError,
-    BlacklistHandler, BlacklistHandlerResult,
+    E621Config,
+    ConfigManager,
+    DownloadJob,
+    BlacklistHandler,
 };
 
 /// Error types for the download engine
@@ -89,6 +88,64 @@ pub struct DownloadStats {
     pub average_speed_bps: f64,
 }
 
+/// Connection pool configuration
+#[derive(Debug, Clone)]
+pub struct ConnectionPoolConfig {
+    /// Maximum number of idle connections per host
+    pub max_idle_per_host: usize,
+    /// Maximum total number of idle connections
+    pub max_idle_total: usize,
+    /// Maximum number of connections per host
+    pub max_connections_per_host: usize,
+    /// Connection timeout in seconds
+    pub connection_timeout_secs: u64,
+    /// Keep-alive timeout in seconds
+    pub keep_alive_timeout_secs: u64,
+    /// Enable HTTP/2
+    pub http2_enabled: bool,
+    /// Enable gzip compression
+    pub gzip_enabled: bool,
+    /// TCP socket keep-alive
+    pub tcp_keepalive: bool,
+    /// TCP nodelay
+    pub tcp_nodelay: bool,
+}
+
+impl Default for ConnectionPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_idle_per_host: 10,
+            max_idle_total: 50,
+            max_connections_per_host: 20,
+            connection_timeout_secs: 30,
+            keep_alive_timeout_secs: 90,
+            http2_enabled: true,
+            gzip_enabled: true,
+            tcp_keepalive: true,
+            tcp_nodelay: true,
+        }
+    }
+}
+
+/// Connection pool metrics
+#[derive(Debug, Default, Clone)]
+pub struct ConnectionPoolMetrics {
+    /// Total connections created
+    pub connections_created: u64,
+    /// Connections reused from pool
+    pub connections_reused: u64,
+    /// Current active connections
+    pub active_connections: usize,
+    /// Current idle connections
+    pub idle_connections: usize,
+    /// Connection timeouts
+    pub connection_timeouts: u64,
+    /// Connection errors
+    pub connection_errors: u64,
+    /// Average connection establishment time (ms)
+    pub avg_connection_time_ms: f64,
+}
+
 /// Download engine configuration
 #[derive(Debug, Clone)]
 pub struct DownloadEngineConfig {
@@ -100,6 +157,8 @@ pub struct DownloadEngineConfig {
     pub temp_dir: PathBuf,
     pub user_agent: String,
     pub timeout_seconds: u64,
+    /// Connection pool configuration
+    pub connection_pool: ConnectionPoolConfig,
 }
 
 impl Default for DownloadEngineConfig {
@@ -113,6 +172,7 @@ impl Default for DownloadEngineConfig {
             temp_dir: PathBuf::from("./.tmp"),
             user_agent: "e621_downloader/2.0 (by anonymous)".to_string(),
             timeout_seconds: 30,
+            connection_pool: ConnectionPoolConfig::default(),
         }
     }
 }
@@ -139,13 +199,25 @@ pub struct DownloadEngine {
 impl DownloadEngine {
     /// Create a new download engine
     pub fn new(config: DownloadEngineConfig, blacklist_handler: Arc<BlacklistHandler>, config_manager: Arc<ConfigManager>) -> DownloadResult<Self> {
-        // Create the HTTP client with a connection pool
+        // Create the HTTP client with advanced connection pool configuration
         let client = Client::builder()
             .user_agent(&config.user_agent)
             .timeout(Duration::from_secs(config.timeout_seconds))
-            .pool_max_idle_per_host(config.max_concurrent_downloads)
+            // Connection pool settings
+            .pool_max_idle_per_host(config.connection_pool.max_idle_per_host)
+            .pool_idle_timeout(Duration::from_secs(config.connection_pool.keep_alive_timeout_secs))
+            .connect_timeout(Duration::from_secs(config.connection_pool.connection_timeout_secs))
+            // HTTP/2 and compression settings
+            .http2_prior_knowledge()
+            .gzip(config.connection_pool.gzip_enabled)
+            // TCP settings
+            .tcp_keepalive(if config.connection_pool.tcp_keepalive { Some(Duration::from_secs(60)) } else { None })
+            .tcp_nodelay(config.connection_pool.tcp_nodelay)
             .build()
             .map_err(|e| DownloadError::Request(e))?;
+        
+        info!("Initialized HTTP client with connection pool: {} max idle per host, {}s keep-alive timeout",
+            config.connection_pool.max_idle_per_host, config.connection_pool.keep_alive_timeout_secs);
 
         // Create the semaphore for bounded concurrency
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
@@ -187,7 +259,7 @@ impl DownloadEngine {
     }
 
     /// Create a new download engine from app config
-    pub fn from_config(config_manager: Arc<ConfigManager>) -> DownloadResult<Self> {
+    pub async fn from_config(config_manager: Arc<ConfigManager>) -> DownloadResult<Self> {
         // Get the app config
         let app_config = config_manager.get_app_config()
             .map_err(|e| DownloadError::Config(e.to_string()))?;
@@ -195,6 +267,19 @@ impl DownloadEngine {
         // Get the e621 config
         let e621_config = config_manager.get_e621_config()
             .map_err(|e| DownloadError::Config(e.to_string()))?;
+
+        // Create connection pool configuration based on the app config
+        let connection_pool = ConnectionPoolConfig {
+            max_idle_per_host: std::cmp::max(app_config.pools.max_download_concurrency, 10),
+            max_idle_total: std::cmp::max(app_config.pools.max_download_concurrency * 3, 50),
+            max_connections_per_host: std::cmp::max(app_config.pools.max_download_concurrency * 2, 20),
+            connection_timeout_secs: 30,
+            keep_alive_timeout_secs: 90,
+            http2_enabled: true,
+            gzip_enabled: true,
+            tcp_keepalive: true,
+            tcp_nodelay: true,
+        };
 
         // Create the download engine config
         let config = DownloadEngineConfig {
@@ -208,10 +293,11 @@ impl DownloadEngine {
                 env!("CARGO_PKG_VERSION"), 
                 e621_config.auth.username),
             timeout_seconds: 30,
+            connection_pool,
         };
 
         // Create the blacklist handler
-        let blacklist_handler = BlacklistHandler::from_config(config_manager.clone())
+        let blacklist_handler = BlacklistHandler::from_config(config_manager.clone()).await
             .map_err(|e| DownloadError::Config(format!("Failed to create blacklist handler: {}", e)))?;
 
         Self::new(config, Arc::new(blacklist_handler), config_manager)
@@ -237,19 +323,33 @@ impl DownloadEngine {
 
         // Spawn the worker task
         tokio::spawn(async move {
-            let mut shutdown_rx = shutdown_rx.lock().await;
-            let mut job_rx = job_rx.lock().await;
-
+            
             loop {
+                // Create a future for the shutdown signal
+                let shutdown_future = async {
+                    let mut guard = shutdown_rx.lock().await;
+                    let result = guard.recv().await;
+                    drop(guard);
+                    result
+                };
+                
+                // Create a future for the job
+                let job_future = async {
+                    let mut guard = job_rx.lock().await;
+                    let result = guard.recv().await;
+                    drop(guard);
+                    result
+                };
+                
                 tokio::select! {
                     // Check for shutdown signal
-                    Some(_) = shutdown_rx.recv() => {
+                    Some(_) = shutdown_future => {
                         info!("Download engine received shutdown signal");
                         break;
                     }
 
                     // Process the next job
-                    Some(job) = job_rx.recv() => {
+                    Some(job) = job_future => {
                         // Acquire a permit from the semaphore
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
@@ -277,13 +377,13 @@ impl DownloadEngine {
                                 Ok(_) => {
                                     info!("Downloaded file: {} ({})", job.post_id, job.md5);
                                     // Update stats
-                                    let mut stats = stats_clone.lock();
+                                    let mut stats = stats_clone.lock().await;
                                     stats.completed_jobs += 1;
                                 }
                                 Err(e) => {
                                     error!("Failed to download file: {} - {}", job.post_id, e);
                                     // Update stats
-                                    let mut stats = stats_clone.lock();
+                                    let mut stats = stats_clone.lock().await;
                                     stats.failed_jobs += 1;
                                 }
                             }
@@ -320,7 +420,7 @@ impl DownloadEngine {
     pub async fn queue_job(&self, job: DownloadJob) -> DownloadResult<()> {
         // Update stats
         {
-            let mut stats = self.stats.lock();
+            let mut stats = self.stats.lock().await;
             stats.total_jobs += 1;
         }
 
@@ -341,23 +441,23 @@ impl DownloadEngine {
     }
 
     /// Get the current download stats
-    pub fn get_stats(&self) -> DownloadStats {
-        self.stats.lock().clone()
+    pub async fn get_stats(&self) -> DownloadStats {
+        self.stats.lock().await.clone()
     }
 
     /// Get the current concurrency setting
-    pub fn get_concurrency(&self) -> usize {
-        *self.current_concurrency.lock()
+    pub async fn get_concurrency(&self) -> usize {
+        *self.current_concurrency.lock().await
     }
 
     /// Get the original concurrency setting
-    pub fn get_original_concurrency(&self) -> usize {
-        *self.original_concurrency.lock()
+    pub async fn get_original_concurrency(&self) -> usize {
+        *self.original_concurrency.lock().await
     }
 
     /// Set the concurrency to a new value
-    pub fn set_concurrency(&self, new_concurrency: usize) -> usize {
-        let mut current = self.current_concurrency.lock();
+    pub async fn set_concurrency(&self, new_concurrency: usize) -> usize {
+        let mut current = self.current_concurrency.lock().await;
         let old_concurrency = *current;
         *current = new_concurrency;
 
@@ -415,7 +515,7 @@ impl DownloadEngine {
             }
 
             // Add the post to the blacklisted_rejects table
-            if let Err(e) = blacklist_handler.add_blacklisted_reject(job.post_id) {
+            if let Err(e) = blacklist_handler.add_blacklisted_reject(job.post_id).await {
                 warn!("Failed to add post {} to blacklisted_rejects table: {}", job.post_id, e);
             } else {
                 debug!("Added post {} to blacklisted_rejects table", job.post_id);
@@ -454,7 +554,7 @@ impl DownloadEngine {
             // Add authentication if credentials are provided
             if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty() 
                 && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
-                let auth = format!("Basic {}", base64::encode(format!("{}:{}", 
+                let auth = format!("Basic {}", BASE64.encode(format!("{}:{}", 
                     e621_config.auth.username, 
                     e621_config.auth.api_key)));
                 request_builder = request_builder.header("Authorization", auth);
@@ -597,14 +697,14 @@ impl DownloadEngine {
         let mut bytes_downloaded = 0;
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result?;
+            let chunk = chunk_result.map_err(|e| DownloadError::Download(format!("Failed to get chunk: {}", e)))?;
             file.write_all(&chunk).await?;
 
             // Update the bytes downloaded
             bytes_downloaded += chunk.len() as u64;
 
             // Update the stats
-            let mut stats = stats.lock();
+            let mut stats = stats.lock().await;
             stats.bytes_downloaded += chunk.len() as u64;
         }
 
@@ -647,7 +747,7 @@ fn sanitize_filename(name: &str) -> String {
 pub async fn init_download_engine(
     config_manager: Arc<ConfigManager>,
 ) -> DownloadResult<Arc<DownloadEngine>> {
-    let engine = DownloadEngine::from_config(config_manager)?;
+    let engine = DownloadEngine::from_config(config_manager).await?;
     let engine = Arc::new(engine);
 
     // Start the download engine

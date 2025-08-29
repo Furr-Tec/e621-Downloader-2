@@ -1,12 +1,13 @@
 ﻿//! Example usage of the config loader module
 
 use std::path::Path;
+use anyhow::Result;
 use tokio;
 
 use crate::v3::{init_config, ConfigReloadEvent};
 
 /// Example function to demonstrate how to use the config loader
-pub async fn config_example() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn config_example() -> Result<()> {
     // Initialize the config manager with the path to the config directory
     let config_manager = init_config(Path::new("src/v3")).await?;
     
@@ -64,7 +65,7 @@ pub async fn config_example() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run the example
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     config_example().await
 }
 

@@ -17,23 +17,23 @@ use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
-    fmt::{self, format::FmtSpan, time::ChronoUtc},
+    fmt::{self, format::FmtSpan},
     prelude::*,
     EnvFilter,
 };
 use uuid::Uuid;
 
-use crate::v3::{AppConfig, ConfigManager, ConfigResult};
+use crate::v3::ConfigManager;
 
 /// Error types for logging
 #[derive(Error, Debug)]
 pub enum LoggerError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Config error: {0}")]
     Config(String),
-    
+
     #[error("Logging error: {0}")]
     Logging(String),
 }
@@ -120,32 +120,31 @@ impl Logger {
             log_format,
         }
     }
-    
+
     /// Initialize the logger
     pub fn init(&self) -> LoggerResult<()> {
         // Create the log directory if it doesn't exist
         if !self.log_dir.exists() {
             fs::create_dir_all(&self.log_dir)?;
         }
-        
+
         // Get the app config
         let app_config = self.config_manager.get_app_config()
             .map_err(|e| LoggerError::Config(e.to_string()))?;
-        
+
         // Create a file appender that rolls daily
         let file_appender = RollingFileAppender::new(
             Rotation::DAILY,
             &self.log_dir,
             "e621_downloader.log",
         );
-        
+
         // Create a formatting layer for the file
         let file_layer = fmt::layer()
             .with_writer(file_appender)
             .with_ansi(false)
-            .json()
             .with_span_events(FmtSpan::CLOSE);
-        
+
         // Create a filter based on the log level
         let log_level = match app_config.logging.log_level.to_lowercase().as_str() {
             "trace" => Level::TRACE,
@@ -155,27 +154,27 @@ impl Logger {
             "error" => Level::ERROR,
             _ => Level::INFO,
         };
-        
+
         let filter_layer = EnvFilter::from_default_env()
             .add_directive(format!("e621_downloader={}", log_level).parse().unwrap());
-        
+
         // Initialize the tracing subscriber
         tracing_subscriber::registry()
             .with(filter_layer)
             .with(file_layer)
             .init();
-        
+
         info!("Logger initialized");
         Ok(())
     }
-    
+
     /// Get the current timestamp as an ISO 8601 string
     fn get_timestamp(&self) -> String {
         let now = SystemTime::now();
         let datetime: DateTime<Utc> = now.into();
         datetime.to_rfc3339()
     }
-    
+
     /// Log a download operation
     pub fn log_download(
         &self,
@@ -190,8 +189,8 @@ impl Logger {
         } else {
             None
         };
-        
-        let entry = LogEntry {
+
+        let _entry = LogEntry {
             timestamp: self.get_timestamp(),
             entry_type: LogEntryType::Download.to_string(),
             task_id: Some(task_id.to_string()),
@@ -200,7 +199,7 @@ impl Logger {
             status: Some(status.to_string()),
             data,
         };
-        
+
         // Log the entry
         match status {
             OperationStatus::Started => info!(
@@ -242,7 +241,7 @@ impl Logger {
             ),
         }
     }
-    
+
     /// Log a hash operation
     pub fn log_hash(
         &self,
@@ -265,8 +264,8 @@ impl Logger {
         } else {
             None
         };
-        
-        let entry = LogEntry {
+
+        let _entry = LogEntry {
             timestamp: self.get_timestamp(),
             entry_type: LogEntryType::Hash.to_string(),
             task_id: Some(task_id.to_string()),
@@ -275,7 +274,7 @@ impl Logger {
             status: Some(status.to_string()),
             data,
         };
-        
+
         // Log the entry
         match status {
             OperationStatus::Started => info!(
@@ -317,7 +316,7 @@ impl Logger {
             ),
         }
     }
-    
+
     /// Log an API fetch operation
     pub fn log_api_fetch(
         &self,
@@ -332,8 +331,8 @@ impl Logger {
         } else {
             None
         };
-        
-        let entry = LogEntry {
+
+        let _entry = LogEntry {
             timestamp: self.get_timestamp(),
             entry_type: LogEntryType::ApiFetch.to_string(),
             task_id: Some(task_id.to_string()),
@@ -342,7 +341,7 @@ impl Logger {
             status: Some(status.to_string()),
             data,
         };
-        
+
         // Log the entry
         match status {
             OperationStatus::Started => info!(
@@ -384,10 +383,10 @@ impl Logger {
             ),
         }
     }
-    
+
     /// Log a system event
     pub fn log_system_event(&self, event_type: &str, message: &str) {
-        let entry = LogEntry {
+        let _entry = LogEntry {
             timestamp: self.get_timestamp(),
             entry_type: LogEntryType::SystemEvent.to_string(),
             task_id: None,
@@ -399,7 +398,7 @@ impl Logger {
                 "message": message,
             })),
         };
-        
+
         // Log the entry
         info!(
             event_type = %event_type,
@@ -407,7 +406,7 @@ impl Logger {
             "System event"
         );
     }
-    
+
     /// Log an error
     pub fn log_error(
         &self,
@@ -426,8 +425,8 @@ impl Logger {
                 "error_type": error_type,
             }))
         };
-        
-        let entry = LogEntry {
+
+        let _entry = LogEntry {
             timestamp: self.get_timestamp(),
             entry_type: LogEntryType::Error.to_string(),
             task_id: task_id.map(|id| id.to_string()),
@@ -436,7 +435,7 @@ impl Logger {
             status: None,
             data,
         };
-        
+
         // Log the entry
         if let Some(task_id) = task_id {
             error!(
@@ -462,19 +461,19 @@ pub async fn init_logger(config_manager: Arc<ConfigManager>) -> LoggerResult<Arc
     // Get the app config
     let app_config = config_manager.get_app_config()
         .map_err(|e| LoggerError::Config(e.to_string()))?;
-    
+
     // Create the log directory
     let log_dir = PathBuf::from(&app_config.paths.log_directory);
-    
+
     // Create the logger
     let logger = Logger::new(
         config_manager.clone(),
         log_dir,
         app_config.logging.log_format.clone(),
     );
-    
+
     // Initialize the logger
     logger.init()?;
-    
+
     Ok(Arc::new(logger))
 }

@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::v3::{
-    AppConfig, ConfigManager, ConfigResult,
+    ConfigManager,
     Orchestrator, OrchestratorResult,
     MetadataStore, MetadataStoreResult, PostMetadata,
     QueryQueue, Query, QueryStatus, QueryTask,
@@ -380,11 +380,49 @@ impl SessionManager {
 fn get_available_space(path: &Path) -> SessionManagerResult<u64> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
+        use winapi::um::fileapi::{GetDiskFreeSpaceExW};
+        use winapi::shared::minwindef::{DWORD, BOOL};
+        use winapi::um::winnt::ULARGE_INTEGER;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ffi::OsStr;
+        use std::ptr;
         
-        let metadata = fs::metadata(path)?;
-        let available_space = metadata.available_bytes();
+        // Convert path to wide string for Windows API
+        let path_str = path.to_str().ok_or_else(|| 
+            SessionManagerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput, 
+                "Path contains invalid Unicode"
+            ))
+        )?;
         
+        let wide_path: Vec<u16> = OsStr::new(path_str)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        
+        let mut free_bytes_available: ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+        let mut total_number_of_bytes: ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+        let mut total_number_of_free_bytes: ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+        
+        let result = unsafe {
+            GetDiskFreeSpaceExW(
+                wide_path.as_ptr(),
+                &mut free_bytes_available,
+                &mut total_number_of_bytes,
+                &mut total_number_of_free_bytes
+            )
+        };
+        
+        if result == 0 {
+            return Err(SessionManagerError::Io(std::io::Error::last_os_error()));
+        }
+        
+        // Access the u64 value from ULARGE_INTEGER union
+        let available_space = unsafe { 
+            // ULARGE_INTEGER is a union with u and QuadPart fields
+            // Access it as a u64 value through the anonymous union
+            std::mem::transmute::<ULARGE_INTEGER, u64>(free_bytes_available)
+        };
         Ok(available_space)
     }
     

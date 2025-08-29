@@ -1,9 +1,6 @@
-#[macro_use]
 extern crate log;
 
-use std::env::{self, consts::{
-    ARCH, DLL_EXTENSION, DLL_PREFIX, DLL_SUFFIX, EXE_EXTENSION, EXE_SUFFIX, FAMILY, OS,
-}};
+use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Write, BufWriter};
 use std::sync::{Arc, Mutex};
@@ -13,10 +10,10 @@ use log::LevelFilter;
 use simplelog::{
     ColorChoice, CombinedLogger, Config, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
 };
+use tokio;
 
 use crate::program::Program;
 
-mod e621;
 mod program;
 mod v3;
 
@@ -205,6 +202,7 @@ fn main() -> Result<(), Error> {
             _ => {
                 println!("Unknown argument: {}", args[1]);
                 println!("Available arguments:");
+                println!("  (no args): Run the interactive CLI menu system (default)");
                 println!("  --cli: Run the interactive CLI menu system");
                 println!("  --orchestration: Run the orchestration example");
                 println!("  --query-planner: Run the query planning example");
@@ -220,9 +218,14 @@ fn main() -> Result<(), Error> {
             }
         }
     } else {
-        // Run the normal program
-        let program = Program::new();
-        program.run()
+        // Run the interactive CLI as the default behavior
+        #[tokio::main]
+        async fn run_default_cli() -> Result<(), Error> {
+            v3::cli_example::cli_example().await?;
+            Ok(())
+        }
+
+        return run_default_cli();
     }
 }
 

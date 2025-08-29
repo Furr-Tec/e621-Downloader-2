@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio;
 use tracing::info;
 use uuid::Uuid;
@@ -21,7 +22,7 @@ use crate::v3::{
 };
 
 /// Example function to demonstrate how to use the download engine
-pub async fn download_engine_example() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn download_engine_example() -> Result<()> {
     // Initialize the config manager with the path to the config directory
     let config_manager = init_config(Path::new("src/v3")).await?;
     let config_manager = Arc::new(config_manager);
@@ -44,7 +45,7 @@ pub async fn download_engine_example() -> Result<(), Box<dyn std::error::Error>>
     info!("Waiting for downloads to complete...");
     for i in 1..=10 {
         // Get the current stats
-        let stats = download_engine.get_stats();
+        let stats = download_engine.get_stats().await;
         info!(
             "Download progress: {}/{} completed, {}/{} failed, {} bytes downloaded",
             stats.completed_jobs,
@@ -85,6 +86,7 @@ fn create_example_jobs() -> Vec<DownloadJob> {
             file_size: 123456,
             tags: vec!["example".to_string(), "test".to_string()],
             priority: 1,
+            is_blacklisted: false,
         },
         // Example 2: Another small image
         DownloadJob {
@@ -96,6 +98,7 @@ fn create_example_jobs() -> Vec<DownloadJob> {
             file_size: 234567,
             tags: vec!["example".to_string(), "test".to_string()],
             priority: 2,
+            is_blacklisted: false,
         },
         // Example 3: A non-existent URL to test error handling
         DownloadJob {
@@ -107,13 +110,14 @@ fn create_example_jobs() -> Vec<DownloadJob> {
             file_size: 345678,
             tags: vec!["example".to_string(), "test".to_string()],
             priority: 3,
+            is_blacklisted: false,
         },
     ]
 }
 
 /// Run the example
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     download_engine_example().await
 }
 
