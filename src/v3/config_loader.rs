@@ -82,6 +82,11 @@ pub struct Verifier {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Organization {
+    pub directory_strategy: String,  // "by_tag", "by_artist", or "flat"
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub paths: Paths,
     pub limits: Limits,
@@ -89,6 +94,7 @@ pub struct AppConfig {
     pub rate: Rate,
     pub logging: Logging,
     pub verifier: Verifier,
+    pub organization: Organization,
 }
 
 // Default implementation for AppConfig
@@ -129,6 +135,9 @@ impl Default for AppConfig {
                 enable_on_shutdown: true,
                 enable_on_startup: true,
                 check_orphans: true,
+            },
+            organization: Organization {
+                directory_strategy: "by_tag".to_string(),  // Default to tag-based organization
             },
         }
     }
@@ -219,6 +228,20 @@ impl Default for RulesConfig {
                     "shota".to_string(),
                     "cub".to_string(),
                     "vore".to_string(),
+                    "inflation".to_string(),
+                    "hyper".to_string(),
+                    "feral".to_string(),
+                    "diaper".to_string(),
+                    "death".to_string(),
+                    "torture".to_string(),
+                    "rape".to_string(),
+                    "non-con".to_string(),
+                    "necrophilia".to_string(),
+                    "bestiality".to_string(),
+                    "incest".to_string(),
+                    "underage".to_string(),
+                    "minor".to_string(),
+                    "young".to_string(),
                 ],
             },
         }
@@ -271,6 +294,9 @@ impl ConfigManager {
             reload_tx,
         };
         
+        // Create default config files if they don't exist
+        manager.create_default_configs()?;
+        
         // Setup file watcher
         manager.setup_watcher()?;
         
@@ -291,8 +317,25 @@ impl ConfigManager {
             Ok(config) => Ok(config),
             Err(e) => {
                 log::error!("Failed to parse config.toml: {}", e);
-                log::info!("Using default configuration");
-                Ok(AppConfig::default())
+                log::info!("Config file appears to be outdated or corrupted");
+                log::info!("Backing up old config and creating new one with default values");
+                
+                // Backup the old config file
+                if let Err(backup_err) = fs::rename(&config_path, config_path.with_extension("toml.backup")) {
+                    log::warn!("Failed to backup old config: {}", backup_err);
+                }
+                
+                // Create new default config
+                let default_config = AppConfig::default();
+                if let Ok(toml_string) = toml::to_string_pretty(&default_config) {
+                    if let Err(write_err) = fs::write(&config_path, toml_string) {
+                        log::error!("Failed to write new config file: {}", write_err);
+                    } else {
+                        log::info!("Created new config.toml with default values");
+                    }
+                }
+                
+                Ok(default_config)
             }
         }
     }

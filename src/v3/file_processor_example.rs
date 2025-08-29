@@ -24,7 +24,12 @@ use crate::v3::{
 /// Example function to demonstrate how to use the file processor
 pub async fn file_processor_example() -> Result<()> {
     // Initialize the config manager with the path to the config directory
-    let config_manager = init_config(Path::new("src/v3")).await?;
+    // Use the same directory as the executable
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get executable directory"))?
+        .to_path_buf();
+    let config_manager = init_config(&exe_dir).await?;
     let config_manager = Arc::new(config_manager);
     
     // Initialize the file processor

@@ -207,8 +207,7 @@ impl DownloadEngine {
             .pool_max_idle_per_host(config.connection_pool.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.connection_pool.keep_alive_timeout_secs))
             .connect_timeout(Duration::from_secs(config.connection_pool.connection_timeout_secs))
-            // HTTP/2 and compression settings
-            .http2_prior_knowledge()
+            // HTTP/2 and compression settings (let the server negotiate HTTP version)
             .gzip(config.connection_pool.gzip_enabled)
             // TCP settings
             .tcp_keepalive(if config.connection_pool.tcp_keepalive { Some(Duration::from_secs(60)) } else { None })
@@ -281,14 +280,33 @@ impl DownloadEngine {
             tcp_nodelay: true,
         };
 
+        // Resolve paths relative to the executable location
+        let exe_path = std::env::current_exe().map_err(|e| DownloadError::Config(format!("Failed to get executable path: {}", e)))?;
+        let exe_dir = exe_path.parent().ok_or_else(|| DownloadError::Config("Failed to get executable directory".to_string()))?;
+        
+        // Resolve each path relative to the executable directory if it's a relative path
+        let download_dir = if PathBuf::from(&app_config.paths.download_directory).is_absolute() {
+            PathBuf::from(&app_config.paths.download_directory)
+        } else {
+            exe_dir.join(&app_config.paths.download_directory)
+        };
+        
+        let blacklisted_dir = exe_dir.join("blacklisted_downloads");
+        
+        let temp_dir = if PathBuf::from(&app_config.paths.temp_directory).is_absolute() {
+            PathBuf::from(&app_config.paths.temp_directory)
+        } else {
+            exe_dir.join(&app_config.paths.temp_directory)
+        };
+
         // Create the download engine config
         let config = DownloadEngineConfig {
             max_concurrent_downloads: app_config.pools.max_download_concurrency,
             retry_attempts: 3,
             base_retry_delay_ms: (app_config.rate.retry_backoff_secs * 1000) as u64,
-            download_dir: PathBuf::from(&app_config.paths.download_directory),
-            blacklisted_dir: PathBuf::from("./blacklisted_downloads"),
-            temp_dir: PathBuf::from(&app_config.paths.temp_directory),
+            download_dir,
+            blacklisted_dir,
+            temp_dir,
             user_agent: format!("e621_downloader/{} (by {})", 
                 env!("CARGO_PKG_VERSION"), 
                 e621_config.auth.username),
@@ -490,8 +508,8 @@ impl DownloadEngine {
         blacklist_handler: Arc<BlacklistHandler>,
         e621_config: &E621Config,
     ) -> DownloadResult<PathBuf> {
-        // Create the file path
-        let file_name = format!("{}_{}.{}", job.post_id, job.md5, job.file_ext);
+        // Create a meaningful file name with artist, tags, and post_id
+        let file_name = create_meaningful_filename(job);
 
         // Determine the target directory based on whether the post is blacklisted
         let target_dir = if job.is_blacklisted {
@@ -723,6 +741,58 @@ impl DownloadEngine {
         let delay = (1 << exponent) as u64 * base_delay_ms;
         std::cmp::min(delay, max_delay)
     }
+}
+
+/// Create a meaningful filename from a download job
+fn create_meaningful_filename(job: &DownloadJob) -> String {
+    // Extract artist names from tags
+    let artists: Vec<String> = job.tags.iter()
+        .filter(|tag| tag.starts_with("artist:"))
+        .map(|tag| sanitize_filename(tag.trim_start_matches("artist:")))
+        .collect();
+    
+    // Get first few relevant non-artist tags
+    let relevant_tags: Vec<String> = job.tags.iter()
+        .filter(|tag| !tag.starts_with("artist:") && 
+                     !tag.starts_with("meta:") && 
+                     !tag.starts_with("lore:") &&
+                     !tag.contains(":") && // Skip rating: and other special tags
+                     tag.len() > 2) // Skip very short tags
+        .take(3) // Only take first 3 relevant tags
+        .map(|tag| sanitize_filename(tag))
+        .collect();
+    
+    // Build the filename components
+    let mut filename_parts = Vec::new();
+    
+    // Add artist (skip if none)
+    if !artists.is_empty() {
+        filename_parts.push(artists.join("+"));
+    }
+    
+    // Add relevant tags if any
+    if !relevant_tags.is_empty() {
+        filename_parts.push(relevant_tags.join("_"));
+    }
+    
+    // Add post ID
+    filename_parts.push(job.post_id.to_string());
+    
+    // Combine all parts with underscores and add extension
+    let base_name = filename_parts.join("_");
+    
+    // Ensure the filename isn't too long (Windows has a 260 char path limit)
+    let max_base_length = 200; // Leave room for directory path and extension
+    let final_base = if base_name.len() > max_base_length {
+        // Truncate but keep the post_id at the end
+        let post_id_part = format!("_{}", job.post_id);
+        let available_length = max_base_length - post_id_part.len();
+        format!("{}{}", &base_name[..available_length], post_id_part)
+    } else {
+        base_name
+    };
+    
+    format!("{}.{}", final_base, job.file_ext)
 }
 
 /// Sanitize a filename to remove invalid characters

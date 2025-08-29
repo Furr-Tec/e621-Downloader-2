@@ -309,76 +309,61 @@ impl FileProcessor {
         })
     }
     
-    /// Generate a filename for a job
-    fn generate_filename(&self, job: &DownloadJob, hashes: &FileHash) -> FileProcessorResult<String> {
+    /// Generate a filename for a job (matching stable version format)
+    fn generate_filename(&self, job: &DownloadJob, _hashes: &FileHash) -> FileProcessorResult<String> {
         // Extract artist tags
         let artists = job.tags.iter()
             .filter(|tag| tag.starts_with("artist:"))
             .map(|tag| tag.trim_start_matches("artist:"))
             .collect::<Vec<_>>();
         
-        // Get up to 3 general tags
-        let general_tags = job.tags.iter()
-            .filter(|tag| !tag.contains(":"))
-            .take(3)
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>();
-        
-        // Create the artist part
-        let artist_part = if !artists.is_empty() {
-            artists.join("_")
+        // Generate filename based on stable version format:
+        // - If no artists: {post_id}.{ext}
+        // - With artist(s): {artist_name(s)}_{post_id}.{ext}
+        let filename = if artists.is_empty() {
+            format!("{}.{}", job.post_id, job.file_ext)
         } else {
-            "unknown_artist".to_string()
+            // Sanitize artist names and join with "+" for multiple artists
+            let artist_names: Vec<String> = artists
+                .iter()
+                .map(|name| sanitize_filename(name))
+                .collect();
+            let artist_string = artist_names.join("+");
+            
+            format!("{}_{}.{}", artist_string, job.post_id, job.file_ext)
         };
-        
-        // Create the tags part
-        let tags_part = if !general_tags.is_empty() {
-            general_tags.join("_")
-        } else {
-            "no_tags".to_string()
-        };
-        
-        // Create the hash suffix (first 8 chars of blake3)
-        let hash_suffix = &hashes.blake3[0..8];
-        
-        // Generate the filename
-        let filename = format!(
-            "{}_{}_{}_{}_.{}",
-            job.post_id,
-            sanitize_filename(&artist_part),
-            sanitize_filename(&tags_part),
-            hash_suffix,
-            job.file_ext
-        );
         
         Ok(filename)
     }
     
-    /// Create the target directory structure
+    /// Create the target directory structure (matching stable version format)
     fn create_target_directory(&self, job: &DownloadJob, app_config: &AppConfig) -> FileProcessorResult<PathBuf> {
+        // Create the base directory
+        let base_dir = Path::new(&app_config.paths.download_directory);
+        
         // Extract artist tags
         let artists = job.tags.iter()
             .filter(|tag| tag.starts_with("artist:"))
             .map(|tag| tag.trim_start_matches("artist:"))
             .collect::<Vec<_>>();
         
-        // Create the base directory
-        let base_dir = Path::new(&app_config.paths.download_directory);
-        
-        // Create the artist directory
-        let artist_dir = if !artists.is_empty() {
-            base_dir.join("by_artist").join(sanitize_filename(&artists[0]))
+        // Use Artists/{artist_name}/ structure like stable version
+        let target_dir = if !artists.is_empty() {
+            // Use first artist for directory name
+            let artist_name = sanitize_filename(&artists[0]);
+            base_dir.join("Artists").join(artist_name)
         } else {
-            base_dir.join("unsorted")
+            // Files without artists go in a "Single Posts" directory
+            base_dir.join("Single Posts")
         };
         
         // Create the directory if it doesn't exist
-        if !artist_dir.exists() {
-            fs::create_dir_all(&artist_dir)
+        if !target_dir.exists() {
+            fs::create_dir_all(&target_dir)
                 .map_err(|e| FileProcessorError::Io(e))?;
         }
         
-        Ok(artist_dir)
+        Ok(target_dir)
     }
 }
 

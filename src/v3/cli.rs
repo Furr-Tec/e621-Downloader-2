@@ -365,9 +365,112 @@ impl CliManager {
         
         use crate::v3::{init_orchestrator, init_query_planner, init_download_engine, init_file_processor};
         use std::sync::Arc;
+        use std::path::Path;
+        
+        // Pre-flight checks
+        println!("{}", style("Performing pre-flight checks...").cyan());
+        
+        // Check and create download directories
+        let config_manager = match init_config(&self.config_dir).await {
+            Ok(cm) => Arc::new(cm),
+            Err(e) => {
+                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        let app_config = match config_manager.get_app_config() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("{} Failed to get app config: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        let e621_config = match config_manager.get_e621_config() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("{} Failed to get E621 config: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        let rules_config = match config_manager.get_rules_config() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("{} Failed to get rules config: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Check and create download directory
+        let download_dir = Path::new(&app_config.paths.download_directory);
+        if !download_dir.exists() {
+            println!("{} Download directory does not exist: {}", 
+                style("!").yellow(), download_dir.display());
+            println!("{} Creating download directory...", style("▶").blue());
+            
+            if let Err(e) = std::fs::create_dir_all(&download_dir) {
+                println!("{} Failed to create download directory: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+            println!("{} Created download directory: {}", 
+                style("✓").green(), download_dir.display());
+        } else {
+            println!("{} Download directory verified: {}", 
+                style("✓").green(), download_dir.display());
+        }
+        
+        // Check and create temp directory
+        let temp_dir = Path::new(&app_config.paths.temp_directory);
+        if !temp_dir.exists() {
+            println!("{} Creating temp directory...", style("▶").blue());
+            if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+                println!("{} Failed to create temp directory: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+            println!("{} Created temp directory: {}", 
+                style("✓").green(), temp_dir.display());
+        }
+        
+        // Report blacklist status
+        let blacklist_count = rules_config.blacklist.tags.len();
+        if blacklist_count > 0 {
+            println!("{} Blacklist loaded: {} tags will be filtered", 
+                style("✓").green(), blacklist_count);
+            if blacklist_count <= 10 {
+                println!("   Blacklisted tags: {:?}", rules_config.blacklist.tags);
+            } else {
+                println!("   First 10 blacklisted tags: {:?}", 
+                    &rules_config.blacklist.tags[..10]);
+                println!("   ... and {} more", blacklist_count - 10);
+            }
+        } else {
+            println!("{} No blacklist tags configured", style("!").yellow());
+        }
+        
+        // Check credentials
+        if e621_config.auth.username == "your_username" || 
+           e621_config.auth.api_key == "your_api_key_here" ||
+           e621_config.auth.username.is_empty() ||
+           e621_config.auth.api_key.is_empty() {
+            println!("{} No valid E621 credentials configured", style("⚠").yellow());
+            println!("   Downloads will be attempted without authentication");
+            println!("   Some content may be inaccessible");
+            println!("   To configure credentials, edit e621.toml");
+        } else {
+            println!("{} E621 authentication configured for user: {}", 
+                style("✓").green(), e621_config.auth.username);
+        }
         
         // Initialize the orchestrator
-        println!("{}", style("Initializing orchestrator...").cyan());
+        println!("\n{}", style("Initializing orchestrator...").cyan());
         // Create a new ConfigManager instance instead of cloning
         let config_manager = match init_config(&self.config_dir).await {
             Ok(cm) => Arc::new(cm),
@@ -409,21 +512,27 @@ impl CliManager {
                                         let mut total_jobs = 0;
                                         let mut total_bytes = 0u64;
                                         
-                                        // Process each query
-                                        for (i, query) in queries.iter().enumerate() {
-                                            println!("{} Processing query {}/{}: {:?}", 
-                                                style("▶").blue(), i + 1, queries.len(), query.tags);
-                                            
-                                            match query_planner.create_query_plan(query).await {
-                                                Ok(plan) => {
-                                                    println!("{} Query plan created: {} jobs, ~{:.1} MB",
-                                                        style("✓").green(),
-                                                        plan.jobs.len(),
-                                                        plan.estimated_size_bytes as f64 / 1_048_576.0
-                                                    );
-                                                    
-                                                    total_jobs += plan.jobs.len();
-                                                    total_bytes += plan.estimated_size_bytes;
+                        // Process each query
+                        for (i, query) in queries.iter().enumerate() {
+                            println!("{} Processing query {}/{}: {:?}", 
+                                style("▶").blue(), i + 1, queries.len(), query.tags);
+                            
+                            match query_planner.create_query_plan(query).await {
+                                Ok(plan) => {
+                                    let skipped_count = plan.estimated_post_count - plan.jobs.len() as u32;
+                                    
+                                    println!("{} Query plan created:", style("✓").green());
+                                    println!("   Posts found: {}", plan.estimated_post_count);
+                                    println!("   New downloads: {}", plan.jobs.len());
+                                    if skipped_count > 0 {
+                                        println!("   Already downloaded: {}", skipped_count);
+                                    }
+                                    println!("   Estimated size: ~{:.1} MB",
+                                        plan.estimated_size_bytes as f64 / 1_048_576.0
+                                    );
+                                    
+                                    total_jobs += plan.jobs.len();
+                                    total_bytes += plan.estimated_size_bytes;
                                                     
                                                     // Execute downloads if jobs exist and credentials are valid
                                                     if !plan.jobs.is_empty() {

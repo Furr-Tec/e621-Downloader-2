@@ -173,7 +173,8 @@ pub struct QueryPlan {
 
 /// Hash store for post deduplication
 pub struct HashStore {
-    memory_store: HashSet<String>,
+    memory_hashes: HashSet<String>,
+    memory_post_ids: HashSet<u32>,
     db_connection: Connection,
 }
 
@@ -201,35 +202,53 @@ impl HashStore {
             [],
         )?;
 
-        // Load existing hashes into memory
-        let mut store: HashSet<String> = HashSet::new();
+        // Load existing hashes and post IDs into memory
+        let mut hashes: HashSet<String> = HashSet::new();
+        let mut post_ids: HashSet<u32> = HashSet::new();
         
         {
-            let mut stmt = db_connection.prepare("SELECT md5 FROM post_hashes")?;
-            let hash_iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stmt = db_connection.prepare("SELECT md5, post_id FROM post_hashes")?;
+            let row_iter = stmt.query_map([], |row| {
+                let md5: String = row.get(0)?;
+                let post_id: u32 = row.get::<_, i64>(1)? as u32;
+                Ok((md5, post_id))
+            })?;
 
-            for hash in hash_iter {
-                if let Ok(h) = hash {
-                    store.insert(h);
+            for row_result in row_iter {
+                if let Ok((md5, post_id)) = row_result {
+                    hashes.insert(md5);
+                    post_ids.insert(post_id);
                 }
             }
         }
 
         Ok(Self {
-            memory_store: store,
+            memory_hashes: hashes,
+            memory_post_ids: post_ids,
             db_connection,
         })
     }
 
     /// Check if a hash exists in the store
     pub fn contains(&self, md5: &str) -> bool {
-        self.memory_store.contains(md5)
+        self.memory_hashes.contains(md5)
+    }
+
+    /// Check if a post ID exists in the store
+    pub fn contains_post_id(&self, post_id: u32) -> bool {
+        self.memory_post_ids.contains(&post_id)
+    }
+
+    /// Check if either hash or post ID exists (comprehensive deduplication)
+    pub fn contains_either(&self, md5: &str, post_id: u32) -> bool {
+        self.memory_hashes.contains(md5) || self.memory_post_ids.contains(&post_id)
     }
 
     /// Add a hash to the store
     pub fn add(&mut self, md5: &str, post_id: u32) -> SqliteResult<()> {
-        // Add to memory store
-        self.memory_store.insert(md5.to_string());
+        // Add to memory stores
+        self.memory_hashes.insert(md5.to_string());
+        self.memory_post_ids.insert(post_id);
 
         // Add to database
         self.db_connection.execute(
@@ -248,24 +267,38 @@ impl QueryPlanner {
         let app_config = config_manager.get_app_config()
             .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
 
-        // Create the HTTP client
+        // Get the e621 config to build proper user agent
+        let e621_config = config_manager.get_e621_config()
+            .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
+
+        // Create the HTTP client with proper user agent
+        let user_agent = format!("e621_downloader/{} (by {})", 
+            env!("CARGO_PKG_VERSION"), 
+            e621_config.auth.username);
         let client = Client::builder()
-            .user_agent("e621_downloader/2.0 (by anonymous)")
+            .user_agent(&user_agent)
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| QueryPlannerError::Request(e))?;
 
-        // Create the hash store
-        let db_path = Path::new(&app_config.paths.database_file);
+        // Resolve database path relative to the executable location
+        let exe_path = std::env::current_exe().map_err(|e| QueryPlannerError::Config(format!("Failed to get executable path: {}", e)))?;
+        let exe_dir = exe_path.parent().ok_or_else(|| QueryPlannerError::Config("Failed to get executable directory".to_string()))?;
+        
+        let db_path = if std::path::PathBuf::from(&app_config.paths.database_file).is_absolute() {
+            std::path::PathBuf::from(&app_config.paths.database_file)
+        } else {
+            exe_dir.join(&app_config.paths.database_file)
+        };
 
         // Create the parent directory if it doesn't exist
         if let Some(parent) = db_path.parent() {
             if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent)?
             }
         }
 
-        let hash_store = HashStore::new(db_path)
+        let hash_store = HashStore::new(&db_path)
             .map_err(|e| QueryPlannerError::Database(e))?;
 
         Ok(Self {
@@ -491,9 +524,9 @@ impl QueryPlanner {
                     continue;
                 }
 
-                // Skip if the post is already downloaded
-                if self.hash_store.read().contains(&post.file.md5) {
-                    debug!("Skipping post {} (already downloaded)", post.id);
+                // Skip if the post is already downloaded (check both MD5 hash and post ID)
+                if self.hash_store.read().contains_either(&post.file.md5, post.id) {
+                    debug!("Skipping post {} (already downloaded by hash or ID)", post.id);
                     continue;
                 }
 
@@ -566,7 +599,12 @@ impl QueryPlanner {
         all_tags.extend(post.tags.species.clone());
         all_tags.extend(post.tags.character.clone());
         all_tags.extend(post.tags.copyright.clone());
-        all_tags.extend(post.tags.artist.clone());
+        
+        // Add artist tags with "artist:" prefix
+        for artist in &post.tags.artist {
+            all_tags.push(format!("artist:{}", artist));
+        }
+        
         all_tags.extend(post.tags.meta.clone());
 
         all_tags
