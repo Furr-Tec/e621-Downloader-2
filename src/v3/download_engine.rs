@@ -30,7 +30,7 @@ use crate::v3::{
     DownloadJob,
     BlacklistHandler,
     DirectoryOrganizer, ContentType, init_directory_organizer,
-    HashManager, init_hash_manager,
+    Database, init_database,
 };
 
 /// Error types for the download engine
@@ -198,8 +198,8 @@ pub struct DownloadEngine {
     config_manager: Arc<ConfigManager>,
     /// Directory organizer for managing folder structures
     directory_organizer: Arc<DirectoryOrganizer>,
-    /// Hash manager for duplicate detection and database management
-    hash_manager: Arc<HashManager>,
+    /// Database for download persistence and duplicate detection
+    database: Arc<Database>,
 }
 
 impl DownloadEngine {
@@ -209,7 +209,7 @@ impl DownloadEngine {
         blacklist_handler: Arc<BlacklistHandler>, 
         config_manager: Arc<ConfigManager>,
         directory_organizer: Arc<DirectoryOrganizer>,
-        hash_manager: Arc<HashManager>
+        database: Arc<Database>
     ) -> DownloadResult<Self> {
         // Create the HTTP client with advanced connection pool configuration
         let client = Client::builder()
@@ -267,7 +267,7 @@ impl DownloadEngine {
             current_concurrency: Arc::new(Mutex::new(original_concurrency)),
             config_manager,
             directory_organizer,
-            hash_manager,
+            database,
         })
     }
 
@@ -318,7 +318,7 @@ impl DownloadEngine {
             max_concurrent_downloads: app_config.pools.max_download_concurrency,
             retry_attempts: 3,
             base_retry_delay_ms: (app_config.rate.retry_backoff_secs * 1000) as u64,
-            download_dir,
+            download_dir: download_dir.clone(),
             blacklisted_dir,
             temp_dir,
             user_agent: format!("e621_downloader/{} (by {})", 
@@ -332,15 +332,25 @@ impl DownloadEngine {
         let blacklist_handler = BlacklistHandler::from_config(config_manager.clone()).await
             .map_err(|e| DownloadError::Config(format!("Failed to create blacklist handler: {}", e)))?;
 
-        // Create the directory organizer
-        let directory_organizer = init_directory_organizer(&app_config).await
+        // Get configured tags from e621 config
+        let mut configured_tags = e621_config.query.tags.clone();
+        configured_tags.extend(e621_config.query.artists.clone());
+        
+        // Create the directory organizer with the resolved download directory path
+        let directory_organizer = init_directory_organizer(download_dir.clone(), &app_config, configured_tags).await
             .map_err(|e| DownloadError::Config(format!("Failed to create directory organizer: {}", e)))?;
 
-        // Create the hash manager
-        let hash_manager = init_hash_manager(config_manager.clone()).await
-            .map_err(|e| DownloadError::Config(format!("Failed to create hash manager: {}", e)))?;
+        // Create the database
+        let db_path = if PathBuf::from(&app_config.paths.database_file).is_absolute() {
+            PathBuf::from(&app_config.paths.database_file)
+        } else {
+            exe_dir.join(&app_config.paths.database_file)
+        };
+        
+        let database = init_database(&db_path).await
+            .map_err(|e| DownloadError::Config(format!("Failed to create database: {}", e)))?;
 
-        Self::new(config, Arc::new(blacklist_handler), config_manager, Arc::new(directory_organizer), hash_manager)
+        Self::new(config, Arc::new(blacklist_handler), config_manager, Arc::new(directory_organizer), database)
     }
 
     /// Start the download engine
@@ -354,7 +364,7 @@ impl DownloadEngine {
         let shutdown_rx = self.shutdown_rx.clone();
         let blacklist_handler = self.blacklist_handler.clone();
         let directory_organizer = self.directory_organizer.clone();
-        let hash_manager = self.hash_manager.clone();
+        let database = self.database.clone();
 
         // Get the e621 config
         let e621_config = match self.config_manager.get_e621_config() {
@@ -402,7 +412,7 @@ impl DownloadEngine {
                         let blacklist_handler_clone = blacklist_handler.clone();
                         let e621_config_clone = e621_config.clone();
                         let directory_organizer_clone = directory_organizer.clone();
-                        let hash_manager_clone = hash_manager.clone();
+                        let database_clone = database.clone();
 
                         // Spawn a task to download the file
                         tokio::spawn(async move {
@@ -414,7 +424,7 @@ impl DownloadEngine {
                                 stats_clone.clone(),
                                 blacklist_handler_clone,
                                 directory_organizer_clone,
-                                hash_manager_clone,
+                                database_clone,
                                 &e621_config_clone,
                             ).await;
 
@@ -527,7 +537,7 @@ impl DownloadEngine {
     }
 
     /// Download a file
-    #[instrument(skip(client, job, config, stats, blacklist_handler, directory_organizer, hash_manager, e621_config), fields(post_id = %job.post_id, md5 = %job.md5))]
+    #[instrument(skip(client, job, config, stats, blacklist_handler, directory_organizer, database, e621_config), fields(post_id = %job.post_id, md5 = %job.md5))]
     async fn download_file(
         client: &Client,
         job: &DownloadJob,
@@ -535,7 +545,7 @@ impl DownloadEngine {
         stats: Arc<Mutex<DownloadStats>>,
         blacklist_handler: Arc<BlacklistHandler>,
         directory_organizer: Arc<DirectoryOrganizer>,
-        hash_manager: Arc<HashManager>,
+        database: Arc<Database>,
         e621_config: &E621Config,
     ) -> DownloadResult<PathBuf> {
         // Determine the content type based on the job and user context
@@ -690,12 +700,12 @@ impl DownloadEngine {
                     fs::rename(&temp_path, &file_path)
                         .map_err(|e| DownloadError::Io(e))?;
 
-                    // Record the successful download in the hash manager
-                    if let Err(e) = hash_manager.record_download(job, &file_path).await {
-                        warn!("Failed to record download in hash manager: {}", e);
+                    // Record the successful download in the database
+                    if let Err(e) = database.record_download(job, &file_path).await {
+                        warn!("Failed to record download in database: {}", e);
                         // Don't fail the download for this, but log it
                     } else {
-                        debug!("Recorded download in hash manager: post_id={}, md5={}", job.post_id, job.md5);
+                        debug!("Recorded download in database: post_id={}, md5={}", job.post_id, job.md5);
                     }
 
                     return Ok(file_path);

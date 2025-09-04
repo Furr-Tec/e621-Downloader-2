@@ -43,6 +43,12 @@ pub enum DatabaseError {
     #[error("Write buffer error: {0}")]
     WriteBuffer(#[from] WriteBufferError),
     
+    #[error("Database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
     #[error("Query error: {0}")]
     Query(String),
     

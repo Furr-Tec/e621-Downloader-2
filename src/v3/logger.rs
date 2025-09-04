@@ -15,7 +15,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn, Level};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_appender;
 use tracing_subscriber::{
     fmt::{self, format::FmtSpan},
     prelude::*,
@@ -132,16 +132,15 @@ impl Logger {
         let app_config = self.config_manager.get_app_config()
             .map_err(|e| LoggerError::Config(e.to_string()))?;
 
-        // Create a file appender that rolls daily
-        let file_appender = RollingFileAppender::new(
-            Rotation::DAILY,
-            &self.log_dir,
+        // Create a non-rolling file appender that always writes to e621_downloader.log
+        let (file_writer, _guard) = tracing_appender::non_blocking(tracing_appender::rolling::never(
+            &self.log_dir, 
             "e621_downloader.log",
-        );
+        ));
 
         // Create a formatting layer for the file
         let file_layer = fmt::layer()
-            .with_writer(file_appender)
+            .with_writer(file_writer)
             .with_ansi(false)
             .with_span_events(FmtSpan::CLOSE);
 

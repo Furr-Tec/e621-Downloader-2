@@ -85,12 +85,12 @@ pub struct DirectoryOrganizer {
     strategy: OrganizationStrategy,
     favorites_folder: PathBuf,
     blacklisted_folder: PathBuf,
+    configured_tags: Vec<String>,
 }
 
 impl DirectoryOrganizer {
     /// Create a new directory organizer
-    pub fn new(config: &AppConfig) -> DirectoryOrganizerResult<Self> {
-        let base_download_dir = PathBuf::from(&config.paths.download_directory);
+    pub fn new(base_download_dir: PathBuf, config: &AppConfig, configured_tags: Vec<String>) -> DirectoryOrganizerResult<Self> {
         let strategy = OrganizationStrategy::from_config_string(&config.organization.directory_strategy);
         
         let favorites_folder = base_download_dir.join("favorites");
@@ -101,6 +101,7 @@ impl DirectoryOrganizer {
             strategy,
             favorites_folder,
             blacklisted_folder,
+            configured_tags,
         })
     }
     
@@ -165,25 +166,32 @@ impl DirectoryOrganizer {
     
     /// Create folders for tags
     fn create_tag_folders(&self, job: &DownloadJob) -> DirectoryOrganizerResult<PathBuf> {
-        // Use the first non-meta tag or fall back to a generic folder
-        let primary_tag = job.tags.iter()
-            .find(|tag| !is_meta_tag(tag))
+        // First, try to find a configured tag that matches the post's tags
+        let primary_tag = self.configured_tags.iter()
+            .find(|configured_tag| {
+                job.tags.iter().any(|post_tag| {
+                    // Handle both exact matches and artist: prefixed tags
+                    post_tag == *configured_tag || 
+                    post_tag == &format!("artist:{}", configured_tag) ||
+                    (post_tag.starts_with("artist:") && 
+                     post_tag.strip_prefix("artist:").unwrap_or("") == *configured_tag)
+                })
+            })
             .cloned()
-            .unwrap_or_else(|| format!("post_{}", job.post_id));
+            .or_else(|| {
+                // Fallback: use the first non-meta tag from the post that's in our configured tags
+                job.tags.iter()
+                    .find(|tag| !is_meta_tag(tag) && self.configured_tags.contains(tag))
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                // Final fallback: create a single unmatched folder for all non-matching posts
+                "unmatched".to_string()
+            });
         
         let tag_folder = self.base_download_dir.join("tags").join(sanitize_filename(&primary_tag));
         
-        // Also create additional tag folders for cross-referencing
-        for tag in &job.tags {
-            if !is_meta_tag(tag) && tag != &primary_tag {
-                let additional_folder = self.base_download_dir.join("tags").join(sanitize_filename(tag));
-                if !additional_folder.exists() {
-                    fs::create_dir_all(&additional_folder)?;
-                    debug!("Created additional tag folder: {}", additional_folder.display());
-                }
-            }
-        }
-        
+        // Only return the primary tag folder - don't create empty additional folders
         Ok(tag_folder)
     }
     
@@ -209,63 +217,38 @@ impl DirectoryOrganizer {
         
         let artist_folder = self.base_download_dir.join("artists").join(sanitize_filename(&artist_name));
         
-        // Create folders for additional artists too
-        for artist in artist_tags.iter().skip(1) {
-            let additional_folder = self.base_download_dir.join("artists").join(sanitize_filename(artist));
-            if !additional_folder.exists() {
-                fs::create_dir_all(&additional_folder)?;
-                debug!("Created additional artist folder: {}", additional_folder.display());
-            }
-        }
-        
+        // Only return the primary artist folder - don't create empty additional folders
         Ok(artist_folder)
     }
     
     /// Create mixed folder structure (both tags and artists)
     fn create_mixed_folders(&self, job: &DownloadJob) -> DirectoryOrganizerResult<PathBuf> {
-        // Create artist folders
-        let artist_tags: Vec<String> = job.tags.iter()
-            .filter(|tag| tag.starts_with("artist:") || is_likely_artist_tag(tag))
-            .map(|tag| {
-                if tag.starts_with("artist:") {
-                    tag.strip_prefix("artist:").unwrap_or(tag).to_string()
-                } else {
-                    tag.clone()
-                }
-            })
-            .collect();
-        
-        // Create folders for all artists
-        for artist in &artist_tags {
-            let artist_folder = self.base_download_dir.join("artists").join(sanitize_filename(artist));
-            if !artist_folder.exists() {
-                fs::create_dir_all(&artist_folder)?;
-                debug!("Created artist folder: {}", artist_folder.display());
-            }
+        // Check for configured artist names first
+        let configured_artist = self.configured_tags.iter()
+            .find(|configured_tag| {
+                job.tags.iter().any(|post_tag| {
+                    post_tag == &format!("artist:{}", configured_tag) ||
+                    (post_tag.starts_with("artist:") && 
+                     post_tag.strip_prefix("artist:").unwrap_or("") == *configured_tag)
+                })
+            });
+            
+        if let Some(artist) = configured_artist {
+            return Ok(self.base_download_dir.join("artists").join(sanitize_filename(artist)));
         }
         
-        // Create tag folders for important tags
-        let important_tags: Vec<String> = job.tags.iter()
-            .filter(|tag| !is_meta_tag(tag) && !tag.starts_with("artist:"))
-            .cloned()
-            .collect();
-        
-        for tag in &important_tags {
-            let tag_folder = self.base_download_dir.join("tags").join(sanitize_filename(tag));
-            if !tag_folder.exists() {
-                fs::create_dir_all(&tag_folder)?;
-                debug!("Created tag folder: {}", tag_folder.display());
-            }
+        // Check for configured tags
+        let configured_tag = self.configured_tags.iter()
+            .find(|configured_tag| {
+                job.tags.iter().any(|post_tag| post_tag == *configured_tag)
+            });
+            
+        if let Some(tag) = configured_tag {
+            return Ok(self.base_download_dir.join("tags").join(sanitize_filename(tag)));
         }
         
-        // Return the primary location (prefer artist if available, otherwise use primary tag)
-        if !artist_tags.is_empty() {
-            Ok(self.base_download_dir.join("artists").join(sanitize_filename(&artist_tags[0])))
-        } else if !important_tags.is_empty() {
-            Ok(self.base_download_dir.join("tags").join(sanitize_filename(&important_tags[0])))
-        } else {
-            Ok(self.base_download_dir.join("unsorted"))
-        }
+        // Final fallback: create an unsorted folder for posts that don't match any configured tags/artists
+        Ok(self.base_download_dir.join("unmatched"))
     }
     
     /// Generate a sanitized filename for the download
@@ -276,8 +259,22 @@ impl DirectoryOrganizer {
             format!(".{}", job.file_ext)
         };
         
-        // Use MD5 as the base filename to avoid conflicts
-        format!("{}{}", job.md5, extension)
+        // Extract artist name from tags
+        let artist_name = job.tags.iter()
+            .find(|tag| tag.starts_with("artist:"))
+            .map(|tag| tag.strip_prefix("artist:").unwrap_or(tag))
+            .or_else(|| {
+                // Fallback to finding likely artist tags
+                job.tags.iter()
+                    .find(|tag| is_likely_artist_tag(tag))
+                    .map(|tag| tag.as_str())
+            })
+            .unwrap_or("unknown")
+            .to_string();
+        
+        // Generate filename in format: artist_postid.extension
+        let sanitized_artist = sanitize_filename(&artist_name);
+        format!("{}_{}{}", sanitized_artist, job.post_id, extension)
     }
     
     /// Get the base download directory
@@ -395,6 +392,6 @@ fn is_likely_artist_tag(tag: &str) -> bool {
 }
 
 /// Initialize directory organizer
-pub async fn init_directory_organizer(config: &AppConfig) -> DirectoryOrganizerResult<DirectoryOrganizer> {
-    DirectoryOrganizer::new(config)
+pub async fn init_directory_organizer(base_download_dir: PathBuf, config: &AppConfig, configured_tags: Vec<String>) -> DirectoryOrganizerResult<DirectoryOrganizer> {
+    DirectoryOrganizer::new(base_download_dir, config, configured_tags)
 }

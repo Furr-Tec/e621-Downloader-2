@@ -906,7 +906,7 @@ impl CliManager {
         
         // Get basic statistics
         let total_downloads: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM post_hashes", [], |row| row.get(0)
+            "SELECT COUNT(*) FROM downloads", [], |row| row.get(0)
         ).unwrap_or(0);
         
         println!("{} Total downloads recorded: {}", style("📊").blue(), total_downloads);
@@ -914,11 +914,11 @@ impl CliManager {
         if total_downloads > 0 {
             // Get earliest and latest downloads
             let earliest: String = conn.query_row(
-                "SELECT MIN(downloaded_at) FROM post_hashes", [], |row| row.get(0)
+                "SELECT MIN(downloaded_at) FROM downloads", [], |row| row.get(0)
             ).unwrap_or_else(|_| "Unknown".to_string());
             
             let latest: String = conn.query_row(
-                "SELECT MAX(downloaded_at) FROM post_hashes", [], |row| row.get(0)
+                "SELECT MAX(downloaded_at) FROM downloads", [], |row| row.get(0)
             ).unwrap_or_else(|_| "Unknown".to_string());
             
             println!("{} First download: {}", style("📅").blue(), earliest);
@@ -927,7 +927,7 @@ impl CliManager {
             // Get file type distribution
             println!("\n{}", style("File Type Distribution:").cyan());
             let mut stmt = conn.prepare(
-                "SELECT SUBSTR(md5, -3) as ext, COUNT(*) as count FROM post_hashes GROUP BY ext ORDER BY count DESC LIMIT 10"
+                "SELECT SUBSTR(md5, -3) as ext, COUNT(*) as count FROM downloads GROUP BY ext ORDER BY count DESC LIMIT 10"
             ).ok();
             
             if let Some(ref mut stmt) = stmt {
@@ -970,7 +970,7 @@ impl CliManager {
         };
         
         let mut stmt = match conn.prepare(
-            "SELECT post_id, md5, downloaded_at FROM post_hashes ORDER BY downloaded_at DESC LIMIT 20"
+            "SELECT post_id, md5, downloaded_at FROM downloads ORDER BY downloaded_at DESC LIMIT 20"
         ) {
             Ok(stmt) => stmt,
             Err(e) => {
@@ -1142,11 +1142,11 @@ impl CliManager {
         
         // Count unique MD5 hashes vs total entries
         let unique_hashes: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT md5) FROM post_hashes", [], |row| row.get(0)
+            "SELECT COUNT(DISTINCT md5) FROM downloads", [], |row| row.get(0)
         ).unwrap_or(0);
         
         let total_entries: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM post_hashes", [], |row| row.get(0)
+            "SELECT COUNT(*) FROM downloads", [], |row| row.get(0)
         ).unwrap_or(0);
         
         println!("{} Unique files (MD5): {}", style("🔒").blue(), unique_hashes);
@@ -1158,7 +1158,7 @@ impl CliManager {
             
             // Show some duplicate examples
             let mut stmt = conn.prepare(
-                "SELECT md5, COUNT(*) as count FROM post_hashes GROUP BY md5 HAVING count > 1 ORDER BY count DESC LIMIT 5"
+                "SELECT md5, COUNT(*) as count FROM downloads GROUP BY md5 HAVING count > 1 ORDER BY count DESC LIMIT 5"
             ).ok();
             
             if let Some(ref mut stmt) = stmt {
@@ -1253,7 +1253,7 @@ impl CliManager {
         
         // Remove entries with empty/invalid MD5 hashes
         let removed = conn.execute(
-            "DELETE FROM post_hashes WHERE md5 IS NULL OR LENGTH(md5) != 32", []
+            "DELETE FROM downloads WHERE md5 IS NULL OR LENGTH(md5) != 32", []
         ).unwrap_or(0);
         
         if removed > 0 {

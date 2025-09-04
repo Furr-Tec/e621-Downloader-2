@@ -19,13 +19,16 @@ use crate::v3::{DownloadJob, HashManagerError};
 use super::connection_pool::{DatabasePool, PoolError};
 
 /// Write buffer errors
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum WriteBufferError {
     #[error("Database pool error: {0}")]
-    Pool(#[from] PoolError),
+    Pool(PoolError),
     
     #[error("Hash manager error: {0}")]
-    HashManager(#[from] HashManagerError),
+    HashManager(String),
+    
+    #[error("Database error: {0}")]
+    Database(String),
     
     #[error("Buffer overflow - too many pending operations")]
     BufferOverflow,
@@ -35,6 +38,24 @@ pub enum WriteBufferError {
     
     #[error("Operation timeout: {0}")]
     Timeout(String),
+}
+
+impl From<PoolError> for WriteBufferError {
+    fn from(error: PoolError) -> Self {
+        WriteBufferError::Pool(error)
+    }
+}
+
+impl From<HashManagerError> for WriteBufferError {
+    fn from(error: HashManagerError) -> Self {
+        WriteBufferError::HashManager(error.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for WriteBufferError {
+    fn from(error: rusqlite::Error) -> Self {
+        WriteBufferError::Database(error.to_string())
+    }
 }
 
 pub type WriteBufferResult<T> = Result<T, WriteBufferError>;
@@ -143,11 +164,11 @@ pub struct DatabaseWriteBuffer {
 
 impl DatabaseWriteBuffer {
     /// Create a new write buffer
-    pub fn new(pool: Arc<DatabasePool>, config: WriteBufferConfig) -> Self {
-        let (flush_trigger, _) = mpsc::channel(1);
-        let (shutdown_trigger, _) = mpsc::channel(1);
+    pub fn new(pool: Arc<DatabasePool>, config: WriteBufferConfig) -> (Self, mpsc::Receiver<()>, mpsc::Receiver<()>) {
+        let (flush_trigger, flush_rx) = mpsc::channel(1);
+        let (shutdown_trigger, shutdown_rx) = mpsc::channel(1);
         
-        Self {
+        let buffer = Self {
             pool,
             config,
             buffer: Arc::new(TokioMutex::new(VecDeque::new())),
@@ -155,11 +176,13 @@ impl DatabaseWriteBuffer {
             flush_trigger,
             shutdown_trigger,
             is_running: Arc::new(RwLock::new(false)),
-        }
+        };
+        
+        (buffer, flush_rx, shutdown_rx)
     }
     
     /// Start the write buffer background task
-    pub async fn start(&self) -> WriteBufferResult<()> {
+    pub async fn start(&self, mut flush_rx: mpsc::Receiver<()>, mut shutdown_rx: mpsc::Receiver<()>) -> WriteBufferResult<()> {
         if *self.is_running.read() {
             return Ok(()); // Already running
         }
@@ -171,8 +194,6 @@ impl DatabaseWriteBuffer {
         let pool = self.pool.clone();
         let config = self.config.clone();
         let is_running = self.is_running.clone();
-        let (_, mut flush_rx) = mpsc::channel(1);
-        let (_, mut shutdown_rx) = mpsc::channel(1);
         
         // Start the background flush task
         tokio::spawn(async move {
@@ -333,32 +354,36 @@ impl DatabaseWriteBuffer {
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to get write connection for batch: {}", e);
+                // Convert error to a cloneable form
+                let error = WriteBufferError::Pool(e);
+                let batch_size = batch.len();
                 // Notify all operations of failure
                 for op in batch {
                     if let Some(sender) = op.response_sender {
-                        let _ = sender.send(Err(WriteBufferError::Pool(e.clone())));
+                        let _ = sender.send(Err(error.clone()));
                     }
                 }
-                return (0, batch.len());
+                return (0, batch_size);
             }
         };
         
         // Begin transaction
         if let Err(e) = conn_guard.connection().execute("BEGIN TRANSACTION", []) {
             error!("Failed to begin transaction: {}", e);
+            let batch_size = batch.len();
             for op in batch {
                 if let Some(sender) = op.response_sender {
-                    let _ = sender.send(Err(WriteBufferError::Pool(PoolError::Database(e.clone()))));
+                    let _ = sender.send(Err(WriteBufferError::Pool(PoolError::Database(e.to_string()))));
                 }
             }
-            return (0, batch.len());
+            return (0, batch_size);
         }
         
         // Process each operation in the transaction
         let mut transaction_failed = false;
         
         while let Some(mut op) = batch.pop_front() {
-            let result = Self::execute_operation(&op.operation, conn_guard.connection()).await;
+            let result = Self::execute_operation(&op.operation, conn_guard.connection());
             
             match result {
                 Ok(()) => {
@@ -415,28 +440,28 @@ impl DatabaseWriteBuffer {
     }
     
     /// Execute a single write operation
-    async fn execute_operation(
+    fn execute_operation(
         operation: &WriteOperation,
         conn: &Connection,
     ) -> WriteBufferResult<()> {
         match operation {
             WriteOperation::RecordDownload { job, file_path, file_size, downloaded_at } => {
-                Self::record_download(conn, job, file_path, *file_size, *downloaded_at).await
+                Self::record_download(conn, job, file_path, *file_size, *downloaded_at)
             }
             WriteOperation::RecordFileIntegrity { post_id, file_path, blake3_hash, sha256_hash } => {
-                Self::record_file_integrity(conn, *post_id, file_path, blake3_hash.as_deref(), sha256_hash.as_deref()).await
+                Self::record_file_integrity(conn, *post_id, file_path, blake3_hash.as_deref(), sha256_hash.as_deref())
             }
             WriteOperation::UpdateBlacklistStatus { post_id, is_blacklisted } => {
-                Self::update_blacklist_status(conn, *post_id, *is_blacklisted).await
+                Self::update_blacklist_status(conn, *post_id, *is_blacklisted)
             }
             WriteOperation::CleanupOrphanedEntry { post_id } => {
-                Self::cleanup_orphaned_entry(conn, *post_id).await
+                Self::cleanup_orphaned_entry(conn, *post_id)
             }
         }
     }
     
     /// Record a download in the database
-    async fn record_download(
+    fn record_download(
         conn: &Connection,
         job: &DownloadJob,
         file_path: &Path,
@@ -484,7 +509,7 @@ impl DatabaseWriteBuffer {
     }
     
     /// Record file integrity hashes
-    async fn record_file_integrity(
+    fn record_file_integrity(
         conn: &Connection,
         post_id: u32,
         file_path: &Path,
@@ -507,7 +532,7 @@ impl DatabaseWriteBuffer {
     }
     
     /// Update blacklist status
-    async fn update_blacklist_status(
+    fn update_blacklist_status(
         conn: &Connection,
         post_id: u32,
         is_blacklisted: bool,
@@ -521,7 +546,7 @@ impl DatabaseWriteBuffer {
     }
     
     /// Cleanup orphaned database entry
-    async fn cleanup_orphaned_entry(
+    fn cleanup_orphaned_entry(
         conn: &Connection,
         post_id: u32,
     ) -> WriteBufferResult<()> {
@@ -536,9 +561,12 @@ impl DatabaseWriteBuffer {
     /// Check if an error is retryable
     fn is_retryable_error(error: &WriteBufferError) -> bool {
         match error {
-            WriteBufferError::Pool(PoolError::Database(rusqlite::Error::SqliteFailure(err, _))) => {
-                matches!(err.code, rusqlite::ErrorCode::DatabaseBusy | 
-                                   rusqlite::ErrorCode::DatabaseLocked)
+            WriteBufferError::Pool(PoolError::Database(msg)) => {
+                // Check if the error message contains retryable error indicators
+                msg.contains("database is busy") || 
+                msg.contains("database is locked") ||
+                msg.contains("SQLITE_BUSY") ||
+                msg.contains("SQLITE_LOCKED")
             }
             WriteBufferError::Pool(PoolError::ConnectionTimeout(_)) => true,
             WriteBufferError::Pool(PoolError::PoolExhausted) => true,
@@ -575,9 +603,10 @@ pub async fn init_database_write_buffer(
     config: Option<WriteBufferConfig>,
 ) -> WriteBufferResult<Arc<DatabaseWriteBuffer>> {
     let config = config.unwrap_or_default();
-    let buffer = Arc::new(DatabaseWriteBuffer::new(pool, config));
+    let (buffer, flush_rx, shutdown_rx) = DatabaseWriteBuffer::new(pool, config);
+    let buffer = Arc::new(buffer);
     
-    buffer.start().await?;
+    buffer.start(flush_rx, shutdown_rx).await?;
     
     Ok(buffer)
 }

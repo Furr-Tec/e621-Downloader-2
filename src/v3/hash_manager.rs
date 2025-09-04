@@ -116,6 +116,8 @@ impl HashManager {
 
     /// Initialize database schema with proper tables and indexes
     fn init_database_schema(conn: &Connection) -> SqliteResult<()> {
+        debug!("Starting database schema initialization");
+        
         // Main downloads table - stores information about downloaded posts
         conn.execute(
             "CREATE TABLE IF NOT EXISTS downloads (
@@ -129,7 +131,11 @@ impl HashManager {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
             [],
-        )?;
+        ).map_err(|e| {
+            error!("Failed to create downloads table: {}", e);
+            e
+        })?;
+        debug!("Created downloads table successfully");
 
         // Tags table - stores tags for downloaded posts
         conn.execute(
@@ -141,7 +147,11 @@ impl HashManager {
                 UNIQUE(post_id, tag)
             )",
             [],
-        )?;
+        ).map_err(|e| {
+            error!("Failed to create download_tags table: {}", e);
+            e
+        })?;
+        debug!("Created download_tags table successfully");
 
         // File integrity table - stores actual file hashes for verification
         conn.execute(
@@ -156,7 +166,11 @@ impl HashManager {
                 UNIQUE(post_id)
             )",
             [],
-        )?;
+        ).map_err(|e| {
+            error!("Failed to create file_integrity table: {}", e);
+            e
+        })?;
+        debug!("Created file_integrity table successfully");
 
         // Artists table - stores artists for downloaded posts
         conn.execute(
@@ -168,19 +182,65 @@ impl HashManager {
                 UNIQUE(post_id, artist)
             )",
             [],
-        )?;
+        ).map_err(|e| {
+            error!("Failed to create download_artists table: {}", e);
+            e
+        })?;
+        debug!("Created download_artists table successfully");
 
         // Create indexes for performance
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_md5 ON downloads(md5)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_post_id ON downloads(post_id)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_path ON downloads(file_path)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_post_id ON download_tags(post_id)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_tag ON download_tags(tag)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_integrity_post_id ON file_integrity(post_id)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_artists_post_id ON download_artists(post_id)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_artists_artist ON download_artists(artist)", [])?;
+        let indexes = [
+            ("CREATE INDEX IF NOT EXISTS idx_downloads_md5 ON downloads(md5)", "idx_downloads_md5"),
+            ("CREATE INDEX IF NOT EXISTS idx_downloads_post_id ON downloads(post_id)", "idx_downloads_post_id"),
+            ("CREATE INDEX IF NOT EXISTS idx_downloads_path ON downloads(file_path)", "idx_downloads_path"),
+            ("CREATE INDEX IF NOT EXISTS idx_tags_post_id ON download_tags(post_id)", "idx_tags_post_id"),
+            ("CREATE INDEX IF NOT EXISTS idx_tags_tag ON download_tags(tag)", "idx_tags_tag"),
+            ("CREATE INDEX IF NOT EXISTS idx_integrity_post_id ON file_integrity(post_id)", "idx_integrity_post_id"),
+            ("CREATE INDEX IF NOT EXISTS idx_artists_post_id ON download_artists(post_id)", "idx_artists_post_id"),
+            ("CREATE INDEX IF NOT EXISTS idx_artists_artist ON download_artists(artist)", "idx_artists_artist"),
+        ];
+        
+        for (sql, index_name) in indexes.iter() {
+            conn.execute(sql, []).map_err(|e| {
+                error!("Failed to create index {}: {}", index_name, e);
+                e
+            })?;
+            debug!("Created index {} successfully", index_name);
+        }
 
-        info!("Database schema initialized successfully");
+        // Verify that all tables were created by checking their existence
+        let tables = ["downloads", "download_tags", "file_integrity", "download_artists"];
+        for table_name in tables.iter() {
+            let count: Result<i32, _> = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table_name],
+                |row| row.get(0)
+            );
+            
+            match count {
+                Ok(1) => debug!("Verified table {} exists", table_name),
+                Ok(0) => {
+                    error!("Table {} was not created successfully", table_name);
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ABORT),
+                        Some(format!("Table {} not found after creation", table_name))
+                    ));
+                },
+                Err(e) => {
+                    error!("Error verifying table {}: {}", table_name, e);
+                    return Err(e);
+                }
+                _ => {
+                    error!("Unexpected result when checking for table {}", table_name);
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ABORT),
+                        Some(format!("Unexpected count for table {}", table_name))
+                    ));
+                }
+            }
+        }
+
+        info!("Database schema initialized successfully with all required tables and indexes");
         Ok(())
     }
 
@@ -282,6 +342,8 @@ impl HashManager {
 
     /// Record a successful download
     pub async fn record_download(&self, job: &DownloadJob, file_path: &Path) -> HashManagerResult<()> {
+        debug!("Recording download for post_id={}, md5={}, path={}", job.post_id, job.md5, file_path.display());
+        
         let conn = self.db_connection.lock().await;
         let file_size = if file_path.exists() {
             std::fs::metadata(file_path)?.len()
@@ -289,8 +351,41 @@ impl HashManager {
             job.file_size as u64
         };
 
+        // Verify that the required tables exist before attempting to use them
+        let tables_to_check = ["downloads", "download_tags", "download_artists"];
+        for table_name in tables_to_check.iter() {
+            let count: Result<i32, _> = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table_name],
+                |row| row.get(0)
+            );
+            
+            match count {
+                Ok(0) => {
+                    error!("Required table '{}' does not exist in database - schema may not be properly initialized", table_name);
+                    return Err(HashManagerError::Database(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                        Some(format!("Required table '{}' is missing", table_name))
+                    )));
+                },
+                Ok(1) => debug!("Verified table '{}' exists", table_name),
+                Err(e) => {
+                    error!("Error checking for table '{}': {}", table_name, e);
+                    return Err(HashManagerError::Database(e));
+                },
+                _ => {
+                    error!("Unexpected count when checking for table '{}'", table_name);
+                    return Err(HashManagerError::Database(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                        Some(format!("Unexpected result for table '{}", table_name))
+                    )));
+                }
+            }
+        }
+
         // Start transaction
         conn.execute("BEGIN TRANSACTION", [])?;
+        debug!("Started database transaction for recording download");
 
         let result = (|| -> HashManagerResult<()> {
             // Insert or update download record
@@ -305,33 +400,56 @@ impl HashManager {
                     file_size,
                     job.is_blacklisted
                 ],
-            )?;
+            ).map_err(|e| {
+                error!("Failed to insert into downloads table: {}", e);
+                HashManagerError::Database(e)
+            })?;
+            debug!("Inserted download record into downloads table");
 
             // Clear existing tags and artists for this post
-            conn.execute("DELETE FROM download_tags WHERE post_id = ?1", params![job.post_id])?;
-            conn.execute("DELETE FROM download_artists WHERE post_id = ?1", params![job.post_id])?;
+            conn.execute("DELETE FROM download_tags WHERE post_id = ?1", params![job.post_id])
+                .map_err(|e| {
+                    error!("Failed to delete existing tags: {}", e);
+                    HashManagerError::Database(e)
+                })?;
+            
+            conn.execute("DELETE FROM download_artists WHERE post_id = ?1", params![job.post_id])
+                .map_err(|e| {
+                    error!("Failed to delete existing artists: {}", e);
+                    HashManagerError::Database(e)
+                })?;
+            debug!("Cleared existing tags and artists for post_id={}", job.post_id);
 
             // Insert tags
             for tag in &job.tags {
                 conn.execute(
                     "INSERT OR IGNORE INTO download_tags (post_id, tag) VALUES (?1, ?2)",
                     params![job.post_id, tag],
-                )?;
+                ).map_err(|e| {
+                    error!("Failed to insert tag '{}' for post_id={}: {}", tag, job.post_id, e);
+                    HashManagerError::Database(e)
+                })?;
             }
+            debug!("Inserted {} tags for post_id={}", job.tags.len(), job.post_id);
 
             // Insert artists
             for artist in &job.artists {
                 conn.execute(
                     "INSERT OR IGNORE INTO download_artists (post_id, artist) VALUES (?1, ?2)",
                     params![job.post_id, artist],
-                )?;
+                ).map_err(|e| {
+                    error!("Failed to insert artist '{}' for post_id={}: {}", artist, job.post_id, e);
+                    HashManagerError::Database(e)
+                })?;
             }
+            debug!("Inserted {} artists for post_id={}", job.artists.len(), job.post_id);
 
             Ok(())
         })();
 
         if result.is_ok() {
             conn.execute("COMMIT", [])?;
+            debug!("Committed database transaction for post_id={}", job.post_id);
             
             // Update cache
             {
@@ -343,11 +461,13 @@ impl HashManager {
                 post_id_cache.insert(job.post_id);
                 file_path_cache.insert(job.md5.clone(), file_path.to_path_buf());
             }
+            debug!("Updated in-memory caches for post_id={}", job.post_id);
             
-            debug!("Recorded download: post_id={}, md5={}, path={}", 
+            debug!("Successfully recorded download: post_id={}, md5={}, path={}", 
                 job.post_id, job.md5, file_path.display());
         } else {
             conn.execute("ROLLBACK", [])?;
+            error!("Rolled back database transaction for post_id={} due to error: {:?}", job.post_id, result);
         }
 
         result

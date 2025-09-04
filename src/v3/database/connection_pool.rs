@@ -20,10 +20,10 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 /// Connection pool errors
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum PoolError {
     #[error("Database error: {0}")]
-    Database(#[from] SqliteError),
+    Database(String),
     
     #[error("Pool exhausted - no connections available")]
     PoolExhausted,
@@ -36,6 +36,12 @@ pub enum PoolError {
     
     #[error("Invalid pool configuration: {0}")]
     InvalidConfig(String),
+}
+
+impl From<SqliteError> for PoolError {
+    fn from(error: SqliteError) -> Self {
+        PoolError::Database(error.to_string())
+    }
 }
 
 pub type PoolResult<T> = Result<T, PoolError>;
@@ -115,9 +121,16 @@ impl PooledConnection {
     
     pub fn validate(&self) -> PoolResult<()> {
         // Simple validation query
-        match self.connection.execute("SELECT 1", []) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(PoolError::Database(e)),
+        debug!("Validating connection with SELECT 1");
+        match self.connection.query_row("SELECT 1", [], |_| Ok(())) {
+            Ok(_) => {
+                debug!("Connection validation succeeded");
+                Ok(())
+            },
+            Err(e) => {
+                error!("Connection validation failed: {}", e);
+                Err(PoolError::Database(e.to_string()))
+            },
         }
     }
 }
@@ -195,15 +208,45 @@ impl DatabasePool {
         
         // Enable WAL mode if configured
         if self.config.enable_wal_mode {
-            conn.execute("PRAGMA journal_mode = WAL", [])?;
-            info!("Enabled WAL mode for concurrent access");
+            debug!("Setting journal_mode = WAL");
+            match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                let mode: String = row.get(0)?;
+                Ok(mode)
+            }) {
+                Ok(mode) => {
+                    debug!("Journal mode set to: {}", mode);
+                    info!("Enabled WAL mode for concurrent access");
+                }
+                Err(e) => {
+                    error!("Failed to set journal_mode=WAL: {}", e);
+                    return Err(PoolError::Database(format!("Failed to set journal_mode=WAL: {}", e)));
+                }
+            }
         }
         
         // Apply configuration pragmas
         for (pragma, value) in &self.config.pragmas {
             let sql = format!("PRAGMA {} = {}", pragma, value);
+            debug!("Executing PRAGMA: {}", sql);
+            
+            // Some PRAGMAs return results, others don't. Try execute first, fall back to query_row
             if let Err(e) = conn.execute(&sql, []) {
-                warn!("Failed to set pragma {}: {}", pragma, e);
+                if e.to_string().contains("Execute returned results") {
+                    debug!("PRAGMA {} returns results, using query_row", pragma);
+                    match conn.query_row(&sql, [], |row| {
+                        let result: String = row.get(0).unwrap_or_default();
+                        Ok(result)
+                    }) {
+                        Ok(result) => {
+                            debug!("PRAGMA {} = {} returned: {}", pragma, value, result);
+                        }
+                        Err(e2) => {
+                            warn!("Failed to set pragma {} with query_row: {}", pragma, e2);
+                        }
+                    }
+                } else {
+                    warn!("Failed to set pragma {}: {}", pragma, e);
+                }
             }
         }
         
@@ -226,8 +269,20 @@ impl DatabasePool {
         // Apply pragmas
         for (pragma, value) in &self.config.pragmas {
             let sql = format!("PRAGMA {} = {}", pragma, value);
+            
+            // Some PRAGMAs return results, others don't. Try execute first, fall back to query_row
             if let Err(e) = conn.execute(&sql, []) {
-                debug!("Failed to set pragma {} on connection: {}", pragma, e);
+                if e.to_string().contains("Execute returned results") {
+                    debug!("PRAGMA {} returns results on connection, using query_row", pragma);
+                    if let Err(e2) = conn.query_row(&sql, [], |row| {
+                        let result: String = row.get(0).unwrap_or_default();
+                        Ok(result)
+                    }) {
+                        debug!("Failed to set pragma {} on connection with query_row: {}", pragma, e2);
+                    }
+                } else {
+                    debug!("Failed to set pragma {} on connection: {}", pragma, e);
+                }
             }
         }
         
@@ -247,7 +302,7 @@ impl DatabasePool {
     }
     
     /// Get a read-only connection from the pool
-    pub async fn get_read_connection(&self) -> PoolResult<PooledConnectionGuard> {
+    pub async fn get_read_connection(&self) -> PoolResult<PooledConnectionGuard<'_>> {
         if *self.is_shutdown.read() {
             return Err(PoolError::ShuttingDown);
         }
@@ -271,7 +326,7 @@ impl DatabasePool {
     }
     
     /// Get a write connection from the pool
-    pub async fn get_write_connection(&self) -> PoolResult<PooledConnectionGuard> {
+    pub async fn get_write_connection(&self) -> PoolResult<PooledConnectionGuard<'_>> {
         if *self.is_shutdown.read() {
             return Err(PoolError::ShuttingDown);
         }
@@ -422,20 +477,20 @@ impl DatabasePool {
 }
 
 /// RAII guard for pooled connections
-pub struct PooledConnectionGuard {
+pub struct PooledConnectionGuard<'a> {
     connection: PooledConnection,
-    _permit: tokio::sync::SemaphorePermit<'static>,
+    _permit: tokio::sync::SemaphorePermit<'a>,
     pool_stats: Arc<RwLock<PoolStats>>,
     is_read: bool,
 }
 
-impl PooledConnectionGuard {
+impl<'a> PooledConnectionGuard<'a> {
     pub fn connection(&self) -> &Connection {
         self.connection.connection()
     }
 }
 
-impl Drop for PooledConnectionGuard {
+impl Drop for PooledConnectionGuard<'_> {
     fn drop(&mut self) {
         // Update stats when connection is returned
         let mut stats = self.pool_stats.write();

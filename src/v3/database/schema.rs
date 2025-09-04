@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use rusqlite::{Connection, Result as SqliteResult};
-use tracing::{info, warn, error};
+use tracing::{debug, info, warn, error};
 
 use super::{DatabasePool, PoolError, PoolResult};
 
@@ -21,7 +21,7 @@ pub async fn initialize_schema(pool: &Arc<DatabasePool>) -> PoolResult<()> {
     
     if current_version == 0 {
         // Fresh database - create all tables
-        create_initial_schema(conn.connection()).await?;
+        create_initial_schema(conn.connection())?;
         set_schema_version(conn.connection(), SCHEMA_VERSION)?;
         info!("Database schema initialized to version {}", SCHEMA_VERSION);
     } else if current_version < SCHEMA_VERSION {
@@ -41,9 +41,13 @@ pub async fn initialize_schema(pool: &Arc<DatabasePool>) -> PoolResult<()> {
 }
 
 /// Create initial database schema
-async fn create_initial_schema(conn: &Connection) -> PoolResult<()> {
+fn create_initial_schema(conn: &Connection) -> PoolResult<()> {
     // Enable foreign key support
-    conn.execute("PRAGMA foreign_keys = ON", [])?;
+    debug!("Setting foreign_keys = ON");
+    if let Err(e) = conn.execute("PRAGMA foreign_keys = ON", []) {
+        error!("Failed to set foreign_keys=ON: {}", e);
+        return Err(PoolError::Database(format!("Failed to set foreign_keys=ON: {}", e)));
+    }
     
     // Main downloads table - stores information about downloaded posts
     conn.execute(
@@ -99,6 +103,15 @@ async fn create_initial_schema(conn: &Connection) -> PoolResult<()> {
         [],
     )?;
 
+    // Blacklisted rejects table - tracks posts that were blacklisted and potentially deleted
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS blacklisted_rejects (
+            post_id INTEGER PRIMARY KEY,
+            deleted_at INTEGER
+        )",
+        [],
+    )?;
+
     // Schema version table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version (
@@ -109,14 +122,14 @@ async fn create_initial_schema(conn: &Connection) -> PoolResult<()> {
         [],
     )?;
 
-    create_indexes(conn).await?;
+    create_indexes(conn)?;
     
     info!("Initial database schema created successfully");
     Ok(())
 }
 
 /// Create database indexes for optimal performance
-async fn create_indexes(conn: &Connection) -> PoolResult<()> {
+fn create_indexes(conn: &Connection) -> PoolResult<()> {
     // Primary lookup indexes
     conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_md5 ON downloads(md5)", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_post_id ON downloads(post_id)", [])?;
@@ -139,6 +152,10 @@ async fn create_indexes(conn: &Connection) -> PoolResult<()> {
     conn.execute("CREATE INDEX IF NOT EXISTS idx_integrity_blake3 ON file_integrity(blake3_hash)", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_integrity_sha256 ON file_integrity(sha256_hash)", [])?;
     
+    // Blacklisted rejects indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blacklisted_rejects_post_id ON blacklisted_rejects(post_id)", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blacklisted_rejects_deleted_at ON blacklisted_rejects(deleted_at)", [])?;
+    
     info!("Database indexes created successfully");
     Ok(())
 }
@@ -149,7 +166,7 @@ async fn run_migrations(conn: &Connection, from_version: u32) -> PoolResult<()> 
         0 => {
             // This shouldn't happen as version 0 means fresh database
             warn!("Running migrations from version 0 - this should use initial schema creation");
-            create_initial_schema(conn).await?;
+            create_initial_schema(conn)?;
         }
         // Future migrations would go here
         // 1 => migrate_from_v1_to_v2(conn).await?,
