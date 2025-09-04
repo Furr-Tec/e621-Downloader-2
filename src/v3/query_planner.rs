@@ -507,8 +507,6 @@ impl QueryPlanner {
 
             info!("Processing page {} with {} posts", page, posts.len());
             
-            let posts_len = posts.len() as u32;
-            
             for post in posts {
                 actual_post_count += 1;
                 
@@ -536,7 +534,8 @@ impl QueryPlanner {
                 // Check if the post is blacklisted
                 let is_blacklisted = self.is_blacklisted(&all_tags, &rules_config);
                 if is_blacklisted {
-                    debug!("Post {} is blacklisted, will be downloaded to blacklisted directory", post.id);
+                    debug!("Skipping post {} (blacklisted)", post.id);
+                    continue;
                 }
 
                 // Create a download job
@@ -549,7 +548,7 @@ impl QueryPlanner {
                     file_size: post.file.size,
                     tags: all_tags,
                     priority: query.priority,
-                    is_blacklisted,
+                    is_blacklisted: false,
                 };
 
                 // Add the job to the queue
@@ -565,11 +564,9 @@ impl QueryPlanner {
                 }
             }
 
-            // If we got fewer posts than the limit, we've reached the end
-            if posts_len < limit {
-                info!("Reached end of results at page {}", page);
-                break;
-            }
+            // Continue to next page - only stop if posts are empty
+            // The check for empty posts is already handled above, so we continue pagination
+            // Let the max_pages limit control when we stop
 
             // Check if we've exceeded the total size cap
             if total_size_bytes > app_config.limits.total_size_cap as u64 {
@@ -612,9 +609,14 @@ impl QueryPlanner {
 
     /// Check if a post is blacklisted
     fn is_blacklisted(&self, tags: &[String], rules_config: &RulesConfig) -> bool {
+        debug!("Checking blacklist for tags: {:?}", tags);
+        debug!("Blacklist contains: {:?}", rules_config.blacklist.tags);
+        debug!("Whitelist contains: {:?}", rules_config.whitelist.tags);
+        
         // Check if any tag is in the whitelist
         for tag in tags {
             if rules_config.whitelist.tags.contains(tag) {
+                debug!("Post whitelisted by tag: {}", tag);
                 return false;
             }
         }
@@ -622,10 +624,12 @@ impl QueryPlanner {
         // Check if any tag is in the blacklist
         for tag in tags {
             if rules_config.blacklist.tags.contains(tag) {
+                debug!("Post blacklisted by tag: {}", tag);
                 return true;
             }
         }
 
+        debug!("Post not blacklisted");
         false
     }
 

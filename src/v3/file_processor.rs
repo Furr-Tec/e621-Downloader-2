@@ -336,25 +336,42 @@ impl FileProcessor {
         Ok(filename)
     }
     
-    /// Create the target directory structure (matching stable version format)
+    /// Create the target directory structure based on configuration
     fn create_target_directory(&self, job: &DownloadJob, app_config: &AppConfig) -> FileProcessorResult<PathBuf> {
         // Create the base directory
         let base_dir = Path::new(&app_config.paths.download_directory);
         
-        // Extract artist tags
-        let artists = job.tags.iter()
-            .filter(|tag| tag.starts_with("artist:"))
-            .map(|tag| tag.trim_start_matches("artist:"))
-            .collect::<Vec<_>>();
-        
-        // Use Artists/{artist_name}/ structure like stable version
-        let target_dir = if !artists.is_empty() {
-            // Use first artist for directory name
-            let artist_name = sanitize_filename(&artists[0]);
-            base_dir.join("Artists").join(artist_name)
-        } else {
-            // Files without artists go in a "Single Posts" directory
-            base_dir.join("Single Posts")
+        // Determine directory structure based on configuration
+        let target_dir = match app_config.organization.directory_strategy.as_str() {
+            "by_artist" => {
+                // Extract artist tags
+                let artists = job.tags.iter()
+                    .filter(|tag| tag.starts_with("artist:"))
+                    .map(|tag| tag.trim_start_matches("artist:"))
+                    .collect::<Vec<_>>();
+                
+                if !artists.is_empty() {
+                    // Use first artist for directory name
+                    let artist_name = sanitize_filename(&artists[0]);
+                    base_dir.join("Artists").join(artist_name)
+                } else {
+                    // Files without artists go in a "Single Posts" directory
+                    base_dir.join("Single Posts")
+                }
+            },
+            "by_tag" => {
+                // Extract first general tag (excluding artist tags)
+                let general_tag = job.tags.iter()
+                    .find(|tag| !tag.starts_with("artist:") && !tag.starts_with("meta:"))
+                    .map(|tag| sanitize_filename(tag))
+                    .unwrap_or_else(|| "untagged".to_string());
+                
+                base_dir.join("Tags").join(general_tag)
+            },
+            "flat" | _ => {
+                // All files go directly in the download directory
+                base_dir.to_path_buf()
+            }
         };
         
         // Create the directory if it doesn't exist
