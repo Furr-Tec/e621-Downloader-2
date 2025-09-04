@@ -30,6 +30,7 @@ walkdir = "2.5.0"
 memmap2 = "0.9.5"
 num_cpus = "1.17.0"
 hex = "0.4.3"
+hmac-sha512 = "1.1.7"
 
 # Memory efficiency and system info
 smallvec = "2.0.0-alpha.11"
@@ -48,11 +49,16 @@ futures = "0.3.31"
 parking_lot = "0.12.4"
 regex = "1.11.1"
 lazy_static = "1.5.0"
-uuid = { version = "1.17.0", features = ["v4"] }
+uuid = { version = "1.17.0", features = ["v4", "serde"] }
 web-sys = "0.3.77"
+humantime = "2.1.0"
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.31.0"
 urlencoding = "2.1.3"
+
+# Test dependencies
+[dev-dependencies]
+tempfile = "3.13.0"
 
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]

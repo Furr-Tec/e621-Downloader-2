@@ -16,8 +16,8 @@ use tokio;
 use tracing::info;
 
 use crate::v3::{
-    init_config, init_orchestrator, init_query_planner,
-    ConfigManager, Orchestrator, QueryPlanner, QueryPlannerResult,
+    init_config, init_orchestrator, init_query_planner, init_hash_manager,
+    ConfigManager, Orchestrator, QueryPlanner, QueryPlannerResult, HashManager,
 };
 
 /// Example function to demonstrate how to use the query planning module
@@ -30,11 +30,16 @@ pub async fn query_planner_example() -> Result<()> {
     info!("Initializing orchestrator...");
     let orchestrator = init_orchestrator(config_manager.clone()).await?;
     
+    // Initialize the hash manager
+    info!("Initializing hash manager...");
+    let hash_manager = init_hash_manager(config_manager.clone()).await?;
+    
     // Initialize the query planner
     info!("Initializing query planner...");
     let query_planner = init_query_planner(
         config_manager.clone(),
         orchestrator.get_job_queue().clone(),
+        hash_manager,
     ).await?;
     
     // Parse input from the e621 config

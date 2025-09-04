@@ -29,6 +29,8 @@ use crate::v3::{
     ConfigManager,
     DownloadJob,
     BlacklistHandler,
+    DirectoryOrganizer, ContentType, init_directory_organizer,
+    HashManager, init_hash_manager,
 };
 
 /// Error types for the download engine
@@ -194,11 +196,21 @@ pub struct DownloadEngine {
     current_concurrency: Arc<Mutex<usize>>,
     /// Configuration manager
     config_manager: Arc<ConfigManager>,
+    /// Directory organizer for managing folder structures
+    directory_organizer: Arc<DirectoryOrganizer>,
+    /// Hash manager for duplicate detection and database management
+    hash_manager: Arc<HashManager>,
 }
 
 impl DownloadEngine {
     /// Create a new download engine
-    pub fn new(config: DownloadEngineConfig, blacklist_handler: Arc<BlacklistHandler>, config_manager: Arc<ConfigManager>) -> DownloadResult<Self> {
+    pub fn new(
+        config: DownloadEngineConfig, 
+        blacklist_handler: Arc<BlacklistHandler>, 
+        config_manager: Arc<ConfigManager>,
+        directory_organizer: Arc<DirectoryOrganizer>,
+        hash_manager: Arc<HashManager>
+    ) -> DownloadResult<Self> {
         // Create the HTTP client with advanced connection pool configuration
         let client = Client::builder()
             .user_agent(&config.user_agent)
@@ -254,6 +266,8 @@ impl DownloadEngine {
             original_concurrency: Arc::new(Mutex::new(original_concurrency)),
             current_concurrency: Arc::new(Mutex::new(original_concurrency)),
             config_manager,
+            directory_organizer,
+            hash_manager,
         })
     }
 
@@ -318,7 +332,15 @@ impl DownloadEngine {
         let blacklist_handler = BlacklistHandler::from_config(config_manager.clone()).await
             .map_err(|e| DownloadError::Config(format!("Failed to create blacklist handler: {}", e)))?;
 
-        Self::new(config, Arc::new(blacklist_handler), config_manager)
+        // Create the directory organizer
+        let directory_organizer = init_directory_organizer(&app_config).await
+            .map_err(|e| DownloadError::Config(format!("Failed to create directory organizer: {}", e)))?;
+
+        // Create the hash manager
+        let hash_manager = init_hash_manager(config_manager.clone()).await
+            .map_err(|e| DownloadError::Config(format!("Failed to create hash manager: {}", e)))?;
+
+        Self::new(config, Arc::new(blacklist_handler), config_manager, Arc::new(directory_organizer), hash_manager)
     }
 
     /// Start the download engine
@@ -331,6 +353,8 @@ impl DownloadEngine {
         let job_rx = self.job_rx.clone();
         let shutdown_rx = self.shutdown_rx.clone();
         let blacklist_handler = self.blacklist_handler.clone();
+        let directory_organizer = self.directory_organizer.clone();
+        let hash_manager = self.hash_manager.clone();
 
         // Get the e621 config
         let e621_config = match self.config_manager.get_e621_config() {
@@ -377,6 +401,8 @@ impl DownloadEngine {
                         let config_clone = config.clone();
                         let blacklist_handler_clone = blacklist_handler.clone();
                         let e621_config_clone = e621_config.clone();
+                        let directory_organizer_clone = directory_organizer.clone();
+                        let hash_manager_clone = hash_manager.clone();
 
                         // Spawn a task to download the file
                         tokio::spawn(async move {
@@ -387,6 +413,8 @@ impl DownloadEngine {
                                 &config_clone,
                                 stats_clone.clone(),
                                 blacklist_handler_clone,
+                                directory_organizer_clone,
+                                hash_manager_clone,
                                 &e621_config_clone,
                             ).await;
 
@@ -499,53 +527,42 @@ impl DownloadEngine {
     }
 
     /// Download a file
-    #[instrument(skip(client, job, config, stats, blacklist_handler, e621_config), fields(post_id = %job.post_id, md5 = %job.md5))]
+    #[instrument(skip(client, job, config, stats, blacklist_handler, directory_organizer, hash_manager, e621_config), fields(post_id = %job.post_id, md5 = %job.md5))]
     async fn download_file(
         client: &Client,
         job: &DownloadJob,
         config: &DownloadEngineConfig,
         stats: Arc<Mutex<DownloadStats>>,
         blacklist_handler: Arc<BlacklistHandler>,
+        directory_organizer: Arc<DirectoryOrganizer>,
+        hash_manager: Arc<HashManager>,
         e621_config: &E621Config,
     ) -> DownloadResult<PathBuf> {
-        // Create a meaningful file name with artist, tags, and post_id
-        let file_name = create_meaningful_filename(job);
-
-        // Determine the target directory based on whether the post is blacklisted
-        let target_dir = if job.is_blacklisted {
-            // Extract artist tags
-            let artists = job.tags.iter()
-                .filter(|tag| tag.starts_with("artist:"))
-                .map(|tag| tag.trim_start_matches("artist:"))
-                .collect::<Vec<_>>();
-
-            // Create the artist directory
-            let artist_dir = if !artists.is_empty() {
-                config.blacklisted_dir.join(sanitize_filename(&artists[0]))
-            } else {
-                config.blacklisted_dir.join("unknown_artist")
-            };
-
-            // Create the directory if it doesn't exist
-            if !artist_dir.exists() {
-                fs::create_dir_all(&artist_dir)
-                    .map_err(|e| DownloadError::Io(e))?;
-            }
-
-            // Add the post to the blacklisted_rejects table
+        // Determine the content type based on the job and user context
+        let username = if !e621_config.auth.username.is_empty() && e621_config.auth.username != "your_username" {
+            Some(e621_config.auth.username.as_str())
+        } else {
+            None
+        };
+        let content_type = directory_organizer.determine_content_type(job, username);
+        
+        // Get the proper file path using the directory organizer
+        let file_path = directory_organizer.get_download_path(job, content_type)
+            .map_err(|e| DownloadError::Config(format!("Failed to get download path: {}", e)))?;
+        
+        // Create temp path using the same filename
+        let filename = file_path.file_name()
+            .ok_or_else(|| DownloadError::Config("Invalid file path generated".to_string()))?;
+        let temp_path = config.temp_dir.join(filename);
+        
+        // Add blacklisted posts to the rejects table
+        if job.is_blacklisted {
             if let Err(e) = blacklist_handler.add_blacklisted_reject(job.post_id).await {
                 warn!("Failed to add post {} to blacklisted_rejects table: {}", job.post_id, e);
             } else {
                 debug!("Added post {} to blacklisted_rejects table", job.post_id);
             }
-
-            artist_dir
-        } else {
-            config.download_dir.clone()
-        };
-
-        let file_path = target_dir.join(&file_name);
-        let temp_path = config.temp_dir.join(&file_name);
+        }
 
         // Check if the file already exists
         if file_path.exists() {
@@ -673,6 +690,14 @@ impl DownloadEngine {
                     fs::rename(&temp_path, &file_path)
                         .map_err(|e| DownloadError::Io(e))?;
 
+                    // Record the successful download in the hash manager
+                    if let Err(e) = hash_manager.record_download(job, &file_path).await {
+                        warn!("Failed to record download in hash manager: {}", e);
+                        // Don't fail the download for this, but log it
+                    } else {
+                        debug!("Recorded download in hash manager: post_id={}, md5={}", job.post_id, job.md5);
+                    }
+
                     return Ok(file_path);
                 }
                 Err(e) => {
@@ -743,75 +768,6 @@ impl DownloadEngine {
     }
 }
 
-/// Create a meaningful filename from a download job
-fn create_meaningful_filename(job: &DownloadJob) -> String {
-    // Extract artist names from tags
-    let artists: Vec<String> = job.tags.iter()
-        .filter(|tag| tag.starts_with("artist:"))
-        .map(|tag| sanitize_filename(tag.trim_start_matches("artist:")))
-        .collect();
-    
-    // Get first few relevant non-artist tags
-    let relevant_tags: Vec<String> = job.tags.iter()
-        .filter(|tag| !tag.starts_with("artist:") && 
-                     !tag.starts_with("meta:") && 
-                     !tag.starts_with("lore:") &&
-                     !tag.contains(":") && // Skip rating: and other special tags
-                     tag.len() > 2) // Skip very short tags
-        .take(3) // Only take first 3 relevant tags
-        .map(|tag| sanitize_filename(tag))
-        .collect();
-    
-    // Build the filename components
-    let mut filename_parts = Vec::new();
-    
-    // Add artist (skip if none)
-    if !artists.is_empty() {
-        filename_parts.push(artists.join("+"));
-    }
-    
-    // Add relevant tags if any
-    if !relevant_tags.is_empty() {
-        filename_parts.push(relevant_tags.join("_"));
-    }
-    
-    // Add post ID
-    filename_parts.push(job.post_id.to_string());
-    
-    // Combine all parts with underscores and add extension
-    let base_name = filename_parts.join("_");
-    
-    // Ensure the filename isn't too long (Windows has a 260 char path limit)
-    let max_base_length = 200; // Leave room for directory path and extension
-    let final_base = if base_name.len() > max_base_length {
-        // Truncate but keep the post_id at the end
-        let post_id_part = format!("_{}", job.post_id);
-        let available_length = max_base_length - post_id_part.len();
-        format!("{}{}", &base_name[..available_length], post_id_part)
-    } else {
-        base_name
-    };
-    
-    format!("{}.{}", final_base, job.file_ext)
-}
-
-/// Sanitize a filename to remove invalid characters
-fn sanitize_filename(name: &str) -> String {
-    // Replace invalid characters with underscores
-    let invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
-    let mut result = name.to_string();
-
-    for c in invalid_chars {
-        result = result.replace(c, "_");
-    }
-
-    // Limit the length to avoid excessively long filenames
-    if result.len() > 50 {
-        result = result[0..50].to_string();
-    }
-
-    result
-}
 
 /// Create a new download engine
 pub async fn init_download_engine(

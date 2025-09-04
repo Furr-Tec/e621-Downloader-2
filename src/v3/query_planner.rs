@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::v3::{
     RulesConfig,
     ConfigManager,
-    Query, QueryQueue,
+    Query, QueryQueue, HashManager,
 };
 
 /// Error types for query planning
@@ -158,6 +158,7 @@ pub struct DownloadJob {
     pub file_ext: String,
     pub file_size: u32,
     pub tags: Vec<String>,
+    pub artists: Vec<String>,
     pub priority: usize,
     pub is_blacklisted: bool,
 }
@@ -171,102 +172,19 @@ pub struct QueryPlan {
     pub jobs: VecDeque<DownloadJob>,
 }
 
-/// Hash store for post deduplication
-pub struct HashStore {
-    memory_hashes: HashSet<String>,
-    memory_post_ids: HashSet<u32>,
-    db_connection: Connection,
-}
 
 /// Query planner for creating and managing download jobs
 pub struct QueryPlanner {
     config_manager: Arc<ConfigManager>,
     client: Client,
-    hash_store: Arc<RwLock<HashStore>>,
+    hash_manager: Arc<HashManager>,
     job_queue: Arc<QueryQueue>,
 }
 
-impl HashStore {
-    /// Create a new hash store
-    pub fn new(db_path: &Path) -> SqliteResult<Self> {
-        // Create the database connection
-        let db_connection = Connection::open(db_path)?;
-
-        // Create the table if it doesn't exist
-        db_connection.execute(
-            "CREATE TABLE IF NOT EXISTS post_hashes (
-                md5 TEXT PRIMARY KEY,
-                post_id INTEGER NOT NULL,
-                downloaded_at TEXT NOT NULL
-            )",
-            [],
-        )?;
-
-        // Load existing hashes and post IDs into memory
-        let mut hashes: HashSet<String> = HashSet::new();
-        let mut post_ids: HashSet<u32> = HashSet::new();
-        
-        {
-            let mut stmt = db_connection.prepare("SELECT md5, post_id FROM post_hashes")?;
-            let row_iter = stmt.query_map([], |row| {
-                let md5: String = row.get(0)?;
-                let post_id: u32 = row.get::<_, i64>(1)? as u32;
-                Ok((md5, post_id))
-            })?;
-
-            for row_result in row_iter {
-                if let Ok((md5, post_id)) = row_result {
-                    hashes.insert(md5);
-                    post_ids.insert(post_id);
-                }
-            }
-        }
-
-        Ok(Self {
-            memory_hashes: hashes,
-            memory_post_ids: post_ids,
-            db_connection,
-        })
-    }
-
-    /// Check if a hash exists in the store
-    pub fn contains(&self, md5: &str) -> bool {
-        self.memory_hashes.contains(md5)
-    }
-
-    /// Check if a post ID exists in the store
-    pub fn contains_post_id(&self, post_id: u32) -> bool {
-        self.memory_post_ids.contains(&post_id)
-    }
-
-    /// Check if either hash or post ID exists (comprehensive deduplication)
-    pub fn contains_either(&self, md5: &str, post_id: u32) -> bool {
-        self.memory_hashes.contains(md5) || self.memory_post_ids.contains(&post_id)
-    }
-
-    /// Add a hash to the store
-    pub fn add(&mut self, md5: &str, post_id: u32) -> SqliteResult<()> {
-        // Add to memory stores
-        self.memory_hashes.insert(md5.to_string());
-        self.memory_post_ids.insert(post_id);
-
-        // Add to database
-        self.db_connection.execute(
-            "INSERT OR REPLACE INTO post_hashes (md5, post_id, downloaded_at) VALUES (?1, ?2, datetime('now'))",
-            [md5, &post_id.to_string()],
-        )?;
-
-        Ok(())
-    }
-}
 
 impl QueryPlanner {
     /// Create a new query planner
-    pub async fn new(config_manager: Arc<ConfigManager>, job_queue: Arc<QueryQueue>) -> QueryPlannerResult<Self> {
-        // Get the app config
-        let app_config = config_manager.get_app_config()
-            .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
-
+    pub async fn new(config_manager: Arc<ConfigManager>, job_queue: Arc<QueryQueue>, hash_manager: Arc<HashManager>) -> QueryPlannerResult<Self> {
         // Get the e621 config to build proper user agent
         let e621_config = config_manager.get_e621_config()
             .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
@@ -281,30 +199,10 @@ impl QueryPlanner {
             .build()
             .map_err(|e| QueryPlannerError::Request(e))?;
 
-        // Resolve database path relative to the executable location
-        let exe_path = std::env::current_exe().map_err(|e| QueryPlannerError::Config(format!("Failed to get executable path: {}", e)))?;
-        let exe_dir = exe_path.parent().ok_or_else(|| QueryPlannerError::Config("Failed to get executable directory".to_string()))?;
-        
-        let db_path = if std::path::PathBuf::from(&app_config.paths.database_file).is_absolute() {
-            std::path::PathBuf::from(&app_config.paths.database_file)
-        } else {
-            exe_dir.join(&app_config.paths.database_file)
-        };
-
-        // Create the parent directory if it doesn't exist
-        if let Some(parent) = db_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?
-            }
-        }
-
-        let hash_store = HashStore::new(&db_path)
-            .map_err(|e| QueryPlannerError::Database(e))?;
-
         Ok(Self {
             config_manager,
             client,
-            hash_store: Arc::new(RwLock::new(hash_store)),
+            hash_manager,
             job_queue,
         })
     }
@@ -375,6 +273,25 @@ impl QueryPlanner {
                 priority: 5,
             };
             queries.push(query);
+        }
+
+        // Process favorites if enabled
+        if e621_config.options.download_favorites {
+            // Check if we have valid credentials for favorites
+            if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty() 
+                && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
+                let id = Uuid::new_v4();
+                let tags = vec![format!("fav:{}", e621_config.auth.username)];
+                let query = Query {
+                    id,
+                    tags,
+                    priority: 1, // High priority for favorites
+                };
+                queries.push(query);
+                info!("Added favorites query for user: {}", e621_config.auth.username);
+            } else {
+                warn!("Download favorites is enabled but no valid credentials found. Skipping favorites.");
+            }
         }
 
         Ok(queries)
@@ -523,13 +440,14 @@ impl QueryPlanner {
                 }
 
                 // Skip if the post is already downloaded (check both MD5 hash and post ID)
-                if self.hash_store.read().contains_either(&post.file.md5, post.id) {
+                if self.hash_manager.contains_either(&post.file.md5, post.id) {
                     debug!("Skipping post {} (already downloaded by hash or ID)", post.id);
                     continue;
                 }
 
                 // Check blacklist and whitelist
                 let all_tags = self.collect_all_tags(&post);
+                let artists = post.tags.artist.clone();
 
                 // Check if the post is blacklisted
                 let is_blacklisted = self.is_blacklisted(&all_tags, &rules_config);
@@ -547,6 +465,7 @@ impl QueryPlanner {
                     file_ext: post.file.ext.clone(),
                     file_size: post.file.size,
                     tags: all_tags,
+                    artists,
                     priority: query.priority,
                     is_blacklisted: false,
                 };
@@ -819,7 +738,8 @@ impl QueryPlanner {
 pub async fn init_query_planner(
     config_manager: Arc<ConfigManager>,
     job_queue: Arc<QueryQueue>,
+    hash_manager: Arc<HashManager>,
 ) -> QueryPlannerResult<Arc<QueryPlanner>> {
-    let planner = QueryPlanner::new(config_manager, job_queue).await?;
+    let planner = QueryPlanner::new(config_manager, job_queue, hash_manager).await?;
     Ok(Arc::new(planner))
 }

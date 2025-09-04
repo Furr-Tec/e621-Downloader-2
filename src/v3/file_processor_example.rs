@@ -62,6 +62,7 @@ pub async fn file_processor_example() -> Result<()> {
             "fluffy".to_string(),
             "happy".to_string(),
         ],
+        artists: vec!["test_artist".to_string()],
         priority: 1,
         is_blacklisted: false,
     };

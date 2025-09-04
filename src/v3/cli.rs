@@ -6,7 +6,6 @@ use std::io::{self, IsTerminal};
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use anyhow::Result;
 
@@ -15,7 +14,7 @@ use console::style;
 
 use crate::v3::{
     ConfigManager, ConfigResult, ConfigError,
-    init_config, QueryPlanner, init_query_planner, Query, init_orchestrator,
+    init_config, init_orchestrator, init_query_planner, init_hash_manager,
 };
 
 // Custom error type for CLI operations
@@ -67,11 +66,15 @@ pub enum MainMenuOption {
     SearchPools,
     SearchCollections,
     SearchPosts,
+    ToggleFavorites,
     EditQuery,
     StartDownload,
+    ResumeDownloads,
     EditConfig,
     ValidateConfigs,
     VerifyArchive,
+    DatabaseInspector,
+    PerformanceMonitor,
     Exit,
 }
 
@@ -84,11 +87,15 @@ impl MainMenuOption {
             MainMenuOption::SearchPools,
             MainMenuOption::SearchCollections,
             MainMenuOption::SearchPosts,
+            MainMenuOption::ToggleFavorites,
             MainMenuOption::EditQuery,
             MainMenuOption::StartDownload,
+            MainMenuOption::ResumeDownloads,
             MainMenuOption::EditConfig,
             MainMenuOption::ValidateConfigs,
             MainMenuOption::VerifyArchive,
+            MainMenuOption::DatabaseInspector,
+            MainMenuOption::PerformanceMonitor,
             MainMenuOption::Exit,
         ]
     }
@@ -101,11 +108,15 @@ impl MainMenuOption {
             MainMenuOption::SearchPools => "Search by pools",
             MainMenuOption::SearchCollections => "Search by collections",
             MainMenuOption::SearchPosts => "Search by posts",
+            MainMenuOption::ToggleFavorites => "Toggle download favorites",
             MainMenuOption::EditQuery => "Edit queries",
             MainMenuOption::StartDownload => "Start download",
+            MainMenuOption::ResumeDownloads => "Resume incomplete downloads",
             MainMenuOption::EditConfig => "Edit config",
             MainMenuOption::ValidateConfigs => "Validate configs",
             MainMenuOption::VerifyArchive => "Verify archive",
+            MainMenuOption::DatabaseInspector => "Database inspector",
+            MainMenuOption::PerformanceMonitor => "Performance monitor",
             MainMenuOption::Exit => "Exit",
         }
     }
@@ -200,11 +211,15 @@ impl CliManager {
                 MainMenuOption::SearchPools => self.search_pools().await?,
                 MainMenuOption::SearchCollections => self.search_collections().await?,
                 MainMenuOption::SearchPosts => self.search_posts().await?,
+                MainMenuOption::ToggleFavorites => self.toggle_favorites().await?,
                 MainMenuOption::EditQuery => self.edit_query().await?,
                 MainMenuOption::StartDownload => self.start_download().await?,
+                MainMenuOption::ResumeDownloads => self.resume_downloads().await?,
                 MainMenuOption::EditConfig => self.edit_config().await?,
                 MainMenuOption::ValidateConfigs => self.validate_configs().await?,
                 MainMenuOption::VerifyArchive => self.verify_archive().await?,
+                MainMenuOption::DatabaseInspector => self.database_inspector().await?,
+                MainMenuOption::PerformanceMonitor => self.performance_monitor().await?,
                 MainMenuOption::Exit => {
                     println!("{}", style("Exiting...").cyan());
                     break;
@@ -363,7 +378,7 @@ impl CliManager {
     async fn start_download(&self) -> CliResult<()> {
         println!("\n{}", style("Start Download").cyan().bold());
         
-        use crate::v3::{init_orchestrator, init_query_planner, init_download_engine, init_file_processor};
+        use crate::v3::{init_orchestrator, init_query_planner, init_download_engine};
         use std::sync::Arc;
         use std::path::Path;
         
@@ -485,9 +500,23 @@ impl CliManager {
             Ok(orchestrator) => {
                 println!("{}", style("✓ Orchestrator initialized").green());
                 
+                // Initialize hash manager
+                println!("{}", style("Initializing hash manager...").cyan());
+                let hash_manager = match init_hash_manager(config_manager.clone()).await {
+                    Ok(hm) => {
+                        println!("{}", style("✓ Hash manager initialized").green());
+                        hm
+                    }
+                    Err(e) => {
+                        println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                        self.press_enter_to_continue()?;
+                        return Ok(());
+                    }
+                };
+                
                 // Initialize the query planner
                 println!("{}", style("Initializing query planner...").cyan());
-                match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone()).await {
+                match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
                     Ok(query_planner) => {
                         println!("{}", style("✓ Query planner initialized").green());
                         
@@ -612,6 +641,779 @@ impl CliManager {
         Ok(())
     }
     
+    /// Resume incomplete downloads from previous sessions
+    async fn resume_downloads(&self) -> CliResult<()> {
+        println!("\n{}", style("Resume Incomplete Downloads").cyan().bold());
+        
+        use crate::v3::{init_session_recovery, init_orchestrator, init_download_engine};
+        use std::sync::Arc;
+        
+        // Initialize session recovery
+        let config_manager = match init_config(&self.config_dir).await {
+            Ok(cm) => Arc::new(cm),
+            Err(e) => {
+                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        let app_config = match config_manager.get_app_config() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("{} Failed to get app config: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Initialize session recovery with database path
+        let recovery_db_path = std::path::Path::new(&app_config.paths.database_file)
+            .parent()
+            .unwrap_or(std::path::Path::new("./data"))
+            .join("session_recovery.sqlite");
+        
+        let session_recovery = match init_session_recovery(&recovery_db_path, config_manager.clone()).await {
+            Ok(sr) => sr,
+            Err(e) => {
+                println!("{} Failed to initialize session recovery: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Get incomplete sessions
+        let incomplete_sessions = match session_recovery.get_incomplete_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                println!("{} Failed to get incomplete sessions: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        if incomplete_sessions.is_empty() {
+            println!("{}", style("No incomplete download sessions found.").yellow());
+            self.press_enter_to_continue()?;
+            return Ok(());
+        }
+        
+        // Display incomplete sessions
+        println!("\n{} Found {} incomplete sessions:", style("ℹ").blue(), incomplete_sessions.len());
+        
+        let mut session_display = Vec::new();
+        for (i, session) in incomplete_sessions.iter().enumerate() {
+            let age = chrono::Utc::now() - session.created_at;
+            let age_str = if age.num_days() > 0 {
+                format!("{} days ago", age.num_days())
+            } else if age.num_hours() > 0 {
+                format!("{} hours ago", age.num_hours())
+            } else {
+                format!("{} minutes ago", age.num_minutes())
+            };
+            
+            let session_str = format!(
+                "Session {} - {} jobs total, {} completed, {} failed ({})",
+                i + 1,
+                session.total_jobs,
+                session.completed_jobs,
+                session.failed_jobs,
+                age_str
+            );
+            session_display.push(session_str);
+        }
+        session_display.push("Cancel".to_string());
+        
+        let selection = Select::with_theme(&self.theme)
+            .with_prompt("Select session to resume")
+            .items(&session_display)
+            .interact()?;
+        
+        if selection >= incomplete_sessions.len() {
+            // User selected "Cancel"
+            return Ok(());
+        }
+        
+        let selected_session = &incomplete_sessions[selection];
+        
+        // Get incomplete jobs for the selected session
+        let incomplete_jobs = match session_recovery.get_incomplete_jobs(selected_session.id).await {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                println!("{} Failed to get incomplete jobs: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        if incomplete_jobs.is_empty() {
+            println!("{}", style("No incomplete jobs found in this session.").yellow());
+            // Mark session as complete if all jobs are done
+            if let Err(e) = session_recovery.complete_session(selected_session.id).await {
+                println!("{} Failed to mark session as complete: {}", style("⚠").yellow(), e);
+            }
+            self.press_enter_to_continue()?;
+            return Ok(());
+        }
+        
+        println!("\n{} Found {} incomplete downloads to resume", style("✓").green(), incomplete_jobs.len());
+        
+        // Ask for confirmation
+        if !Confirm::with_theme(&self.theme)
+            .with_prompt(format!("Resume downloading {} files?", incomplete_jobs.len()))
+            .default(true)
+            .interact()? {
+            return Ok(());
+        }
+        
+        // Initialize orchestrator and download engine
+        let orchestrator = match init_orchestrator(config_manager.clone()).await {
+            Ok(o) => o,
+            Err(e) => {
+                println!("{} Failed to initialize orchestrator: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        let download_engine = match init_download_engine(config_manager.clone()).await {
+            Ok(de) => de,
+            Err(e) => {
+                println!("{} Failed to initialize download engine: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Queue incomplete jobs for download
+        println!("{}", style("Resuming downloads...").cyan());
+        let mut successful_queues = 0;
+        
+        for job in &incomplete_jobs {
+            // Update job status to pending in recovery system
+            if let Err(e) = session_recovery.update_job_status(
+                job.id, 
+                crate::v3::JobStatus::Pending, 
+                None
+            ).await {
+                println!("{} Failed to update job status: {}", style("⚠").yellow(), e);
+            }
+            
+            // Queue job in download engine
+            match download_engine.queue_job(job.clone()).await {
+                Ok(()) => {
+                    successful_queues += 1;
+                    println!("{} Queued: Post {} ({})", 
+                        style("✓").green(), job.post_id, job.md5);
+                }
+                Err(e) => {
+                    println!("{} Failed to queue job {}: {}", 
+                        style("✗").red(), job.post_id, e);
+                    
+                    // Update job as failed in recovery system
+                    if let Err(e) = session_recovery.update_job_status(
+                        job.id, 
+                        crate::v3::JobStatus::Failed(e.to_string()), 
+                        Some(e.to_string())
+                    ).await {
+                        println!("{} Failed to update job status: {}", style("⚠").yellow(), e);
+                    }
+                }
+            }
+        }
+        
+        if successful_queues > 0 {
+            println!("\n{} {} downloads resumed successfully!", 
+                style("✓").green(), successful_queues);
+            
+            if successful_queues < incomplete_jobs.len() {
+                println!("{} {} downloads failed to queue", 
+                    style("⚠").yellow(), incomplete_jobs.len() - successful_queues);
+            }
+        } else {
+            println!("{}", style("No downloads were successfully queued.").red());
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Database inspector for examining downloaded content
+    async fn database_inspector(&self) -> CliResult<()> {
+        println!("\n{}", style("Database Inspector").cyan().bold());
+        
+        // Get config to find database paths
+        let app_config = match self.config_manager.get_app_config() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("{}: {}", style("Error").red().bold(), e);
+                return Ok(());
+            }
+        };
+        
+        let db_path = std::path::Path::new(&app_config.paths.database_file);
+        if !db_path.exists() {
+            println!("{}", style("Database file not found. No downloads have been recorded yet.").yellow());
+            self.press_enter_to_continue()?;
+            return Ok(());
+        }
+        
+        loop {
+            // Database inspector menu
+            println!("\n{}", style("Database Inspector Options:").cyan());
+            println!("1. Show download statistics");
+            println!("2. List recent downloads");
+            println!("3. Search downloads by tag");
+            println!("4. Search downloads by artist");
+            println!("5. Show duplicate detection stats");
+            println!("6. Show database file info");
+            println!("7. Clean up database (remove orphaned entries)");
+            println!("0. Back to main menu");
+            
+            let choice: String = Input::with_theme(&self.theme)
+                .with_prompt("Select option (0-7)")
+                .interact_text()?;
+            
+            match choice.trim() {
+                "0" => break,
+                "1" => self.show_download_statistics(&db_path).await?,
+                "2" => self.list_recent_downloads(&db_path).await?,
+                "3" => self.search_downloads_by_tag(&db_path).await?,
+                "4" => self.search_downloads_by_artist(&db_path).await?,
+                "5" => self.show_duplicate_detection_stats(&db_path).await?,
+                "6" => self.show_database_file_info(&db_path).await?,
+                "7" => self.cleanup_database(&db_path).await?,
+                _ => println!("{}", style("Invalid choice. Please select 0-7.").red()),
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Show download statistics from database
+    async fn show_download_statistics(&self, db_path: &std::path::Path) -> CliResult<()> {
+        use rusqlite::Connection;
+        
+        println!("\n{}", style("Download Statistics").cyan().bold());
+        
+        let conn = match Connection::open(db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                println!("{} Failed to open database: {}", style("✗").red(), e);
+                return Ok(());
+            }
+        };
+        
+        // Get basic statistics
+        let total_downloads: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM post_hashes", [], |row| row.get(0)
+        ).unwrap_or(0);
+        
+        println!("{} Total downloads recorded: {}", style("📊").blue(), total_downloads);
+        
+        if total_downloads > 0 {
+            // Get earliest and latest downloads
+            let earliest: String = conn.query_row(
+                "SELECT MIN(downloaded_at) FROM post_hashes", [], |row| row.get(0)
+            ).unwrap_or_else(|_| "Unknown".to_string());
+            
+            let latest: String = conn.query_row(
+                "SELECT MAX(downloaded_at) FROM post_hashes", [], |row| row.get(0)
+            ).unwrap_or_else(|_| "Unknown".to_string());
+            
+            println!("{} First download: {}", style("📅").blue(), earliest);
+            println!("{} Latest download: {}", style("📅").blue(), latest);
+            
+            // Get file type distribution
+            println!("\n{}", style("File Type Distribution:").cyan());
+            let mut stmt = conn.prepare(
+                "SELECT SUBSTR(md5, -3) as ext, COUNT(*) as count FROM post_hashes GROUP BY ext ORDER BY count DESC LIMIT 10"
+            ).ok();
+            
+            if let Some(ref mut stmt) = stmt {
+                match stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?
+                    ))
+                }) {
+                    Ok(rows) => {
+                        for row in rows {
+                            if let Ok((ext, count)) = row {
+                                println!("  {}: {} files", ext, count);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("{} Query failed: {}", style("✗").red(), e);
+                    }
+                }
+            }
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// List recent downloads from database
+    async fn list_recent_downloads(&self, db_path: &std::path::Path) -> CliResult<()> {
+        use rusqlite::Connection;
+        
+        println!("\n{}", style("Recent Downloads").cyan().bold());
+        
+        let conn = match Connection::open(db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                println!("{} Failed to open database: {}", style("✗").red(), e);
+                return Ok(());
+            }
+        };
+        
+        let mut stmt = match conn.prepare(
+            "SELECT post_id, md5, downloaded_at FROM post_hashes ORDER BY downloaded_at DESC LIMIT 20"
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                println!("{} Failed to prepare query: {}", style("✗").red(), e);
+                return Ok(());
+            }
+        };
+        
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?
+            ))
+        });
+        
+        match rows {
+            Ok(rows) => {
+                println!("{}:", style("Last 20 downloads").cyan());
+                for (i, row) in rows.enumerate() {
+                    if let Ok((post_id, md5, downloaded_at)) = row {
+                        println!("{:2}. Post {}: {} ({})", 
+                            i + 1, post_id, &md5[..8], downloaded_at);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("{} Query failed: {}", style("✗").red(), e);
+            }
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Search downloads by tag
+    async fn search_downloads_by_tag(&self, _db_path: &std::path::Path) -> CliResult<()> {
+        println!("\n{}", style("Search by Tag").cyan().bold());
+        
+        // Get search term from user
+        let search_term: String = Input::with_theme(&self.theme)
+            .with_prompt("Enter tag to search for")
+            .interact_text()?;
+            
+        if search_term.trim().is_empty() {
+            println!("{}", style("Search term cannot be empty.").yellow());
+            self.press_enter_to_continue()?;
+            return Ok(());
+        }
+        
+        // Initialize hash manager
+        let config_manager = Arc::new(init_config(&self.config_dir).await?);
+        let hash_manager = match init_hash_manager(config_manager.clone()).await {
+            Ok(hm) => hm,
+            Err(e) => {
+                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Search for downloads with the tag
+        match hash_manager.search_by_tag(&search_term, 20).await {
+            Ok(results) => {
+                if results.is_empty() {
+                    println!("\n{}", style("No downloads found with that tag.").yellow());
+                } else {
+                    println!("\n{} Found {} downloads with tag '{}'", 
+                        style("✓").green(), results.len(), search_term);
+                    println!();
+                    
+                    for (i, record) in results.iter().enumerate() {
+                        println!("{} {}", 
+                            style(&format!("{}.", i + 1)).bold(),
+                            style(&format!("Post {}", record.post_id)).cyan());
+                        println!("   MD5: {}", &record.md5[..8]);
+                        println!("   File: {}", record.file_path.display());
+                        println!("   Size: {} bytes", record.file_size);
+                        if !record.artists.is_empty() {
+                            println!("   Artists: {}", record.artists.join(", "));
+                        }
+                        println!("   Tags: {}", record.tags.join(", "));
+                        println!();
+                    }
+                }
+            }
+            Err(e) => {
+                println!("{} Search failed: {}", style("✗").red(), e);
+            }
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Search downloads by artist
+    async fn search_downloads_by_artist(&self, _db_path: &std::path::Path) -> CliResult<()> {
+        println!("\n{}", style("Search by Artist").cyan().bold());
+        
+        // Get search term from user
+        let search_term: String = Input::with_theme(&self.theme)
+            .with_prompt("Enter artist name to search for")
+            .interact_text()?;
+            
+        if search_term.trim().is_empty() {
+            println!("{}", style("Search term cannot be empty.").yellow());
+            self.press_enter_to_continue()?;
+            return Ok(());
+        }
+        
+        // Initialize hash manager
+        let config_manager = Arc::new(init_config(&self.config_dir).await?);
+        let hash_manager = match init_hash_manager(config_manager.clone()).await {
+            Ok(hm) => hm,
+            Err(e) => {
+                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Search for downloads by the artist
+        match hash_manager.search_by_artist(&search_term, 20).await {
+            Ok(results) => {
+                if results.is_empty() {
+                    println!("\n{}", style("No downloads found for that artist.").yellow());
+                } else {
+                    println!("\n{} Found {} downloads by artist '{}'", 
+                        style("✓").green(), results.len(), search_term);
+                    println!();
+                    
+                    for (i, record) in results.iter().enumerate() {
+                        println!("{} {}", 
+                            style(&format!("{}.", i + 1)).bold(),
+                            style(&format!("Post {}", record.post_id)).cyan());
+                        println!("   MD5: {}", &record.md5[..8]);
+                        println!("   File: {}", record.file_path.display());
+                        println!("   Size: {} bytes", record.file_size);
+                        println!("   Artists: {}", record.artists.join(", "));
+                        if !record.tags.is_empty() {
+                            println!("   Tags: {}", record.tags.join(", "));
+                        }
+                        println!();
+                    }
+                }
+            }
+            Err(e) => {
+                println!("{} Search failed: {}", style("✗").red(), e);
+            }
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Show duplicate detection statistics
+    async fn show_duplicate_detection_stats(&self, db_path: &std::path::Path) -> CliResult<()> {
+        use rusqlite::Connection;
+        
+        println!("\n{}", style("Duplicate Detection Statistics").cyan().bold());
+        
+        let conn = match Connection::open(db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                println!("{} Failed to open database: {}", style("✗").red(), e);
+                return Ok(());
+            }
+        };
+        
+        // Count unique MD5 hashes vs total entries
+        let unique_hashes: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT md5) FROM post_hashes", [], |row| row.get(0)
+        ).unwrap_or(0);
+        
+        let total_entries: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM post_hashes", [], |row| row.get(0)
+        ).unwrap_or(0);
+        
+        println!("{} Unique files (MD5): {}", style("🔒").blue(), unique_hashes);
+        println!("{} Total database entries: {}", style("📝").blue(), total_entries);
+        
+        if total_entries > unique_hashes {
+            let duplicates = total_entries - unique_hashes;
+            println!("{} Duplicate entries detected: {}", style("⚠").yellow(), duplicates);
+            
+            // Show some duplicate examples
+            let mut stmt = conn.prepare(
+                "SELECT md5, COUNT(*) as count FROM post_hashes GROUP BY md5 HAVING count > 1 ORDER BY count DESC LIMIT 5"
+            ).ok();
+            
+            if let Some(ref mut stmt) = stmt {
+                println!("\n{}", style("Top duplicate files:").cyan());
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?
+                    ))
+                });
+                
+                if let Ok(rows) = rows {
+                    for row in rows {
+                        if let Ok((md5, count)) = row {
+                            println!("  {}: {} entries", &md5[..8], count);
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("{}", style("✓ No duplicate entries found").green());
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Show database file information
+    async fn show_database_file_info(&self, db_path: &std::path::Path) -> CliResult<()> {
+        println!("\n{}", style("Database File Information").cyan().bold());
+        
+        // File size and path
+        if let Ok(metadata) = std::fs::metadata(db_path) {
+            let size_mb = metadata.len() as f64 / 1_048_576.0;
+            println!("{} Database path: {}", style("📁").blue(), db_path.display());
+            println!("{} Database size: {:.2} MB", style("💾").blue(), size_mb);
+            
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
+                        .unwrap_or_else(|| chrono::Utc::now());
+                    println!("{} Last modified: {}", style("📅").blue(), datetime.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+            }
+        } else {
+            println!("{} Could not read database file metadata", style("✗").red());
+        }
+        
+        // Database schema info
+        use rusqlite::Connection;
+        if let Ok(conn) = Connection::open(db_path) {
+            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'").ok();
+            if let Some(ref mut stmt) = stmt {
+                println!("\n{}", style("Database Tables:").cyan());
+                let rows = stmt.query_map([], |row| {
+                    Ok(row.get::<_, String>(0)?)
+                });
+                
+                if let Ok(rows) = rows {
+                    for row in rows {
+                        if let Ok(table_name) = row {
+                            println!("  • {}", table_name);
+                        }
+                    }
+                }
+            }
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Clean up database by removing orphaned entries
+    async fn cleanup_database(&self, db_path: &std::path::Path) -> CliResult<()> {
+        println!("\n{}", style("Database Cleanup").cyan().bold());
+        
+        if !Confirm::with_theme(&self.theme)
+            .with_prompt("This will remove orphaned/invalid database entries. Continue?")
+            .default(false)
+            .interact()? {
+            return Ok(());
+        }
+        
+        use rusqlite::Connection;
+        let conn = match Connection::open(db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                println!("{} Failed to open database: {}", style("✗").red(), e);
+                return Ok(());
+            }
+        };
+        
+        // Remove entries with empty/invalid MD5 hashes
+        let removed = conn.execute(
+            "DELETE FROM post_hashes WHERE md5 IS NULL OR LENGTH(md5) != 32", []
+        ).unwrap_or(0);
+        
+        if removed > 0 {
+            println!("{} Removed {} invalid entries", style("✓").green(), removed);
+        } else {
+            println!("{} No invalid entries found", style("✓").green());
+        }
+        
+        // Vacuum the database to reclaim space
+        if conn.execute("VACUUM", []).is_ok() {
+            println!("{} Database optimized", style("✓").green());
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Performance monitoring dashboard
+    async fn performance_monitor(&self) -> CliResult<()> {
+        println!("\n{}", style("Performance Monitor").cyan().bold());
+        
+        use crate::v3::{init_adaptive_concurrency};
+        use std::sync::Arc;
+        
+        // Initialize config manager
+        let config_manager = match init_config(&self.config_dir).await {
+            Ok(cm) => Arc::new(cm),
+            Err(e) => {
+                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Initialize adaptive concurrency system
+        let concurrency_manager = match init_adaptive_concurrency(config_manager).await {
+            Ok(cm) => cm,
+            Err(e) => {
+                println!("{} Failed to initialize concurrency manager: {}", style("✗").red(), e);
+                self.press_enter_to_continue()?;
+                return Ok(());
+            }
+        };
+        
+        // Get current performance metrics and limits
+        let (download_limit, api_limit, hash_limit) = concurrency_manager.get_current_limits();
+        let (download_available, api_available, hash_available) = concurrency_manager.get_available_permits();
+        let metrics = concurrency_manager.get_performance_metrics();
+        let is_under_load = concurrency_manager.is_under_load();
+        
+        // Calculate usage percentages
+        let download_usage = ((download_limit - download_available) as f64 / download_limit as f64) * 100.0;
+        let api_usage = ((api_limit - api_available) as f64 / api_limit as f64) * 100.0;
+        let hash_usage = ((hash_limit - hash_available) as f64 / hash_limit as f64) * 100.0;
+        
+        // Display current system status
+        println!("\n{}", style("Current System Status").cyan());
+        println!("{} System under load: {}", 
+            if is_under_load { style("⚠").yellow() } else { style("✓").green() },
+            if is_under_load { style("Yes").red() } else { style("No").green() }
+        );
+        
+        // Display concurrency information
+        println!("\n{}", style("Concurrency Limits & Usage").cyan());
+        
+        println!("{} Download Concurrency: {}/{} ({:.1}% used)", 
+            if download_usage > 75.0 { style("⚠").yellow() } else { style("ℹ").blue() },
+            download_limit - download_available, 
+            download_limit, 
+            download_usage
+        );
+        
+        println!("{} API Concurrency: {}/{} ({:.1}% used)", 
+            if api_usage > 75.0 { style("⚠").yellow() } else { style("ℹ").blue() },
+            api_limit - api_available, 
+            api_limit, 
+            api_usage
+        );
+        
+        println!("{} Hash Concurrency: {}/{} ({:.1}% used)", 
+            if hash_usage > 75.0 { style("⚠").yellow() } else { style("ℹ").blue() },
+            hash_limit - hash_available, 
+            hash_limit, 
+            hash_usage
+        );
+        
+        // Display performance metrics
+        println!("\n{}", style("Performance Metrics").cyan());
+        
+        println!("{} Average Response Time: {:?}", 
+            if metrics.avg_response_time.as_secs() > 3 { style("⚠").yellow() } else { style("ℹ").blue() },
+            metrics.avg_response_time
+        );
+        
+        println!("{} Success Rate: {:.1}%", 
+            if metrics.success_rate < 0.9 { style("⚠").yellow() } else { style("✓").green() },
+            metrics.success_rate * 100.0
+        );
+        
+        println!("{} Error Rate: {:.1}%", 
+            if metrics.error_rate > 0.1 { style("⚠").yellow() } else { style("✓").green() },
+            metrics.error_rate * 100.0
+        );
+        
+        println!("{} Throughput: {:.2} requests/sec", 
+            style("ℹ").blue(),
+            metrics.throughput
+        );
+        
+        // Performance recommendations
+        println!("\n{}", style("Recommendations").cyan());
+        
+        if metrics.error_rate > 0.2 {
+            println!("{} High error rate detected - consider reducing concurrency limits", style("⚠").yellow());
+        } else if metrics.avg_response_time.as_secs() > 5 {
+            println!("{} Slow response times - consider reducing API concurrency", style("⚠").yellow());
+        } else if !is_under_load && metrics.success_rate > 0.95 {
+            println!("{} System performing well - current limits are optimal", style("✓").green());
+        } else if is_under_load {
+            println!("{} System under heavy load - downloads are progressing normally", style("ℹ").blue());
+        }
+        
+        // Show config edit option
+        println!("\n{}", style("Options:").cyan());
+        
+        if Confirm::with_theme(&self.theme)
+            .with_prompt("Would you like to optimize concurrency settings automatically?")
+            .default(false)
+            .interact()? {
+            
+            match concurrency_manager.optimize_concurrency().await {
+                Ok(()) => {
+                    println!("{} Concurrency optimization completed", style("✓").green());
+                    
+                    // Show new limits
+                    let (new_download, new_api, new_hash) = concurrency_manager.get_current_limits();
+                    if new_download != download_limit || new_api != api_limit || new_hash != hash_limit {
+                        println!("New limits: Download={}, API={}, Hash={}", new_download, new_api, new_hash);
+                    } else {
+                        println!("Limits remain unchanged - current settings are optimal");
+                    }
+                }
+                Err(e) => {
+                    println!("{} Optimization failed: {}", style("✗").red(), e);
+                }
+            }
+        }
+        
+        if Confirm::with_theme(&self.theme)
+            .with_prompt("Would you like to edit concurrency limits manually?")
+            .default(false)
+            .interact()? {
+            
+            self.edit_app_config().await?;
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
     /// Edit configuration files
     async fn edit_config(&self) -> CliResult<()> {
         loop {
@@ -642,7 +1444,7 @@ impl CliManager {
         println!("\n{}", style("Edit Application Config").cyan().bold());
         
         // Get the current app config
-        let app_config = match self.config_manager.get_app_config() {
+        let mut app_config = match self.config_manager.get_app_config() {
             Ok(config) => config,
             Err(e) => {
                 println!("{}: {}", style("Error").red().bold(), e);
@@ -650,15 +1452,156 @@ impl CliManager {
             }
         };
         
-        // Display current config values
-        println!("{}", style("Current configuration:").cyan());
-        println!("Download directory: {}", app_config.paths.download_directory);
-        println!("Database file: {}", app_config.paths.database_file);
-        println!("Max download concurrency: {}", app_config.pools.max_download_concurrency);
-        println!("Max API concurrency: {}", app_config.pools.max_api_concurrency);
-        
-        println!("\n{}", style("Config editing functionality not fully implemented.").yellow());
-        println!("Please edit the config.toml file directly for now.");
+        loop {
+            // Display current config values
+            println!("\n{}", style("Current Application Configuration:").cyan());
+            println!("1. Download directory: {}", app_config.paths.download_directory);
+            println!("2. Database file: {}", app_config.paths.database_file);
+            println!("3. Log directory: {}", app_config.paths.log_directory);
+            println!("4. Temp directory: {}", app_config.paths.temp_directory);
+            println!("5. Max download concurrency: {}", app_config.pools.max_download_concurrency);
+            println!("6. Max API concurrency: {}", app_config.pools.max_api_concurrency);
+            println!("7. Batch size: {}", app_config.pools.batch_size);
+            println!("8. Posts per page: {}", app_config.limits.posts_per_page);
+            println!("9. Max page number: {}", app_config.limits.max_page_number);
+            println!("10. File size cap (bytes): {}", app_config.limits.file_size_cap);
+            println!("11. Total size cap (bytes): {}", app_config.limits.total_size_cap);
+            println!("12. Log level: {}", app_config.logging.log_level);
+            println!("0. Save and return");
+            
+            let choice: String = Input::with_theme(&self.theme)
+                .with_prompt("Select field to edit (0-12)")
+                .interact_text()?;
+            
+            match choice.trim() {
+                "0" => {
+                    // Save config and exit
+                    match self.config_manager.save_app_config(&app_config) {
+                        Ok(()) => {
+                            println!("{}", style("Configuration saved successfully!").green());
+                        }
+                        Err(e) => {
+                            println!("{} Failed to save configuration: {}", style("✗").red(), e);
+                        }
+                    }
+                    break;
+                }
+                "1" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter new download directory")
+                        .with_initial_text(&app_config.paths.download_directory)
+                        .interact_text()?;
+                    app_config.paths.download_directory = new_value;
+                }
+                "2" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter new database file path")
+                        .with_initial_text(&app_config.paths.database_file)
+                        .interact_text()?;
+                    app_config.paths.database_file = new_value;
+                }
+                "3" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter new log directory")
+                        .with_initial_text(&app_config.paths.log_directory)
+                        .interact_text()?;
+                    app_config.paths.log_directory = new_value;
+                }
+                "4" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter new temp directory")
+                        .with_initial_text(&app_config.paths.temp_directory)
+                        .interact_text()?;
+                    app_config.paths.temp_directory = new_value;
+                }
+                "5" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter max download concurrency (1-32)")
+                        .with_initial_text(&app_config.pools.max_download_concurrency.to_string())
+                        .interact_text()?;
+                    match new_value.parse::<usize>() {
+                        Ok(val) if val > 0 && val <= 32 => app_config.pools.max_download_concurrency = val,
+                        _ => println!("{}", style("Invalid value. Must be between 1-32.").red())
+                    }
+                }
+                "6" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter max API concurrency (1-16)")
+                        .with_initial_text(&app_config.pools.max_api_concurrency.to_string())
+                        .interact_text()?;
+                    match new_value.parse::<usize>() {
+                        Ok(val) if val > 0 && val <= 16 => app_config.pools.max_api_concurrency = val,
+                        _ => println!("{}", style("Invalid value. Must be between 1-16.").red())
+                    }
+                }
+                "7" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter batch size (1-50)")
+                        .with_initial_text(&app_config.pools.batch_size.to_string())
+                        .interact_text()?;
+                    match new_value.parse::<usize>() {
+                        Ok(val) if val > 0 && val <= 50 => app_config.pools.batch_size = val,
+                        _ => println!("{}", style("Invalid value. Must be between 1-50.").red())
+                    }
+                }
+                "8" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter posts per page (1-320)")
+                        .with_initial_text(&app_config.limits.posts_per_page.to_string())
+                        .interact_text()?;
+                    match new_value.parse::<usize>() {
+                        Ok(val) if val > 0 && val <= 320 => app_config.limits.posts_per_page = val,
+                        _ => println!("{}", style("Invalid value. Must be between 1-320.").red())
+                    }
+                }
+                "9" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter max page number (1-1000)")
+                        .with_initial_text(&app_config.limits.max_page_number.to_string())
+                        .interact_text()?;
+                    match new_value.parse::<usize>() {
+                        Ok(val) if val > 0 && val <= 1000 => app_config.limits.max_page_number = val,
+                        _ => println!("{}", style("Invalid value. Must be between 1-1000.").red())
+                    }
+                }
+                "10" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter file size cap in MB")
+                        .with_initial_text(&(app_config.limits.file_size_cap / 1_048_576).to_string())
+                        .interact_text()?;
+                    match new_value.parse::<usize>() {
+                        Ok(val) if val > 0 => app_config.limits.file_size_cap = val * 1_048_576,
+                        _ => println!("{}", style("Invalid value. Must be positive number in MB.").red())
+                    }
+                }
+                "11" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter total size cap in MB")
+                        .with_initial_text(&(app_config.limits.total_size_cap / 1_048_576).to_string())
+                        .interact_text()?;
+                    match new_value.parse::<usize>() {
+                        Ok(val) if val > 0 => app_config.limits.total_size_cap = val * 1_048_576,
+                        _ => println!("{}", style("Invalid value. Must be positive number in MB.").red())
+                    }
+                }
+                "12" => {
+                    let log_levels = vec!["trace", "debug", "info", "warn", "error"];
+                    let current_index = log_levels.iter().position(|&x| x == app_config.logging.log_level)
+                        .unwrap_or(2); // Default to "info"
+                    
+                    let selection = Select::with_theme(&self.theme)
+                        .with_prompt("Select log level")
+                        .default(current_index)
+                        .items(&log_levels)
+                        .interact()?;
+                    
+                    app_config.logging.log_level = log_levels[selection].to_string();
+                }
+                _ => {
+                    println!("{}", style("Invalid choice. Please select 0-12.").red());
+                }
+            }
+        }
         
         self.press_enter_to_continue()?;
         Ok(())
@@ -669,7 +1612,7 @@ impl CliManager {
         println!("\n{}", style("Edit E621 Config").cyan().bold());
         
         // Get the current e621 config
-        let e621_config = match self.config_manager.get_e621_config() {
+        let mut e621_config = match self.config_manager.get_e621_config() {
             Ok(config) => config,
             Err(e) => {
                 println!("{}: {}", style("Error").red().bold(), e);
@@ -677,19 +1620,312 @@ impl CliManager {
             }
         };
         
-        // Display current config values
-        println!("{}", style("Current configuration:").cyan());
-        println!("Username: {}", e621_config.auth.username);
-        println!("API Key: {}", if e621_config.auth.api_key == "your_api_key_here" { 
-            "Not set" 
-        } else { 
-            "Set (hidden)" 
-        });
-        println!("Download favorites: {}", e621_config.options.download_favorites);
-        println!("Safe mode: {}", e621_config.options.safe_mode);
-        
-        println!("\n{}", style("Config editing functionality not fully implemented.").yellow());
-        println!("Please edit the e621.toml file directly for now.");
+        loop {
+            // Display current config values
+            println!("\n{}", style("Current E621 Configuration:").cyan());
+            println!("1. Username: {}", e621_config.auth.username);
+            println!("2. API Key: {}", if e621_config.auth.api_key == "your_api_key_here" || e621_config.auth.api_key.is_empty() { 
+                "Not set" 
+            } else { 
+                "Set (hidden)" 
+            });
+            println!("3. Download favorites: {}", e621_config.options.download_favorites);
+            println!("4. Safe mode: {}", e621_config.options.safe_mode);
+            println!("5. Tags: {:?}", e621_config.query.tags);
+            println!("6. Artists: {:?}", e621_config.query.artists);
+            println!("7. Pools: {:?}", e621_config.query.pools);
+            println!("8. Collections: {:?}", e621_config.query.collections);
+            println!("9. Posts: {:?}", e621_config.query.posts);
+            println!("0. Save and return");
+            
+            let choice: String = Input::with_theme(&self.theme)
+                .with_prompt("Select field to edit (0-9)")
+                .interact_text()?;
+            
+            match choice.trim() {
+                "0" => {
+                    // Save config and exit
+                    match self.config_manager.save_e621_config(&e621_config) {
+                        Ok(()) => {
+                            println!("{}", style("Configuration saved successfully!").green());
+                        }
+                        Err(e) => {
+                            println!("{} Failed to save configuration: {}", style("✗").red(), e);
+                        }
+                    }
+                    break;
+                }
+                "1" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter E621 username")
+                        .with_initial_text(&e621_config.auth.username)
+                        .interact_text()?;
+                    e621_config.auth.username = new_value;
+                }
+                "2" => {
+                    let new_value: String = Input::with_theme(&self.theme)
+                        .with_prompt("Enter E621 API key")
+                        .interact_text()?;
+                    if !new_value.trim().is_empty() {
+                        e621_config.auth.api_key = new_value;
+                        println!("{}", style("API key updated").green());
+                    }
+                }
+                "3" => {
+                    let new_value = Confirm::with_theme(&self.theme)
+                        .with_prompt("Download favorites?")
+                        .default(e621_config.options.download_favorites)
+                        .interact()?;
+                    e621_config.options.download_favorites = new_value;
+                }
+                "4" => {
+                    let new_value = Confirm::with_theme(&self.theme)
+                        .with_prompt("Enable safe mode?")
+                        .default(e621_config.options.safe_mode)
+                        .interact()?;
+                    e621_config.options.safe_mode = new_value;
+                }
+                "5" => {
+                    println!("\n{}", style("Edit Tags").cyan());
+                    println!("Current tags: {:?}", e621_config.query.tags);
+                    
+                    let sub_choice = Select::with_theme(&self.theme)
+                        .with_prompt("What would you like to do?")
+                        .items(&["Add tags", "Remove tags", "Clear all tags", "Back"])
+                        .interact()?;
+                    
+                    match sub_choice {
+                        0 => { // Add tags
+                            let tags_input: String = Input::with_theme(&self.theme)
+                                .with_prompt("Enter tags to add (space separated)")
+                                .interact_text()?;
+                            let new_tags: Vec<String> = tags_input.split_whitespace()
+                                .map(|s| s.to_lowercase())
+                                .filter(|s| !e621_config.query.tags.contains(s))
+                                .collect();
+                            e621_config.query.tags.extend(new_tags);
+                        }
+                        1 => { // Remove tags
+                            if !e621_config.query.tags.is_empty() {
+                                let selections = MultiSelect::with_theme(&self.theme)
+                                    .items(&e621_config.query.tags)
+                                    .with_prompt("Select tags to remove")
+                                    .interact()?;
+                                
+                                for index in selections.into_iter().rev() {
+                                    e621_config.query.tags.remove(index);
+                                }
+                            } else {
+                                println!("{}", style("No tags to remove.").yellow());
+                            }
+                        }
+                        2 => { // Clear all tags
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Are you sure you want to clear all tags?")
+                                .default(false)
+                                .interact()? {
+                                e621_config.query.tags.clear();
+                                println!("{}", style("All tags cleared.").green());
+                            }
+                        }
+                        _ => {} // Back
+                    }
+                }
+                "6" => {
+                    println!("\n{}", style("Edit Artists").cyan());
+                    println!("Current artists: {:?}", e621_config.query.artists);
+                    
+                    let sub_choice = Select::with_theme(&self.theme)
+                        .with_prompt("What would you like to do?")
+                        .items(&["Add artists", "Remove artists", "Clear all artists", "Back"])
+                        .interact()?;
+                    
+                    match sub_choice {
+                        0 => { // Add artists
+                            let artists_input: String = Input::with_theme(&self.theme)
+                                .with_prompt("Enter artist names to add (space separated)")
+                                .interact_text()?;
+                            let new_artists: Vec<String> = artists_input.split_whitespace()
+                                .map(|s| s.to_lowercase())
+                                .filter(|s| !e621_config.query.artists.contains(s))
+                                .collect();
+                            e621_config.query.artists.extend(new_artists);
+                        }
+                        1 => { // Remove artists
+                            if !e621_config.query.artists.is_empty() {
+                                let selections = MultiSelect::with_theme(&self.theme)
+                                    .items(&e621_config.query.artists)
+                                    .with_prompt("Select artists to remove")
+                                    .interact()?;
+                                
+                                for index in selections.into_iter().rev() {
+                                    e621_config.query.artists.remove(index);
+                                }
+                            } else {
+                                println!("{}", style("No artists to remove.").yellow());
+                            }
+                        }
+                        2 => { // Clear all artists
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Are you sure you want to clear all artists?")
+                                .default(false)
+                                .interact()? {
+                                e621_config.query.artists.clear();
+                                println!("{}", style("All artists cleared.").green());
+                            }
+                        }
+                        _ => {} // Back
+                    }
+                }
+                "7" => {
+                    println!("\n{}", style("Edit Pools").cyan());
+                    println!("Current pools: {:?}", e621_config.query.pools);
+                    
+                    let sub_choice = Select::with_theme(&self.theme)
+                        .with_prompt("What would you like to do?")
+                        .items(&["Add pools", "Remove pools", "Clear all pools", "Back"])
+                        .interact()?;
+                    
+                    match sub_choice {
+                        0 => { // Add pools
+                            let pools_input: String = Input::with_theme(&self.theme)
+                                .with_prompt("Enter pool IDs to add (space separated numbers)")
+                                .interact_text()?;
+                            let new_pools: Vec<usize> = pools_input.split_whitespace()
+                                .filter_map(|s| s.parse::<usize>().ok())
+                                .filter(|id| !e621_config.query.pools.contains(id))
+                                .collect();
+                            e621_config.query.pools.extend(new_pools);
+                        }
+                        1 => { // Remove pools
+                            if !e621_config.query.pools.is_empty() {
+                                let pool_strings: Vec<String> = e621_config.query.pools.iter()
+                                    .map(|p| p.to_string()).collect();
+                                let selections = MultiSelect::with_theme(&self.theme)
+                                    .items(&pool_strings)
+                                    .with_prompt("Select pools to remove")
+                                    .interact()?;
+                                
+                                for index in selections.into_iter().rev() {
+                                    e621_config.query.pools.remove(index);
+                                }
+                            } else {
+                                println!("{}", style("No pools to remove.").yellow());
+                            }
+                        }
+                        2 => { // Clear all pools
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Are you sure you want to clear all pools?")
+                                .default(false)
+                                .interact()? {
+                                e621_config.query.pools.clear();
+                                println!("{}", style("All pools cleared.").green());
+                            }
+                        }
+                        _ => {} // Back
+                    }
+                }
+                "8" => {
+                    println!("\n{}", style("Edit Collections").cyan());
+                    println!("Current collections: {:?}", e621_config.query.collections);
+                    
+                    let sub_choice = Select::with_theme(&self.theme)
+                        .with_prompt("What would you like to do?")
+                        .items(&["Add collections", "Remove collections", "Clear all collections", "Back"])
+                        .interact()?;
+                    
+                    match sub_choice {
+                        0 => { // Add collections
+                            let collections_input: String = Input::with_theme(&self.theme)
+                                .with_prompt("Enter collection IDs to add (space separated numbers)")
+                                .interact_text()?;
+                            let new_collections: Vec<usize> = collections_input.split_whitespace()
+                                .filter_map(|s| s.parse::<usize>().ok())
+                                .filter(|id| !e621_config.query.collections.contains(id))
+                                .collect();
+                            e621_config.query.collections.extend(new_collections);
+                        }
+                        1 => { // Remove collections
+                            if !e621_config.query.collections.is_empty() {
+                                let collection_strings: Vec<String> = e621_config.query.collections.iter()
+                                    .map(|c| c.to_string()).collect();
+                                let selections = MultiSelect::with_theme(&self.theme)
+                                    .items(&collection_strings)
+                                    .with_prompt("Select collections to remove")
+                                    .interact()?;
+                                
+                                for index in selections.into_iter().rev() {
+                                    e621_config.query.collections.remove(index);
+                                }
+                            } else {
+                                println!("{}", style("No collections to remove.").yellow());
+                            }
+                        }
+                        2 => { // Clear all collections
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Are you sure you want to clear all collections?")
+                                .default(false)
+                                .interact()? {
+                                e621_config.query.collections.clear();
+                                println!("{}", style("All collections cleared.").green());
+                            }
+                        }
+                        _ => {} // Back
+                    }
+                }
+                "9" => {
+                    println!("\n{}", style("Edit Posts").cyan());
+                    println!("Current posts: {:?}", e621_config.query.posts);
+                    
+                    let sub_choice = Select::with_theme(&self.theme)
+                        .with_prompt("What would you like to do?")
+                        .items(&["Add posts", "Remove posts", "Clear all posts", "Back"])
+                        .interact()?;
+                    
+                    match sub_choice {
+                        0 => { // Add posts
+                            let posts_input: String = Input::with_theme(&self.theme)
+                                .with_prompt("Enter post IDs to add (space separated numbers)")
+                                .interact_text()?;
+                            let new_posts: Vec<usize> = posts_input.split_whitespace()
+                                .filter_map(|s| s.parse::<usize>().ok())
+                                .filter(|id| !e621_config.query.posts.contains(id))
+                                .collect();
+                            e621_config.query.posts.extend(new_posts);
+                        }
+                        1 => { // Remove posts
+                            if !e621_config.query.posts.is_empty() {
+                                let post_strings: Vec<String> = e621_config.query.posts.iter()
+                                    .map(|p| p.to_string()).collect();
+                                let selections = MultiSelect::with_theme(&self.theme)
+                                    .items(&post_strings)
+                                    .with_prompt("Select posts to remove")
+                                    .interact()?;
+                                
+                                for index in selections.into_iter().rev() {
+                                    e621_config.query.posts.remove(index);
+                                }
+                            } else {
+                                println!("{}", style("No posts to remove.").yellow());
+                            }
+                        }
+                        2 => { // Clear all posts
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Are you sure you want to clear all posts?")
+                                .default(false)
+                                .interact()? {
+                                e621_config.query.posts.clear();
+                                println!("{}", style("All posts cleared.").green());
+                            }
+                        }
+                        _ => {} // Back
+                    }
+                }
+                _ => {
+                    println!("{}", style("Invalid choice. Please select 0-9.").red());
+                }
+            }
+        }
         
         self.press_enter_to_continue()?;
         Ok(())
@@ -700,7 +1936,7 @@ impl CliManager {
         println!("\n{}", style("Edit Rules Config").cyan().bold());
         
         // Get the current rules config
-        let rules_config = match self.config_manager.get_rules_config() {
+        let mut rules_config = match self.config_manager.get_rules_config() {
             Ok(config) => config,
             Err(e) => {
                 println!("{}: {}", style("Error").red().bold(), e);
@@ -708,13 +1944,190 @@ impl CliManager {
             }
         };
         
-        // Display current config values
-        println!("{}", style("Current configuration:").cyan());
-        println!("Whitelist tags: {:?}", rules_config.whitelist.tags);
-        println!("Blacklist tags: {:?}", rules_config.blacklist.tags);
-        
-        println!("\n{}", style("Config editing functionality not fully implemented.").yellow());
-        println!("Please edit the rules.toml file directly for now.");
+        loop {
+            // Display current config values
+            println!("\n{}", style("Current Rules Configuration:").cyan());
+            println!("1. Whitelist tags ({} items): {:?}", 
+                rules_config.whitelist.tags.len(),
+                if rules_config.whitelist.tags.len() <= 10 {
+                    rules_config.whitelist.tags.clone()
+                } else {
+                    let mut preview = rules_config.whitelist.tags[..10].to_vec();
+                    preview.push(format!("... and {} more", rules_config.whitelist.tags.len() - 10));
+                    preview
+                }
+            );
+            println!("2. Blacklist tags ({} items): {:?}", 
+                rules_config.blacklist.tags.len(),
+                if rules_config.blacklist.tags.len() <= 10 {
+                    rules_config.blacklist.tags.clone()
+                } else {
+                    let mut preview = rules_config.blacklist.tags[..10].to_vec();
+                    preview.push(format!("... and {} more", rules_config.blacklist.tags.len() - 10));
+                    preview
+                }
+            );
+            println!("0. Save and return");
+            
+            let choice: String = Input::with_theme(&self.theme)
+                .with_prompt("Select field to edit (0-2)")
+                .interact_text()?;
+            
+            match choice.trim() {
+                "0" => {
+                    // Save config and exit
+                    match self.config_manager.save_rules_config(&rules_config) {
+                        Ok(()) => {
+                            println!("{}", style("Configuration saved successfully!").green());
+                        }
+                        Err(e) => {
+                            println!("{} Failed to save configuration: {}", style("✗").red(), e);
+                        }
+                    }
+                    break;
+                }
+                "1" => {
+                    println!("\n{}", style("Edit Whitelist Tags").cyan());
+                    println!("Current whitelist: {} tags", rules_config.whitelist.tags.len());
+                    
+                    let sub_choice = Select::with_theme(&self.theme)
+                        .with_prompt("What would you like to do?")
+                        .items(&[
+                            "Add tags to whitelist", 
+                            "Remove tags from whitelist", 
+                            "View all whitelist tags",
+                            "Clear all whitelist tags", 
+                            "Back"
+                        ])
+                        .interact()?;
+                    
+                    match sub_choice {
+                        0 => { // Add tags
+                            let tags_input: String = Input::with_theme(&self.theme)
+                                .with_prompt("Enter tags to add to whitelist (space separated)")
+                                .interact_text()?;
+                            let new_tags: Vec<String> = tags_input.split_whitespace()
+                                .map(|s| s.to_lowercase())
+                                .filter(|s| !rules_config.whitelist.tags.contains(s))
+                                .collect();
+                            let added_count = new_tags.len();
+                            rules_config.whitelist.tags.extend(new_tags);
+                            println!("{} {} tags added to whitelist", style("✓").green(), added_count);
+                        }
+                        1 => { // Remove tags
+                            if !rules_config.whitelist.tags.is_empty() {
+                                let selections = MultiSelect::with_theme(&self.theme)
+                                    .items(&rules_config.whitelist.tags)
+                                    .with_prompt("Select tags to remove from whitelist (Space to select, Enter to confirm)")
+                                    .interact()?;
+                                
+                                let removed_count = selections.len();
+                                for index in selections.into_iter().rev() {
+                                    rules_config.whitelist.tags.remove(index);
+                                }
+                                println!("{} {} tags removed from whitelist", style("✓").green(), removed_count);
+                            } else {
+                                println!("{}", style("No tags in whitelist to remove.").yellow());
+                            }
+                        }
+                        2 => { // View all tags
+                            println!("\n{}", style("All Whitelist Tags:").cyan());
+                            for (i, tag) in rules_config.whitelist.tags.iter().enumerate() {
+                                println!("{:3}. {}", i + 1, tag);
+                            }
+                        }
+                        3 => { // Clear all tags
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Are you sure you want to clear ALL whitelist tags?")
+                                .default(false)
+                                .interact()? {
+                                rules_config.whitelist.tags.clear();
+                                println!("{}", style("All whitelist tags cleared.").green());
+                            }
+                        }
+                        _ => {} // Back
+                    }
+                }
+                "2" => {
+                    println!("\n{}", style("Edit Blacklist Tags").cyan());
+                    println!("Current blacklist: {} tags", rules_config.blacklist.tags.len());
+                    
+                    let sub_choice = Select::with_theme(&self.theme)
+                        .with_prompt("What would you like to do?")
+                        .items(&[
+                            "Add tags to blacklist", 
+                            "Remove tags from blacklist", 
+                            "View all blacklist tags",
+                            "Clear all blacklist tags", 
+                            "Reset to default blacklist",
+                            "Back"
+                        ])
+                        .interact()?;
+                    
+                    match sub_choice {
+                        0 => { // Add tags
+                            let tags_input: String = Input::with_theme(&self.theme)
+                                .with_prompt("Enter tags to add to blacklist (space separated)")
+                                .interact_text()?;
+                            let new_tags: Vec<String> = tags_input.split_whitespace()
+                                .map(|s| s.to_lowercase())
+                                .filter(|s| !rules_config.blacklist.tags.contains(s))
+                                .collect();
+                            let added_count = new_tags.len();
+                            rules_config.blacklist.tags.extend(new_tags);
+                            println!("{} {} tags added to blacklist", style("✓").green(), added_count);
+                        }
+                        1 => { // Remove tags
+                            if !rules_config.blacklist.tags.is_empty() {
+                                let selections = MultiSelect::with_theme(&self.theme)
+                                    .items(&rules_config.blacklist.tags)
+                                    .with_prompt("Select tags to remove from blacklist (Space to select, Enter to confirm)")
+                                    .interact()?;
+                                
+                                let removed_count = selections.len();
+                                for index in selections.into_iter().rev() {
+                                    rules_config.blacklist.tags.remove(index);
+                                }
+                                println!("{} {} tags removed from blacklist", style("✓").green(), removed_count);
+                            } else {
+                                println!("{}", style("No tags in blacklist to remove.").yellow());
+                            }
+                        }
+                        2 => { // View all tags
+                            println!("\n{}", style("All Blacklist Tags:").cyan());
+                            for (i, tag) in rules_config.blacklist.tags.iter().enumerate() {
+                                println!("{:3}. {}", i + 1, tag);
+                            }
+                        }
+                        3 => { // Clear all tags
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Are you sure you want to clear ALL blacklist tags?")
+                                .default(false)
+                                .interact()? {
+                                rules_config.blacklist.tags.clear();
+                                println!("{}", style("All blacklist tags cleared.").green());
+                                println!("{}", style("Warning: This will allow ALL content types!").red());
+                            }
+                        }
+                        4 => { // Reset to default
+                            if Confirm::with_theme(&self.theme)
+                                .with_prompt("Reset blacklist to default safety tags?")
+                                .default(true)
+                                .interact()? {
+                                use crate::v3::RulesConfig;
+                                let default_rules = RulesConfig::default();
+                                rules_config.blacklist.tags = default_rules.blacklist.tags;
+                                println!("{}", style("Blacklist reset to default safety tags.").green());
+                            }
+                        }
+                        _ => {} // Back
+                    }
+                }
+                _ => {
+                    println!("{}", style("Invalid choice. Please select 0-2.").red());
+                }
+            }
+        }
         
         self.press_enter_to_continue()?;
         Ok(())
@@ -772,7 +2185,92 @@ impl CliManager {
     /// Verify the downloaded archive
     async fn verify_archive(&self) -> CliResult<()> {
         println!("\n{}", style("Verify Archive").cyan().bold());
-        println!("{}", style("Archive verification not yet implemented.").yellow());
+        
+        // Get the app config
+        let app_config = match self.config_manager.get_app_config() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("{}: {}", style("Error").red().bold(), e);
+                return Ok(());
+            }
+        };
+        
+        let download_dir = Path::new(&app_config.paths.download_directory);
+        if !download_dir.exists() {
+            println!("{} Download directory does not exist: {}", 
+                style("✗").red(), download_dir.display());
+            self.press_enter_to_continue()?;
+            return Ok(());
+        }
+        
+        println!("Scanning download directory: {}", download_dir.display());
+        
+        // Initialize verification statistics
+        let mut total_files = 0u64;
+        let mut verified_files = 0u64;
+        let mut corrupted_files = Vec::new();
+        let mut missing_files = Vec::new();
+        let mut total_size = 0u64;
+        
+        // Recursively scan the download directory
+        match self.scan_directory_for_verification(download_dir, &mut total_files, &mut verified_files, 
+            &mut corrupted_files, &mut missing_files, &mut total_size).await {
+            Ok(()) => {
+                // Display results
+                println!("\n{}", style("Verification Results").cyan().bold());
+                println!("{} Total files scanned: {}", style("📁").cyan(), total_files);
+                println!("{} Verified files: {}", style("✓").green(), verified_files);
+                println!("{} Total archive size: {:.2} MB", style("💾").blue(), total_size as f64 / 1_048_576.0);
+                
+                if !corrupted_files.is_empty() {
+                    println!("\n{} {} corrupted files found:", style("⚠").yellow(), corrupted_files.len());
+                    for (i, file) in corrupted_files.iter().enumerate().take(10) {
+                        println!("  {}: {}", i + 1, file);
+                    }
+                    if corrupted_files.len() > 10 {
+                        println!("  ... and {} more", corrupted_files.len() - 10);
+                    }
+                }
+                
+                if !missing_files.is_empty() {
+                    println!("\n{} {} missing files detected:", style("✗").red(), missing_files.len());
+                    for (i, file) in missing_files.iter().enumerate().take(10) {
+                        println!("  {}: {}", i + 1, file);
+                    }
+                    if missing_files.len() > 10 {
+                        println!("  ... and {} more", missing_files.len() - 10);
+                    }
+                }
+                
+                let integrity_pct = if total_files > 0 {
+                    (verified_files as f64 / total_files as f64) * 100.0
+                } else {
+                    100.0
+                };
+                
+                println!("\n{} Archive integrity: {:.1}%", 
+                    if integrity_pct >= 95.0 { style("✓").green() } 
+                    else if integrity_pct >= 80.0 { style("⚠").yellow() }
+                    else { style("✗").red() },
+                    integrity_pct
+                );
+                
+                if integrity_pct < 100.0 {
+                    println!("\n{}", style("Recommendations:").yellow());
+                    if !corrupted_files.is_empty() {
+                        println!("• Re-download corrupted files");
+                    }
+                    if !missing_files.is_empty() {
+                        println!("• Check for incomplete downloads");
+                    }
+                    println!("• Run verification again after cleanup");
+                }
+            }
+            Err(e) => {
+                println!("{} Verification failed: {}", style("✗").red(), e);
+            }
+        }
+        
         self.press_enter_to_continue()?;
         Ok(())
     }
@@ -1213,6 +2711,88 @@ impl CliManager {
         Ok(())
     }
     
+    /// Toggle download favorites setting
+    async fn toggle_favorites(&self) -> CliResult<()> {
+        println!("\n{}", style("Toggle Download Favorites").cyan().bold());
+        
+        // Get the current e621 config
+        let mut e621_config = match self.config_manager.get_e621_config() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("{}: {}", style("Error").red().bold(), e);
+                return Ok(());
+            }
+        };
+        
+        // Display current status
+        let status_text = if e621_config.options.download_favorites {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        
+        println!("{} Download favorites is currently: {}", 
+            style("ℹ").blue(), 
+            if e621_config.options.download_favorites {
+                style(status_text).green()
+            } else {
+                style(status_text).yellow()
+            }
+        );
+        
+        // Check if we have valid credentials
+        let has_valid_creds = !e621_config.auth.username.is_empty() && 
+            !e621_config.auth.api_key.is_empty() &&
+            e621_config.auth.username != "your_username" && 
+            e621_config.auth.api_key != "your_api_key_here";
+        
+        if !has_valid_creds {
+            println!("{} Note: You need valid E621 credentials to download favorites", 
+                style("⚠").yellow());
+            println!("   Configure credentials first in the main menu or edit e621.toml");
+        }
+        
+        // Ask if user wants to toggle
+        let new_value = Confirm::with_theme(&self.theme)
+            .with_prompt(format!("Would you like to {} download favorites?", 
+                if e621_config.options.download_favorites { "disable" } else { "enable" }))
+            .default(!e621_config.options.download_favorites)
+            .interact()?;
+        
+        if new_value != e621_config.options.download_favorites {
+            e621_config.options.download_favorites = new_value;
+            
+            // Save the updated config
+            match self.config_manager.save_e621_config(&e621_config) {
+                Ok(()) => {
+                    let new_status = if new_value { "enabled" } else { "disabled" };
+                    println!("{} Download favorites {}", 
+                        style("✓").green(), 
+                        if new_value {
+                            style(new_status).green()
+                        } else {
+                            style(new_status).yellow()
+                        }
+                    );
+                    
+                    if new_value && has_valid_creds {
+                        println!("   Your favorites will be included in the next download");
+                    } else if new_value {
+                        println!("   Remember to set up your E621 credentials to download favorites");
+                    }
+                }
+                Err(e) => {
+                    println!("{} Failed to save config: {}", style("✗").red(), e);
+                }
+            }
+        } else {
+            println!("{}", style("No changes made.").yellow());
+        }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
     /// Helper function to fetch tag search results
     async fn fetch_tag_search_results(&self, search_term: &str, max_results: usize) -> CliResult<Vec<(String, crate::v3::query_planner::TagInfo)>> {
         use crate::v3::orchestration::QueryQueue;
@@ -1234,7 +2814,15 @@ impl CliManager {
             }
         };
 
-        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone()).await {
+        let hash_manager = match init_hash_manager(config_manager.clone()).await {
+            Ok(hm) => hm,
+            Err(e) => {
+                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                return Ok(Vec::new());
+            }
+        };
+
+        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
             Ok(qp) => qp,
             Err(e) => {
                 println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
@@ -1278,7 +2866,15 @@ impl CliManager {
             }
         };
 
-        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone()).await {
+        let hash_manager = match init_hash_manager(config_manager.clone()).await {
+            Ok(hm) => hm,
+            Err(e) => {
+                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                return Ok(Vec::new());
+            }
+        };
+
+        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
             Ok(qp) => qp,
             Err(e) => {
                 println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
@@ -1322,7 +2918,15 @@ impl CliManager {
             }
         };
 
-        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone()).await {
+        let hash_manager = match init_hash_manager(config_manager.clone()).await {
+            Ok(hm) => hm,
+            Err(e) => {
+                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                return Ok(Vec::new());
+            }
+        };
+
+        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
             Ok(qp) => qp,
             Err(e) => {
                 println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
@@ -1394,7 +2998,15 @@ impl CliManager {
             }
         };
 
-        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone()).await {
+        let hash_manager = match init_hash_manager(config_manager.clone()).await {
+            Ok(hm) => hm,
+            Err(e) => {
+                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                return Ok(Vec::new());
+            }
+        };
+
+        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
             Ok(qp) => qp,
             Err(e) => {
                 println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
@@ -1443,6 +3055,90 @@ impl CliManager {
         }
     }
 
+    /// Scan directory recursively for verification
+    async fn scan_directory_for_verification(
+        &self, 
+        dir: &Path, 
+        total_files: &mut u64,
+        verified_files: &mut u64,
+        corrupted_files: &mut Vec<String>,
+        missing_files: &mut Vec<String>,
+        total_size: &mut u64
+    ) -> CliResult<()> {
+        use std::fs;
+        use tokio::fs as async_fs;
+        
+        let entries = fs::read_dir(dir)?;
+        
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                // Recursively process subdirectories
+                Box::pin(self.scan_directory_for_verification(&path, total_files, verified_files, 
+                    corrupted_files, missing_files, total_size)).await?;
+            } else if path.is_file() {
+                // Only process image/video files that might be downloaded content
+                if let Some(ext) = path.extension() {
+                    let ext_str = ext.to_string_lossy().to_lowercase();
+                    match ext_str.as_str() {
+                        "jpg" | "jpeg" | "png" | "gif" | "webm" | "mp4" | "webp" | "swf" => {
+                            *total_files += 1;
+                            
+                            // Get file size
+                            if let Ok(metadata) = entry.metadata() {
+                                *total_size += metadata.len();
+                                
+                                // Check if file is accessible and not zero-sized
+                                if metadata.len() == 0 {
+                                    corrupted_files.push(path.display().to_string());
+                                    continue;
+                                }
+                                
+                                // Try to read the file to verify it's not corrupted
+                                match async_fs::read(&path).await {
+                                    Ok(contents) => {
+                                        // Basic verification - ensure file has expected magic bytes
+                                        let is_valid = match ext_str.as_str() {
+                                            "jpg" | "jpeg" => contents.starts_with(&[0xFF, 0xD8, 0xFF]),
+                                            "png" => contents.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+                                            "gif" => contents.starts_with(b"GIF87a") || contents.starts_with(b"GIF89a"),
+                                            "webm" => contents.len() > 4 && &contents[4..8] == b"webm",
+                                            "mp4" => contents.len() > 8 && (&contents[4..8] == b"ftyp" || &contents[4..12] == b"ftypmp41"),
+                                            "webp" => contents.starts_with(b"RIFF") && contents.len() > 12 && &contents[8..12] == b"WEBP",
+                                            "swf" => contents.starts_with(b"FWS") || contents.starts_with(b"CWS") || contents.starts_with(b"ZWS"),
+                                            _ => true, // For unknown formats, assume valid if readable
+                                        };
+                                        
+                                        if is_valid {
+                                            *verified_files += 1;
+                                        } else {
+                                            corrupted_files.push(path.display().to_string());
+                                        }
+                                    }
+                                    Err(_) => {
+                                        corrupted_files.push(path.display().to_string());
+                                    }
+                                }
+                            } else {
+                                missing_files.push(path.display().to_string());
+                            }
+                            
+                            // Show progress every 100 files
+                            if *total_files % 100 == 0 {
+                                println!("Processed {} files...", *total_files);
+                            }
+                        }
+                        _ => {} // Skip non-media files
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// Helper function to pause and wait for user to press Enter
     fn press_enter_to_continue(&self) -> CliResult<()> {
         println!("\nPress Enter to continue...");

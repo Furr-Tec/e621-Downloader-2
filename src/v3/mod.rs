@@ -26,6 +26,11 @@ pub mod logger;
 pub mod logger_example;
 pub mod session_manager;
 pub mod session_manager_example;
+pub mod session_recovery;
+pub mod adaptive_concurrency;
+pub mod directory_organizer;
+pub mod hash_manager;
+pub mod database;
 
 // Re-export commonly used types for convenience
 pub use config_loader::{
@@ -46,7 +51,7 @@ pub use orchestration::{
 pub use query_planner::{
     QueryPlanner, QueryPlannerError, QueryPlannerResult,
     Post, PostFile, PostTags, PostScore,
-    DownloadJob, QueryPlan, HashStore,
+    DownloadJob, QueryPlan,
     init_query_planner,
 };
 
@@ -101,6 +106,37 @@ pub use logger::{
 pub use session_manager::{
     SessionManager, SessionManagerError, SessionManagerResult,
     SessionState, init_session_manager,
+};
+
+// Re-export session recovery functionality
+pub use session_recovery::{
+    SessionRecovery, SessionRecoveryError, SessionRecoveryResult,
+    JobStatus, PersistentJob, init_session_recovery,
+};
+
+// Re-export adaptive concurrency functionality
+pub use adaptive_concurrency::{
+    AdaptiveConcurrency, ConcurrencyError, ConcurrencyResult,
+    PerformanceMetrics, init_adaptive_concurrency,
+};
+
+// Re-export directory organizer functionality
+pub use directory_organizer::{
+    DirectoryOrganizer, DirectoryOrganizerError, DirectoryOrganizerResult,
+    OrganizationStrategy, ContentType, sanitize_filename, init_directory_organizer,
+};
+
+// Re-export hash manager functionality
+pub use hash_manager::{
+    HashManager, HashManagerError, HashManagerResult,
+    DownloadRecord, HashVerification, DownloadStatistics, init_hash_manager,
+};
+
+// Re-export database functionality
+pub use database::{
+    Database, DatabaseError, DatabaseResult,
+    DownloadRecord as DbDownloadRecord, DownloadStatistics as DbDownloadStatistics,
+    init_database,
 };
 
 // Re-export e621 validator functionality
