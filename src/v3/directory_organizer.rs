@@ -112,13 +112,16 @@ impl DirectoryOrganizer {
                 self.blacklisted_folder.clone()
             }
             ContentType::Favorites(ref username) => {
-                self.favorites_folder.join(sanitize_filename(username))
+                // Align folder naming with v2 structure (capitalized)
+                self.base_download_dir.join("Favorites").join(sanitize_filename(username))
             }
             ContentType::Pool(pool_id) => {
-                self.base_download_dir.join("pools").join(format!("pool_{}", pool_id))
+                // Align folder naming with v2 structure (capitalized)
+                self.base_download_dir.join("Pools").join(format!("pool_{}", pool_id))
             }
             ContentType::Collection(collection_id) => {
-                self.base_download_dir.join("collections").join(format!("collection_{}", collection_id))
+                // Keep collections under capitalized directory for consistency
+                self.base_download_dir.join("Collections").join(format!("collection_{}", collection_id))
             }
             ContentType::Tagged | ContentType::Artist(_) => {
                 self.get_organized_path(job, &content_type)?
@@ -152,7 +155,8 @@ impl DirectoryOrganizer {
                 // Create both tag and artist folders
                 match content_type {
                     ContentType::Artist(artist_name) => {
-                        let artist_folder = self.base_download_dir.join("artists").join(sanitize_filename(artist_name));
+                        // Align with v2 folder casing: "Artists"
+                        let artist_folder = self.base_download_dir.join("Artists").join(sanitize_filename(artist_name));
                         Ok(artist_folder)
                     }
                     _ => {
@@ -184,12 +188,27 @@ impl DirectoryOrganizer {
                     .find(|tag| !is_meta_tag(tag) && self.configured_tags.contains(tag))
                     .cloned()
             })
+            .or_else(|| {
+                // Better fallback: Use any reasonable non-meta tag from the post
+                job.tags.iter()
+                    .find(|tag| !is_meta_tag(tag) && !tag.starts_with("artist:") && tag.len() > 2)
+                    .cloned()
+            })
+            .or_else(|| {
+                // If from favorites, use "favorites" as tag
+                if job.tags.iter().any(|tag| tag.starts_with("fav:")) {
+                    Some("favorites".to_string())
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| {
                 // Final fallback: create a single unmatched folder for all non-matching posts
                 "unmatched".to_string()
             });
         
-        let tag_folder = self.base_download_dir.join("tags").join(sanitize_filename(&primary_tag));
+        // Align with v2 folder casing: "Tags"
+        let tag_folder = self.base_download_dir.join("Tags").join(sanitize_filename(&primary_tag));
         
         // Only return the primary tag folder - don't create empty additional folders
         Ok(tag_folder)
@@ -215,7 +234,8 @@ impl DirectoryOrganizer {
             format!("unknown_artist_{}", job.post_id)
         };
         
-        let artist_folder = self.base_download_dir.join("artists").join(sanitize_filename(&artist_name));
+        // Align with v2 folder casing: "Artists"
+        let artist_folder = self.base_download_dir.join("Artists").join(sanitize_filename(&artist_name));
         
         // Only return the primary artist folder - don't create empty additional folders
         Ok(artist_folder)
@@ -223,7 +243,19 @@ impl DirectoryOrganizer {
     
     /// Create mixed folder structure (both tags and artists)
     fn create_mixed_folders(&self, job: &DownloadJob) -> DirectoryOrganizerResult<PathBuf> {
-        // Check for configured artist names first
+        // First priority: Check for any artist tags in the post
+        let artist_tags: Vec<String> = job.tags.iter()
+            .filter(|tag| tag.starts_with("artist:"))
+            .map(|tag| tag.strip_prefix("artist:").unwrap_or(tag).to_string())
+            .collect();
+        
+        if !artist_tags.is_empty() {
+            let artist_name = &artist_tags[0]; // Use the first artist
+            // Align with v2 folder casing: "Artists"
+            return Ok(self.base_download_dir.join("Artists").join(sanitize_filename(artist_name)));
+        }
+        
+        // Second priority: Check for configured artist names 
         let configured_artist = self.configured_tags.iter()
             .find(|configured_tag| {
                 job.tags.iter().any(|post_tag| {
@@ -234,20 +266,38 @@ impl DirectoryOrganizer {
             });
             
         if let Some(artist) = configured_artist {
-            return Ok(self.base_download_dir.join("artists").join(sanitize_filename(artist)));
+            // Align with v2 folder casing: "Artists"
+            return Ok(self.base_download_dir.join("Artists").join(sanitize_filename(artist)));
         }
         
-        // Check for configured tags
+        // Third priority: Check for configured tags
         let configured_tag = self.configured_tags.iter()
             .find(|configured_tag| {
                 job.tags.iter().any(|post_tag| post_tag == *configured_tag)
             });
             
         if let Some(tag) = configured_tag {
-            return Ok(self.base_download_dir.join("tags").join(sanitize_filename(tag)));
+            // Align with v2 folder casing: "Tags"
+            return Ok(self.base_download_dir.join("Tags").join(sanitize_filename(tag)));
         }
         
-        // Final fallback: create an unsorted folder for posts that don't match any configured tags/artists
+        // Fourth priority: Use common tags to create folders (skip meta tags)
+        let common_tag = job.tags.iter()
+            .find(|tag| !is_meta_tag(tag) && !tag.starts_with("artist:") && tag.len() > 2)
+            .cloned();
+            
+        if let Some(tag) = common_tag {
+            // Align with v2 folder casing: "Tags"
+            return Ok(self.base_download_dir.join("Tags").join(sanitize_filename(&tag)));
+        }
+        
+        // Final fallback: use favorites folder if it's from fav: search
+        if job.tags.iter().any(|tag| tag.starts_with("fav:")) {
+            // Align with v2 folder casing: "Favorites"
+            return Ok(self.base_download_dir.join("Favorites"));
+        }
+        
+        // Final fallback: create an unsorted folder for posts that don't match any pattern
         Ok(self.base_download_dir.join("unmatched"))
     }
     

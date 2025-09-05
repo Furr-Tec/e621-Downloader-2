@@ -106,28 +106,7 @@ impl BlacklistHandler {
         Self::new(config_manager, db_path).await
     }
 
-    /// Check if a post is blacklisted
-    pub fn is_blacklisted(&self, tags: &[String]) -> BlacklistHandlerResult<bool> {
-        // Get the rules config
-        let rules_config = self.config_manager.get_rules_config()
-            .map_err(|e| BlacklistHandlerError::Config(e.to_string()))?;
-
-        // Check if any tag is in the whitelist
-        for tag in tags {
-            if rules_config.whitelist.tags.contains(tag) {
-                return Ok(false);
-            }
-        }
-
-        // Check if any tag is in the blacklist
-        for tag in tags {
-            if rules_config.blacklist.tags.contains(tag) {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
+    /// Note: is_blacklisted() method removed - blacklist checking now handled by QueryPlanner using E621 API
 
     /// Get the target directory for a blacklisted download
     pub fn get_blacklisted_directory(&self, job: &DownloadJob) -> BlacklistHandlerResult<PathBuf> {

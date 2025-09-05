@@ -195,64 +195,12 @@ impl Default for E621Config {
     }
 }
 
-// Config structs for rules.toml
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Whitelist {
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Blacklist {
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RulesConfig {
-    pub whitelist: Whitelist,
-    pub blacklist: Blacklist,
-}
-
-// Default implementation for RulesConfig
-impl Default for RulesConfig {
-    fn default() -> Self {
-        Self {
-            whitelist: Whitelist {
-                tags: vec!["dragon".to_string(), "muscle".to_string(), "male_focus".to_string()],
-            },
-            blacklist: Blacklist {
-                tags: vec![
-                    "scat".to_string(),
-                    "watersports".to_string(),
-                    "gore".to_string(),
-                    "loli".to_string(),
-                    "shota".to_string(),
-                    "cub".to_string(),
-                    "vore".to_string(),
-                    "inflation".to_string(),
-                    "hyper".to_string(),
-                    "feral".to_string(),
-                    "diaper".to_string(),
-                    "death".to_string(),
-                    "torture".to_string(),
-                    "rape".to_string(),
-                    "non-con".to_string(),
-                    "necrophilia".to_string(),
-                    "bestiality".to_string(),
-                    "incest".to_string(),
-                    "underage".to_string(),
-                    "minor".to_string(),
-                    "young".to_string(),
-                ],
-            },
-        }
-    }
-}
+// Note: Local rules configuration removed - using E621 API blacklist directly
 
 // Config manager to handle all configuration files
 pub struct ConfigManager {
     app_config: Arc<RwLock<AppConfig>>,
     e621_config: Arc<RwLock<E621Config>>,
-    rules_config: Arc<RwLock<RulesConfig>>,
     config_dir: PathBuf,
     _watcher: Option<RecommendedWatcher>,
     reload_tx: broadcast::Sender<ConfigReloadEvent>,
@@ -263,7 +211,6 @@ pub struct ConfigManager {
 pub enum ConfigReloadEvent {
     AppConfig,
     E621Config,
-    RulesConfig,
 }
 
 impl ConfigManager {
@@ -280,7 +227,6 @@ impl ConfigManager {
         // Load initial configurations
         let app_config = Self::load_app_config(&config_dir)?;
         let e621_config = Self::load_e621_config(&config_dir)?;
-        let rules_config = Self::load_rules_config(&config_dir)?;
         
         // Create broadcast channel for reload events
         let (reload_tx, _) = broadcast::channel(100);
@@ -288,7 +234,6 @@ impl ConfigManager {
         let mut manager = Self {
             app_config: Arc::new(RwLock::new(app_config)),
             e621_config: Arc::new(RwLock::new(e621_config)),
-            rules_config: Arc::new(RwLock::new(rules_config)),
             config_dir,
             _watcher: None,
             reload_tx,
@@ -360,25 +305,7 @@ impl ConfigManager {
         }
     }
     
-    // Load rules config from rules.toml
-    fn load_rules_config(config_dir: &Path) -> ConfigResult<RulesConfig> {
-        let config_path = config_dir.join("rules.toml");
-        
-        if !config_path.exists() {
-            log::warn!("Rules config file not found: {}", config_path.display());
-            return Ok(RulesConfig::default());
-        }
-        
-        let content = fs::read_to_string(&config_path)?;
-        match toml::from_str(&content) {
-            Ok(config) => Ok(config),
-            Err(e) => {
-                log::error!("Failed to parse rules.toml: {}", e);
-                log::info!("Using default rules configuration");
-                Ok(RulesConfig::default())
-            }
-        }
-    }
+    // Note: load_rules_config() removed - using E621 API blacklist directly
     
     // Setup file watcher for live reloading
     fn setup_watcher(&mut self) -> ConfigResult<()> {
@@ -397,7 +324,6 @@ impl ConfigManager {
         // Clone Arc references for the async task
         let app_config = self.app_config.clone();
         let e621_config = self.e621_config.clone();
-        let rules_config = self.rules_config.clone();
         
         // Spawn a task to handle file change events
         task::spawn(async move {
@@ -433,16 +359,8 @@ impl ConfigManager {
                                             }
                                         }
                                         "rules.toml" => {
-                                            match Self::load_rules_config(&config_dir) {
-                                                Ok(new_config) => {
-                                                    if let Ok(mut config) = rules_config.write() {
-                                                        *config = new_config;
-                                                        let _ = reload_tx.send(ConfigReloadEvent::RulesConfig);
-                                                        log::info!("Reloaded rules config");
-                                                    }
-                                                }
-                                                Err(e) => log::error!("Failed to reload rules config: {}", e),
-                                            }
+                                            // Rules config is deprecated - using E621 API blacklist directly
+                                            log::info!("rules.toml is deprecated. Using E621 API blacklist instead.");
                                         }
                                         _ => {}
                                     }
@@ -481,21 +399,14 @@ impl ConfigManager {
             .map(|config| config.clone())
     }
     
-    // Get rules config
-    pub fn get_rules_config(&self) -> ConfigResult<RulesConfig> {
-        self.rules_config
-            .read()
-            .map_err(|e| ConfigError::LockError(e.to_string()))
-            .map(|config| config.clone())
-    }
+    // Note: get_rules_config() removed - using E621 API blacklist directly
     
     // Check if all required config files exist
     pub fn check_config_files(&self) -> bool {
         let config_path = self.config_dir.join("config.toml");
         let e621_path = self.config_dir.join("e621.toml");
-        let rules_path = self.config_dir.join("rules.toml");
         
-        config_path.exists() && e621_path.exists() && rules_path.exists()
+        config_path.exists() && e621_path.exists()
     }
     
     // Save app config to file
@@ -575,20 +486,7 @@ impl ConfigManager {
             *e621_config = default_config;
         }
         
-        // Create rules.toml
-        let rules_path = self.config_dir.join("rules.toml");
-        if !rules_path.exists() {
-            let default_config = RulesConfig::default();
-            let toml_string = toml::to_string_pretty(&default_config)
-                .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
-            fs::write(&rules_path, toml_string)?;
-            
-            // Update the in-memory config
-            let mut rules_config = self.rules_config
-                .write()
-                .map_err(|e| ConfigError::LockError(e.to_string()))?;
-            *rules_config = default_config;
-        }
+        // Note: rules.toml is deprecated - using E621 API blacklist directly
         
         Ok(())
     }
@@ -614,21 +512,7 @@ impl ConfigManager {
         Ok(())
     }
     
-    // Save rules config to file
-    pub fn save_rules_config(&self, config: &RulesConfig) -> ConfigResult<()> {
-        let config_path = self.config_dir.join("rules.toml");
-        let toml_string = toml::to_string_pretty(config)
-            .map_err(|e| ConfigError::TomlSer(e.to_string()))?;
-        fs::write(&config_path, toml_string)?;
-        
-        // Update the in-memory config
-        let mut rules_config = self.rules_config
-            .write()
-            .map_err(|e| ConfigError::LockError(e.to_string()))?;
-        *rules_config = config.clone();
-        
-        Ok(())
-    }
+    // Note: save_rules_config() removed - using E621 API blacklist directly
 }
 
 // Helper function to create a ConfigManager instance

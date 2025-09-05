@@ -417,15 +417,6 @@ impl CliManager {
             }
         };
         
-        let rules_config = match config_manager.get_rules_config() {
-            Ok(config) => config,
-            Err(e) => {
-                println!("{} Failed to get rules config: {}", style("✗").red(), e);
-                self.press_enter_to_continue()?;
-                return Ok(());
-            }
-        };
-        
         // Check and create download directory
         let download_dir = Path::new(&app_config.paths.download_directory);
         if !download_dir.exists() {
@@ -458,21 +449,9 @@ impl CliManager {
                 style("✓").green(), temp_dir.display());
         }
         
-        // Report blacklist status
-        let blacklist_count = rules_config.blacklist.tags.len();
-        if blacklist_count > 0 {
-            println!("{} Blacklist loaded: {} tags will be filtered", 
-                style("✓").green(), blacklist_count);
-            if blacklist_count <= 10 {
-                println!("   Blacklisted tags: {:?}", rules_config.blacklist.tags);
-            } else {
-                println!("   First 10 blacklisted tags: {:?}", 
-                    &rules_config.blacklist.tags[..10]);
-                println!("   ... and {} more", blacklist_count - 10);
-            }
-        } else {
-            println!("{} No blacklist tags configured", style("!").yellow());
-        }
+        // Report blacklist status (now using E621 API)
+        println!("{} Blacklist will be fetched from E621 API using your account settings", 
+            style("ℹ").blue());
         
         // Check credentials
         if e621_config.auth.username == "your_username" || 
@@ -1935,203 +1914,21 @@ impl CliManager {
         Ok(())
     }
     
-    /// Edit rules config
+    /// Edit rules config (deprecated)
     async fn edit_rules_config(&self) -> CliResult<()> {
-        println!("\n{}", style("Edit Rules Config").cyan().bold());
+        println!("\n{}", style("Rules Config (Deprecated)").cyan().bold());
         
-        // Get the current rules config
-        let mut rules_config = match self.config_manager.get_rules_config() {
-            Ok(config) => config,
-            Err(e) => {
-                println!("{}: {}", style("Error").red().bold(), e);
-                return Ok(());
-            }
-        };
-        
-        loop {
-            // Display current config values
-            println!("\n{}", style("Current Rules Configuration:").cyan());
-            println!("1. Whitelist tags ({} items): {:?}", 
-                rules_config.whitelist.tags.len(),
-                if rules_config.whitelist.tags.len() <= 10 {
-                    rules_config.whitelist.tags.clone()
-                } else {
-                    let mut preview = rules_config.whitelist.tags[..10].to_vec();
-                    preview.push(format!("... and {} more", rules_config.whitelist.tags.len() - 10));
-                    preview
-                }
-            );
-            println!("2. Blacklist tags ({} items): {:?}", 
-                rules_config.blacklist.tags.len(),
-                if rules_config.blacklist.tags.len() <= 10 {
-                    rules_config.blacklist.tags.clone()
-                } else {
-                    let mut preview = rules_config.blacklist.tags[..10].to_vec();
-                    preview.push(format!("... and {} more", rules_config.blacklist.tags.len() - 10));
-                    preview
-                }
-            );
-            println!("0. Save and return");
-            
-            let choice: String = Input::with_theme(&self.theme)
-                .with_prompt("Select field to edit (0-2)")
-                .interact_text()?;
-            
-            match choice.trim() {
-                "0" => {
-                    // Save config and exit
-                    match self.config_manager.save_rules_config(&rules_config) {
-                        Ok(()) => {
-                            println!("{}", style("Configuration saved successfully!").green());
-                        }
-                        Err(e) => {
-                            println!("{} Failed to save configuration: {}", style("✗").red(), e);
-                        }
-                    }
-                    break;
-                }
-                "1" => {
-                    println!("\n{}", style("Edit Whitelist Tags").cyan());
-                    println!("Current whitelist: {} tags", rules_config.whitelist.tags.len());
-                    
-                    let sub_choice = Select::with_theme(&self.theme)
-                        .with_prompt("What would you like to do?")
-                        .items(&[
-                            "Add tags to whitelist", 
-                            "Remove tags from whitelist", 
-                            "View all whitelist tags",
-                            "Clear all whitelist tags", 
-                            "Back"
-                        ])
-                        .interact()?;
-                    
-                    match sub_choice {
-                        0 => { // Add tags
-                            let tags_input: String = Input::with_theme(&self.theme)
-                                .with_prompt("Enter tags to add to whitelist (space separated)")
-                                .interact_text()?;
-                            let new_tags: Vec<String> = tags_input.split_whitespace()
-                                .map(|s| s.to_lowercase())
-                                .filter(|s| !rules_config.whitelist.tags.contains(s))
-                                .collect();
-                            let added_count = new_tags.len();
-                            rules_config.whitelist.tags.extend(new_tags);
-                            println!("{} {} tags added to whitelist", style("✓").green(), added_count);
-                        }
-                        1 => { // Remove tags
-                            if !rules_config.whitelist.tags.is_empty() {
-                                let selections = MultiSelect::with_theme(&self.theme)
-                                    .items(&rules_config.whitelist.tags)
-                                    .with_prompt("Select tags to remove from whitelist (Space to select, Enter to confirm)")
-                                    .interact()?;
-                                
-                                let removed_count = selections.len();
-                                for index in selections.into_iter().rev() {
-                                    rules_config.whitelist.tags.remove(index);
-                                }
-                                println!("{} {} tags removed from whitelist", style("✓").green(), removed_count);
-                            } else {
-                                println!("{}", style("No tags in whitelist to remove.").yellow());
-                            }
-                        }
-                        2 => { // View all tags
-                            println!("\n{}", style("All Whitelist Tags:").cyan());
-                            for (i, tag) in rules_config.whitelist.tags.iter().enumerate() {
-                                println!("{:3}. {}", i + 1, tag);
-                            }
-                        }
-                        3 => { // Clear all tags
-                            if Confirm::with_theme(&self.theme)
-                                .with_prompt("Are you sure you want to clear ALL whitelist tags?")
-                                .default(false)
-                                .interact()? {
-                                rules_config.whitelist.tags.clear();
-                                println!("{}", style("All whitelist tags cleared.").green());
-                            }
-                        }
-                        _ => {} // Back
-                    }
-                }
-                "2" => {
-                    println!("\n{}", style("Edit Blacklist Tags").cyan());
-                    println!("Current blacklist: {} tags", rules_config.blacklist.tags.len());
-                    
-                    let sub_choice = Select::with_theme(&self.theme)
-                        .with_prompt("What would you like to do?")
-                        .items(&[
-                            "Add tags to blacklist", 
-                            "Remove tags from blacklist", 
-                            "View all blacklist tags",
-                            "Clear all blacklist tags", 
-                            "Reset to default blacklist",
-                            "Back"
-                        ])
-                        .interact()?;
-                    
-                    match sub_choice {
-                        0 => { // Add tags
-                            let tags_input: String = Input::with_theme(&self.theme)
-                                .with_prompt("Enter tags to add to blacklist (space separated)")
-                                .interact_text()?;
-                            let new_tags: Vec<String> = tags_input.split_whitespace()
-                                .map(|s| s.to_lowercase())
-                                .filter(|s| !rules_config.blacklist.tags.contains(s))
-                                .collect();
-                            let added_count = new_tags.len();
-                            rules_config.blacklist.tags.extend(new_tags);
-                            println!("{} {} tags added to blacklist", style("✓").green(), added_count);
-                        }
-                        1 => { // Remove tags
-                            if !rules_config.blacklist.tags.is_empty() {
-                                let selections = MultiSelect::with_theme(&self.theme)
-                                    .items(&rules_config.blacklist.tags)
-                                    .with_prompt("Select tags to remove from blacklist (Space to select, Enter to confirm)")
-                                    .interact()?;
-                                
-                                let removed_count = selections.len();
-                                for index in selections.into_iter().rev() {
-                                    rules_config.blacklist.tags.remove(index);
-                                }
-                                println!("{} {} tags removed from blacklist", style("✓").green(), removed_count);
-                            } else {
-                                println!("{}", style("No tags in blacklist to remove.").yellow());
-                            }
-                        }
-                        2 => { // View all tags
-                            println!("\n{}", style("All Blacklist Tags:").cyan());
-                            for (i, tag) in rules_config.blacklist.tags.iter().enumerate() {
-                                println!("{:3}. {}", i + 1, tag);
-                            }
-                        }
-                        3 => { // Clear all tags
-                            if Confirm::with_theme(&self.theme)
-                                .with_prompt("Are you sure you want to clear ALL blacklist tags?")
-                                .default(false)
-                                .interact()? {
-                                rules_config.blacklist.tags.clear();
-                                println!("{}", style("All blacklist tags cleared.").green());
-                                println!("{}", style("Warning: This will allow ALL content types!").red());
-                            }
-                        }
-                        4 => { // Reset to default
-                            if Confirm::with_theme(&self.theme)
-                                .with_prompt("Reset blacklist to default safety tags?")
-                                .default(true)
-                                .interact()? {
-                                use crate::v3::RulesConfig;
-                                let default_rules = RulesConfig::default();
-                                rules_config.blacklist.tags = default_rules.blacklist.tags;
-                                println!("{}", style("Blacklist reset to default safety tags.").green());
-                            }
-                        }
-                        _ => {} // Back
-                    }
-                }
-                _ => {
-                    println!("{}", style("Invalid choice. Please select 0-2.").red());
-                }
-            }
-        }
+        println!("{}", style("Local rules configuration has been deprecated!").yellow().bold());
+        println!("{}", style("The application now uses your E621 account's blacklist directly.").cyan());
+        println!("{}", style("To manage your blacklist:").cyan());
+        println!("  1. Log into your E621 account on the website");
+        println!("  2. Go to Account → Settings → Blacklisted Tags");
+        println!("  3. Configure your blacklist there");
+        println!("\n{}", style("Benefits of using E621 API blacklist:").green());
+        println!("  ✓ Synchronized across all your devices");
+        println!("  ✓ Always up-to-date with the latest tag changes");
+        println!("  ✓ Consistent with what you see on the website");
+        println!("  ✓ No need to manually maintain local rules");
         
         self.press_enter_to_continue()?;
         Ok(())
@@ -2152,7 +1949,6 @@ impl CliManager {
         // Try to load each config to validate
         let app_config_result = self.config_manager.get_app_config();
         let e621_config_result = self.config_manager.get_e621_config();
-        let rules_config_result = self.config_manager.get_rules_config();
         
         println!("\n{}", style("Validation results:").cyan());
         
@@ -2177,10 +1973,7 @@ impl CliManager {
             Err(e) => println!("{} {}", style("✗ E621 config error:").red(), e),
         }
         
-        match rules_config_result {
-            Ok(_) => println!("{}", style("✓ Rules config is valid").green()),
-            Err(e) => println!("{} {}", style("✗ Rules config error:").red(), e),
-        }
+        println!("{}", style("ℹ Rules config is deprecated - using E621 API blacklist").blue());
         
         self.press_enter_to_continue()?;
         Ok(())

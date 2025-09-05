@@ -33,7 +33,7 @@ pub mod database;
 
 // Re-export commonly used types for convenience
 pub use config_loader::{
-    AppConfig, E621Config, RulesConfig,
+    AppConfig, E621Config,
     ConfigManager, ConfigError, ConfigResult, ConfigReloadEvent,
     init_config,
 };

@@ -19,7 +19,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::v3::{
-    RulesConfig,
     ConfigManager,
     Query, QueryQueue, HashManager,
 };
@@ -145,6 +144,28 @@ pub struct ArtistInfo {
     pub other_names: Vec<String>,
 }
 
+/// E621 API response for user profile
+#[derive(Debug, Deserialize)]
+pub struct UserResponse {
+    pub id: u32,
+    pub name: String,
+    pub level: u32,
+    pub base_upload_limit: u32,
+    pub post_upload_count: u32,
+    pub post_update_count: u32,
+    pub note_update_count: u32,
+    pub is_banned: bool,
+    pub can_approve_posts: bool,
+    pub can_upload_free: bool,
+    pub level_string: String,
+    pub avatar_id: Option<u32>,
+    pub blacklisted_tags: Option<String>,
+    pub favorite_tags: Option<String>,
+    pub created_at: String,
+    pub profile_about: Option<String>,
+    pub profile_artinfo: Option<String>,
+}
+
 /// Download job for a post
 #[derive(Debug, Clone)]
 pub struct DownloadJob {
@@ -204,6 +225,77 @@ impl QueryPlanner {
         })
     }
 
+    /// Fetch user profile and blacklisted tags from E621 API
+    pub async fn fetch_user_blacklist(&self, username: &str) -> QueryPlannerResult<Vec<String>> {
+        // Get the e621 config
+        let e621_config = self.config_manager.get_e621_config()
+            .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
+
+        // Get the app config
+        let app_config = self.config_manager.get_app_config()
+            .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
+
+        // Build the user profile URL
+        let url = format!("https://e621.net/users/{}.json", username);
+        
+        debug!("Fetching user profile URL: {}", url);
+
+        // Create a request builder with authentication (required for user profiles)
+        let mut request_builder = self.client.get(&url)
+            .header("User-Agent", format!("e621_downloader/{} (by {})", 
+                env!("CARGO_PKG_VERSION"), 
+                e621_config.auth.username));
+
+        // Add authentication - required for user profile access
+        if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty() 
+            && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
+            use base64::{Engine as _, engine::general_purpose};
+            let auth = format!("Basic {}", general_purpose::STANDARD.encode(format!("{}:{}", 
+                e621_config.auth.username, 
+                e621_config.auth.api_key)));
+            request_builder = request_builder.header("Authorization", auth);
+            debug!("Using authentication for user profile request");
+        } else {
+            warn!("No authentication credentials provided, user blacklist fetch may fail");
+            return Ok(Vec::new()); // Return empty blacklist if no auth
+        }
+
+        // Make the request
+        let response = request_builder.send().await?;
+
+        // Check for rate limiting
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            // Wait and retry
+            sleep(Duration::from_secs(app_config.rate.retry_backoff_secs as u64)).await;
+            return Box::pin(self.fetch_user_blacklist(username)).await;
+        }
+
+        // Check for other errors
+        if !response.status().is_success() {
+            warn!("Failed to fetch user profile: {} - using local blacklist only", response.status());
+            return Ok(Vec::new()); // Return empty blacklist on error, use local rules
+        }
+
+        // Parse the response
+        let user_profile: UserResponse = response.json().await?;
+        
+        // Parse blacklisted tags from the profile
+        let blacklisted_tags = if let Some(blacklist_str) = user_profile.blacklisted_tags {
+            blacklist_str
+                .split_whitespace()
+                .map(|tag| tag.trim().to_string())
+                .filter(|tag| !tag.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        
+        info!("Fetched {} blacklisted tags from E621 API for user: {}", blacklisted_tags.len(), username);
+        debug!("Blacklisted tags from API: {:?}", blacklisted_tags);
+        
+        Ok(blacklisted_tags)
+    }
+
     /// Parse input from E621Config and create queries
     pub async fn parse_input(&self) -> QueryPlannerResult<Vec<Query>> {
         // Get the e621 config
@@ -212,22 +304,24 @@ impl QueryPlanner {
 
         let mut queries = Vec::new();
 
-        // Process tags
+        // Process tags (each tag as its own query to avoid zero-result combinations and to mirror v2 behavior)
         if !e621_config.query.tags.is_empty() {
-            let id = Uuid::new_v4();
-            let tags = e621_config.query.tags.clone();
-            let query = Query {
-                id,
-                tags,
-                priority: 1,
-            };
-            queries.push(query);
+            for tag in &e621_config.query.tags {
+                let id = Uuid::new_v4();
+                let tags = vec![tag.clone()];
+                let query = Query {
+                    id,
+                    tags,
+                    priority: 1,
+                };
+                queries.push(query);
+            }
         }
 
         // Process artists
         for artist in &e621_config.query.artists {
             let id = Uuid::new_v4();
-            let tags = vec![format!("artist:{}", artist)];
+            let tags = vec![artist.clone()]; // Use artist name directly, not with artist: prefix
             let query = Query {
                 id,
                 tags,
@@ -394,9 +488,21 @@ impl QueryPlanner {
         let app_config = self.config_manager.get_app_config()
             .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
 
-        // Get the rules config
-        let rules_config = self.config_manager.get_rules_config()
+        // Get the e621 config to fetch user blacklist
+        let e621_config = self.config_manager.get_e621_config()
             .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
+
+        // Fetch user's blacklisted tags from E621 API
+        let api_blacklisted_tags = if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty() 
+            && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
+            self.fetch_user_blacklist(&e621_config.auth.username).await.unwrap_or_else(|e| {
+                warn!("Failed to fetch user blacklist from API: {}", e);
+                Vec::new()
+            })
+        } else {
+            info!("No valid credentials provided, proceeding without blacklist filtering");
+            Vec::new()
+        };
 
         // Create a queue for download jobs
         let mut jobs = VecDeque::new();
@@ -442,14 +548,14 @@ impl QueryPlanner {
                     continue;
                 }
 
-                // Check blacklist and whitelist
+                // Check blacklist using API tags
                 let all_tags = self.collect_all_tags(&post);
                 let artists = post.tags.artist.clone();
 
-                // Check if the post is blacklisted
-                let is_blacklisted = self.is_blacklisted(&all_tags, &rules_config);
+                // Check if the post is blacklisted using API blacklist
+                let is_blacklisted = self.is_blacklisted_by_api(&all_tags, &api_blacklisted_tags);
                 if is_blacklisted {
-                    debug!("Skipping post {} (blacklisted)", post.id);
+                    debug!("Skipping post {} (blacklisted by user's E621 blacklist)", post.id);
                     continue;
                 }
 
@@ -523,29 +629,20 @@ impl QueryPlanner {
         all_tags
     }
 
-    /// Check if a post is blacklisted
-    fn is_blacklisted(&self, tags: &[String], rules_config: &RulesConfig) -> bool {
-        debug!("Checking blacklist for tags: {:?}", tags);
-        debug!("Blacklist contains: {:?}", rules_config.blacklist.tags);
-        debug!("Whitelist contains: {:?}", rules_config.whitelist.tags);
+    /// Check if a post is blacklisted using E621 API blacklist
+    fn is_blacklisted_by_api(&self, tags: &[String], api_blacklisted_tags: &[String]) -> bool {
+        debug!("Checking API blacklist for tags: {:?}", tags);
+        debug!("API blacklist contains: {:?}", api_blacklisted_tags);
         
-        // Check if any tag is in the whitelist
+        // Check if any tag matches the user's blacklist from E621
         for tag in tags {
-            if rules_config.whitelist.tags.contains(tag) {
-                debug!("Post whitelisted by tag: {}", tag);
-                return false;
-            }
-        }
-
-        // Check if any tag is in the blacklist
-        for tag in tags {
-            if rules_config.blacklist.tags.contains(tag) {
-                debug!("Post blacklisted by tag: {}", tag);
+            if api_blacklisted_tags.contains(tag) {
+                debug!("Post blacklisted by API tag: {}", tag);
                 return true;
             }
         }
 
-        debug!("Post not blacklisted");
+        debug!("Post not blacklisted by API");
         false
     }
 
