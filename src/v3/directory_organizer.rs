@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::fs;
 
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::info;
 
-use crate::v3::{DownloadJob, ConfigManager, AppConfig};
+use crate::v3::{DownloadJob, AppConfig};
 
 /// Error types for directory organization
 #[derive(Error, Debug)]

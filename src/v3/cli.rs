@@ -67,6 +67,7 @@ pub enum MainMenuOption {
     SearchCollections,
     SearchPosts,
     ToggleFavorites,
+    AddQuery,
     EditQuery,
     StartDownload,
     ResumeDownloads,
@@ -88,6 +89,7 @@ impl MainMenuOption {
             MainMenuOption::SearchCollections,
             MainMenuOption::SearchPosts,
             MainMenuOption::ToggleFavorites,
+            MainMenuOption::AddQuery,
             MainMenuOption::EditQuery,
             MainMenuOption::StartDownload,
             MainMenuOption::ResumeDownloads,
@@ -109,6 +111,7 @@ impl MainMenuOption {
             MainMenuOption::SearchCollections => "Search by collections",
             MainMenuOption::SearchPosts => "Search by posts",
             MainMenuOption::ToggleFavorites => "Toggle download favorites",
+            MainMenuOption::AddQuery => "Add new query",
             MainMenuOption::EditQuery => "Edit queries",
             MainMenuOption::StartDownload => "Start download",
             MainMenuOption::ResumeDownloads => "Resume incomplete downloads",
@@ -212,6 +215,7 @@ impl CliManager {
                 MainMenuOption::SearchCollections => self.search_collections().await?,
                 MainMenuOption::SearchPosts => self.search_posts().await?,
                 MainMenuOption::ToggleFavorites => self.toggle_favorites().await?,
+                MainMenuOption::AddQuery => self.add_query().await?,
                 MainMenuOption::EditQuery => self.edit_query().await?,
                 MainMenuOption::StartDownload => self.start_download().await?,
                 MainMenuOption::ResumeDownloads => self.resume_downloads().await?,
@@ -767,7 +771,7 @@ impl CliManager {
         }
         
         // Initialize orchestrator and download engine
-        let orchestrator = match init_orchestrator(config_manager.clone()).await {
+        let _orchestrator = match init_orchestrator(config_manager.clone()).await {
             Ok(o) => o,
             Err(e) => {
                 println!("{} Failed to initialize orchestrator: {}", style("✗").red(), e);
@@ -2795,7 +2799,6 @@ impl CliManager {
     
     /// Helper function to fetch tag search results
     async fn fetch_tag_search_results(&self, search_term: &str, max_results: usize) -> CliResult<Vec<(String, crate::v3::query_planner::TagInfo)>> {
-        use crate::v3::orchestration::QueryQueue;
 
         // Initialize the orchestrator and query planner
         let config_manager = match init_config(&self.config_dir).await {
@@ -2847,7 +2850,6 @@ impl CliManager {
 
     /// Helper function to fetch artist search results
     async fn fetch_artist_search_results(&self, search_term: &str, max_results: usize) -> CliResult<Vec<(String, crate::v3::query_planner::ArtistInfo)>> {
-        use crate::v3::orchestration::QueryQueue;
 
         // Initialize the orchestrator and query planner
         let config_manager = match init_config(&self.config_dir).await {
@@ -2897,163 +2899,6 @@ impl CliManager {
         }
     }
 
-    /// Helper function to display tag search results
-    async fn display_tag_search_results(&self, search_term: &str, max_results: usize) -> CliResult<Vec<String>> {
-        use crate::v3::orchestration::QueryQueue;
-
-        // Initialize the orchestrator and query planner
-        let config_manager = match init_config(&self.config_dir).await {
-            Ok(cm) => Arc::new(cm),
-            Err(e) => {
-                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        let orchestrator = match init_orchestrator(config_manager.clone()).await {
-            Ok(o) => o,
-            Err(e) => {
-                println!("{} Failed to initialize orchestrator: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        let hash_manager = match init_hash_manager(config_manager.clone()).await {
-            Ok(hm) => hm,
-            Err(e) => {
-                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
-            Ok(qp) => qp,
-            Err(e) => {
-                println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        println!("{} Searching for tags matching: '{}'", style("🔍").cyan(), search_term);
-
-        // Search for tags
-        match query_planner.search_tags(search_term, max_results as u32).await {
-            Ok(tags) => {
-                if tags.is_empty() {
-                    println!("{}", style("No matching tags found.").yellow());
-                    return Ok(Vec::new());
-                }
-
-                println!("{} Found {} matching tags:", style("✓").green(), tags.len());
-                println!();
-
-                let mut selected_tags = Vec::new();
-                // Display each tag with details
-                for (i, tag) in tags.iter().enumerate() {
-                    let category_name = match tag.category {
-                        0 => "General",
-                        1 => "Artist", 
-                        3 => "Character",
-                        4 => "Species",
-                        5 => "Meta",
-                        _ => "Other",
-                    };
-                    
-                    println!("{} {}", 
-                        style(&format!("{}.", i + 1)).bold(), 
-                        style(&tag.name).cyan());
-                    println!("   Category: {} | Posts: {}", category_name, tag.post_count);
-                    println!();
-                    
-                    selected_tags.push(tag.name.clone());
-                }
-
-                Ok(selected_tags)
-            },
-            Err(e) => {
-                println!("{} Tag search failed: {}", style("✗").red(), e);
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    /// Helper function to display artist search results
-    async fn display_artist_search_results(&self, search_term: &str, max_results: usize) -> CliResult<Vec<String>> {
-        use crate::v3::orchestration::QueryQueue;
-
-        // Initialize the orchestrator and query planner
-        let config_manager = match init_config(&self.config_dir).await {
-            Ok(cm) => Arc::new(cm),
-            Err(e) => {
-                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        let orchestrator = match init_orchestrator(config_manager.clone()).await {
-            Ok(o) => o,
-            Err(e) => {
-                println!("{} Failed to initialize orchestrator: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        let hash_manager = match init_hash_manager(config_manager.clone()).await {
-            Ok(hm) => hm,
-            Err(e) => {
-                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
-            Ok(qp) => qp,
-            Err(e) => {
-                println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
-                return Ok(Vec::new());
-            }
-        };
-
-        println!("{} Searching for artists matching: '{}'", style("🔍").cyan(), search_term);
-
-        // Search for artists
-        match query_planner.search_artists(search_term, max_results as u32).await {
-            Ok(artists) => {
-                if artists.is_empty() {
-                    println!("{}", style("No matching artists found.").yellow());
-                    return Ok(Vec::new());
-                }
-
-                println!("{} Found {} matching artists:", style("✓").green(), artists.len());
-                println!();
-
-                let mut selected_artists = Vec::new();
-                // Display each artist with details
-                for (i, artist) in artists.iter().enumerate() {
-                    println!("{} {}", 
-                        style(&format!("{}.", i + 1)).bold(), 
-                        style(&artist.name).cyan());
-                    println!("   Status: {} | Other names: {}", 
-                        if artist.is_active { "Active" } else { "Inactive" },
-                        if artist.other_names.is_empty() {
-                            "None".to_string()
-                        } else {
-                            artist.other_names.join(", ")
-                        }
-                    );
-                    println!();
-                    
-                    selected_artists.push(artist.name.clone());
-                }
-
-                Ok(selected_artists)
-            },
-            Err(e) => {
-                println!("{} Artist search failed: {}", style("✗").red(), e);
-                Ok(Vec::new())
-            }
-        }
-    }
 
     /// Scan directory recursively for verification
     async fn scan_directory_for_verification(

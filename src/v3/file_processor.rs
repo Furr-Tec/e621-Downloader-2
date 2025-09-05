@@ -15,7 +15,7 @@ use blake3::Hasher as Blake3Hasher;
 use parking_lot::RwLock;
 use r2d2;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::{Result as SqliteResult};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, instrument, warn};

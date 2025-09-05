@@ -7,23 +7,23 @@
 //! 4. Using notify crate to watch directories if available
 //! 5. Rebuilding metadata if --verify-disk flag is passed
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher as Blake3Hasher;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use notify::event::ModifyKind;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::task;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, warn};
 use walkdir::WalkDir;
 
 use crate::v3::{

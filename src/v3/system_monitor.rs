@@ -7,18 +7,18 @@
 //! 4. Optionally reducing concurrency dynamically
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use sysinfo::System;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info};
 
 use crate::v3::{
     ConfigManager,
-    DownloadEngine, DownloadEngineConfig,
+    DownloadEngine,
 };
 
 /// Error types for system monitoring
@@ -221,7 +221,7 @@ impl SystemMonitor {
     fn calculate_metrics(
         system: &Arc<RwLock<System>>,
         thresholds: &ResourceThresholds,
-        download_engine: &Arc<DownloadEngine>,
+        _download_engine: &Arc<DownloadEngine>,
     ) -> ResourceMetrics {
         let sys = system.read();
 
@@ -322,7 +322,7 @@ pub async fn init_system_monitor(
     config_manager: Arc<ConfigManager>,
 ) -> SystemMonitorResult<Arc<SystemMonitor>> {
     // Get the app config
-    let app_config = config_manager.get_app_config()
+    let _app_config = config_manager.get_app_config()
         .map_err(|e| SystemMonitorError::Config(e.to_string()))?;
 
     // Initialize the download engine

@@ -62,6 +62,7 @@ pub enum DatabaseError {
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
 
 /// Download record from the database
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DownloadRecord {
     pub post_id: u32,
@@ -75,7 +76,8 @@ pub struct DownloadRecord {
 }
 
 /// Download statistics
-#[derive(Debug, Clone)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
 pub struct DownloadStatistics {
     pub total_downloads: u64,
     pub total_size_bytes: u64,

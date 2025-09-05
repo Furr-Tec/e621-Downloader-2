@@ -29,7 +29,7 @@ use crate::v3::{
     ConfigManager,
     DownloadJob,
     BlacklistHandler,
-    DirectoryOrganizer, ContentType, init_directory_organizer,
+    DirectoryOrganizer, init_directory_organizer,
     Database, init_database,
 };
 
@@ -62,6 +62,7 @@ pub enum DownloadError {
 pub type DownloadResult<T> = Result<T, DownloadError>;
 
 /// Status of a download
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadStatus {
     Pending,
@@ -72,6 +73,7 @@ pub enum DownloadStatus {
 }
 
 /// Download task
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DownloadTask {
     pub job: DownloadJob,
@@ -130,6 +132,7 @@ impl Default for ConnectionPoolConfig {
 }
 
 /// Connection pool metrics
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionPoolMetrics {
     /// Total connections created
@@ -488,6 +491,7 @@ impl DownloadEngine {
     }
 
     /// Queue multiple download jobs
+    #[allow(dead_code)]
     pub async fn queue_jobs(&self, jobs: Vec<DownloadJob>) -> DownloadResult<()> {
         for job in jobs {
             self.queue_job(job).await?;
@@ -502,11 +506,13 @@ impl DownloadEngine {
     }
 
     /// Get the current concurrency setting
+    #[allow(dead_code)]
     pub async fn get_concurrency(&self) -> usize {
         *self.current_concurrency.lock().await
     }
 
     /// Get the original concurrency setting
+    #[allow(dead_code)]
     pub async fn get_original_concurrency(&self) -> usize {
         *self.original_concurrency.lock().await
     }
@@ -740,7 +746,7 @@ impl DownloadEngine {
         stats: Arc<Mutex<DownloadStats>>,
     ) -> DownloadResult<()> {
         // Get the content length if available
-        let content_length = response.content_length().unwrap_or(0);
+        let _content_length = response.content_length().unwrap_or(0);
 
         // Create the file
         let mut file = File::create(file_path).await?;
@@ -754,7 +760,7 @@ impl DownloadEngine {
             file.write_all(&chunk).await?;
 
             // Update the bytes downloaded
-            bytes_downloaded += chunk.len() as u64;
+            let _ = bytes_downloaded + chunk.len() as u64; // Track bytes for future use
 
             // Update the stats
             let mut stats = stats.lock().await;

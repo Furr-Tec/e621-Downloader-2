@@ -7,7 +7,7 @@
 //! 4. Ensures orderly startup/shutdown with all threads joining cleanly
 
 use std::fs::{File, OpenOptions};
-use std::io::{Error as IoError, Read, Write};
+use std::io::{Error as IoError, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Uuid;
 
-use crate::v3::{AppConfig, ConfigManager, DownloadEngine, DownloadJob, init_download_engine};
+use crate::v3::{AppConfig, ConfigManager};
 
 /// Error types for the orchestration layer
 #[derive(Error, Debug)]
@@ -179,7 +179,7 @@ impl Scheduler {
         let join_set = self.join_set.clone();
 
         // Spawn the scheduler task
-        let handle: tokio::task::JoinHandle<Result<(), OrchestratorError>> = tokio::spawn(async move {
+        let _handle: tokio::task::JoinHandle<Result<(), OrchestratorError>> = tokio::spawn(async move {
             info!("Scheduler started");
 
             loop {
@@ -200,7 +200,7 @@ impl Scheduler {
 
                         // Process the query in a separate task
                         let queue_clone = queue.clone();
-                        let config_clone = config.clone();
+                        let _config_clone = config.clone();
                         let task = tokio::spawn(async move {
                             // Process the query
                             info!("Processing query: {:?}", query);

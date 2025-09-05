@@ -1,6 +1,6 @@
 [auth]
-username = "your_username"
-api_key = "your_api_key_here"
+username = ""
+api_key = ""
 
 [options]
 download_favorites = true
@@ -8,13 +8,17 @@ safe_mode = false
 
 [query]
 tags = [
-    "femboy",
-    "tomboy",
-    "cum",
+    "wolf",
+    "muscle",
+    "solo",
+    "femboys_and_firearms",
+    "femboy_rimming",
 ]
 artists = [
     "nekoyasha",
     "dogbreath",
+    "angiewolfnsfw",
+    "angiewolf",
 ]
 pools = [
     12345,

@@ -7,14 +7,11 @@
 //! 4. Queuing tasks into a VecDeque or channel
 //! 5. Deduplicating posts using in-memory and persistent hash store
 
-use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
 use reqwest::{Client, StatusCode};
-use rusqlite::{Connection, Result as SqliteResult};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::time::sleep;
@@ -573,6 +570,7 @@ impl QueryPlanner {
     }
 
     /// Process a query and create jobs
+    #[allow(dead_code)]
     pub async fn process_query(&self, query: &Query) -> QueryPlannerResult<QueryPlan> {
         // Create a query plan
         let plan = self.create_query_plan(query).await?;

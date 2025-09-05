@@ -5,7 +5,6 @@ use std::env;
 use anyhow::Error;
 use tokio;
 
-mod program;
 mod v3;
 
 fn main() -> Result<(), Error> {
@@ -18,7 +17,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_cli_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::cli_example::cli_example().await?;
+                    v3::cli_runner::cli_example().await?;
                     Ok(())
                 }
 
@@ -29,7 +28,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_orchestration_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::orchestration_example::orchestration_example().await?;
+                    v3::orchestration_runner::orchestration_example().await?;
                     Ok(())
                 }
 
@@ -40,7 +39,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_query_planner_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::query_planner_example::query_planner_example().await?;
+                    v3::query_planner_runner::query_planner_example().await?;
                     Ok(())
                 }
 
@@ -51,7 +50,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_download_engine_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::download_engine_example::download_engine_example().await?;
+                    v3::download_engine_runner::download_engine_example().await?;
                     Ok(())
                 }
 
@@ -62,7 +61,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_file_processor_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::file_processor_example::file_processor_example().await?;
+                    v3::file_processor_runner::file_processor_example().await?;
                     Ok(())
                 }
 
@@ -73,7 +72,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_metadata_store_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::metadata_store_example::metadata_store_example().await?;
+                    v3::metadata_store_runner::metadata_store_example().await?;
                     Ok(())
                 }
 
@@ -84,7 +83,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_blacklist_handling_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::blacklist_handling_example::blacklist_handling_example().await?;
+                    v3::blacklist_handler_runner::blacklist_handling_example().await?;
                     Ok(())
                 }
 
@@ -95,7 +94,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_disk_verifier_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::disk_verifier_example::disk_verifier_example().await?;
+                    v3::disk_verifier_runner::disk_verifier_example().await?;
                     Ok(())
                 }
 
@@ -106,7 +105,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_system_monitor_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::system_monitor_example::system_monitor_example().await?;
+                    v3::system_monitor_runner::system_monitor_example().await?;
                     Ok(())
                 }
 
@@ -117,7 +116,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_logger_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::logger_example::logger_example().await?;
+                    v3::logger_runner::logger_example().await?;
                     Ok(())
                 }
 
@@ -128,7 +127,7 @@ fn main() -> Result<(), Error> {
                 #[tokio::main]
                 async fn run_session_manager_main() -> Result<(), Error> {
                     initialize_logger().await;
-                    v3::session_manager_example::session_manager_example().await?;
+                    v3::session_manager_runner::session_manager_example().await?;
                     Ok(())
                 }
 
@@ -157,7 +156,7 @@ fn main() -> Result<(), Error> {
         #[tokio::main]
         async fn run_default_cli() -> Result<(), Error> {
             initialize_logger().await;
-            v3::cli_example::cli_example().await?;
+            v3::cli_runner::cli_example().await?;
             Ok(())
         }
 
@@ -228,9 +227,3 @@ async fn initialize_logger() {
     }
 }
 
-/// Sets up graceful shutdown handling to ensure logs are flushed on exit
-fn setup_shutdown_handler() -> Result<(), Error> {
-    // For now, just ensure the Drop implementation handles flushing
-    // Could be extended with signal handlers if needed
-    Ok(())
-}

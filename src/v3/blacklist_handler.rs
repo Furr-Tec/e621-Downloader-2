@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{Connection, params};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error};
 
 use crate::v3::{
-    ConfigManager, RulesConfig,
-    DownloadJob, FileHash, ProcessedFile,
+    ConfigManager,
+    DownloadJob,
 };
 
 /// Error types for blacklist handling
@@ -155,7 +155,7 @@ impl BlacklistHandler {
     /// Add a blacklisted reject to the database
     pub async fn add_blacklisted_reject(&self, post_id: u32) -> BlacklistHandlerResult<()> {
         // Insert the reject record
-        let mut conn = self.db_connection.lock().await;
+        let conn = self.db_connection.lock().await;
         conn.execute(
             "INSERT OR REPLACE INTO blacklisted_rejects (post_id, deleted_at) VALUES (?1, NULL)",
             params![post_id],
@@ -173,7 +173,7 @@ impl BlacklistHandler {
             .as_secs() as i64;
 
         // Update the deleted_at timestamp
-        let mut conn = self.db_connection.lock().await;
+        let conn = self.db_connection.lock().await;
         conn.execute(
             "UPDATE blacklisted_rejects SET deleted_at = ?1 WHERE post_id = ?2",
             params![now, post_id],
