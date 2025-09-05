@@ -368,6 +368,23 @@ impl FileProcessor {
                 
                 base_dir.join("Tags").join(general_tag)
             },
+            "mixed" => {
+                // Prefer artist folders when artist tags are present; otherwise fall back to a tag folder
+                let artists = job.tags.iter()
+                    .filter(|tag| tag.starts_with("artist:"))
+                    .map(|tag| tag.trim_start_matches("artist:"))
+                    .collect::<Vec<_>>();
+                if !artists.is_empty() {
+                    let artist_name = sanitize_filename(&artists[0]);
+                    base_dir.join("Artists").join(artist_name)
+                } else {
+                    let general_tag = job.tags.iter()
+                        .find(|tag| !tag.starts_with("artist:") && !tag.starts_with("meta:"))
+                        .map(|tag| sanitize_filename(tag))
+                        .unwrap_or_else(|| "untagged".to_string());
+                    base_dir.join("Tags").join(general_tag)
+                }
+            },
             "flat" | _ => {
                 // All files go directly in the download directory
                 base_dir.to_path_buf()

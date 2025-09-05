@@ -576,7 +576,8 @@ impl DownloadEngine {
 
         // Check if the file already exists
         if file_path.exists() {
-            debug!("File already exists: {}", file_path.display());
+            // Quietly acknowledge; planner should have skipped this via hash/db check
+            tracing::trace!("File already exists locally, skipping: {}", file_path.display());
             return Ok(file_path);
         }
 

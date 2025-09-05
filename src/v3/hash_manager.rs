@@ -291,10 +291,99 @@ impl HashManager {
     }
 
     /// Check if a post is already downloaded by either MD5 or post ID
+    /// This method now verifies that the actual file exists on disk
     pub fn contains_either(&self, md5: &str, post_id: u32) -> bool {
         let md5_cache = self.md5_cache.read();
         let post_id_cache = self.post_id_cache.read();
-        md5_cache.contains(md5) || post_id_cache.contains(&post_id)
+        
+        // First check if we have database records
+        let has_md5_record = md5_cache.contains(md5);
+        let has_post_id_record = post_id_cache.contains(&post_id);
+        
+        if !has_md5_record && !has_post_id_record {
+            // No database records at all
+            return false;
+        }
+        
+        // If we have database records, verify the actual file exists on disk
+        if has_md5_record {
+            if let Some(file_path) = self.file_path_cache.read().get(md5) {
+                if file_path.exists() {
+                    debug!("Post with MD5 {} confirmed downloaded (file exists at {})", md5, file_path.display());
+                    return true;
+                } else {
+                    debug!("Post with MD5 {} has database record but file missing at {}", md5, file_path.display());
+                }
+            }
+        }
+        
+        // If MD5 check failed but we have post_id record, try to find the file path via async lookup
+        // For now, we'll be conservative and assume it doesn't exist unless we can verify the file
+        false
+    }
+    
+    /// Check if a post is already downloaded by either MD5 or post ID with async file verification
+    /// This is the more thorough version that can lookup file paths from the database
+    pub async fn contains_either_verified(&self, md5: &str, post_id: u32) -> bool {
+        // First try the fast cache-based check
+        if self.contains_either(md5, post_id) {
+            return true;
+        }
+        
+        // If cache check failed, do a database lookup to find the file path
+        let verification = match self.verify_hash(md5).await {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        
+        if verification.exists {
+            if let Some(file_path) = verification.file_path {
+                let exists = file_path.exists();
+                if exists {
+                    debug!("Post {} (MD5: {}) verified as downloaded via database lookup", post_id, md5);
+                } else {
+                    debug!("Post {} (MD5: {}) has database record but file missing at {}", post_id, md5, file_path.display());
+                }
+                return exists;
+            }
+        }
+        
+        // Try lookup by post_id if MD5 lookup failed
+        let conn = self.db_connection.lock().await;
+        let result = conn.query_row(
+            "SELECT file_path FROM downloads WHERE post_id = ?",
+            [post_id],
+            |row| {
+                let file_path: String = row.get(0)?;
+                Ok(file_path)
+            }
+        );
+        
+        if let Ok(file_path_str) = result {
+            let file_path = std::path::PathBuf::from(file_path_str);
+            let exists = file_path.exists();
+            if exists {
+                debug!("Post {} verified as downloaded via post_id lookup at {}", post_id, file_path.display());
+            } else {
+                debug!("Post {} has database record but file missing at {}", post_id, file_path.display());
+            }
+            return exists;
+        }
+        
+        false
+    }
+    
+    /// Batch check if multiple posts are already downloaded with file verification
+    /// Returns a vector of (post_id, is_downloaded) pairs
+    pub async fn batch_contains_verified(&self, posts: &[(String, u32)]) -> Vec<(u32, bool)> {
+        let mut results = Vec::with_capacity(posts.len());
+        
+        for (md5, post_id) in posts {
+            let is_downloaded = self.contains_either_verified(md5, *post_id).await;
+            results.push((*post_id, is_downloaded));
+        }
+        
+        results
     }
 
     /// Get verification information for a hash

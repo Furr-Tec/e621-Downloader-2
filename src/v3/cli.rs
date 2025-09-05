@@ -10,7 +10,14 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use dialoguer::{theme::ColorfulTheme, Select, Input, Confirm, MultiSelect};
-use console::style;
+use console::style as __console_style;
+
+// Sanitize styled output: strip all non-ASCII (emoji/symbols) before styling
+fn style<S: Into<String>>(s: S) -> console::StyledObject<String> {
+    let raw: String = s.into();
+    let cleaned: String = raw.chars().filter(|c| c.is_ascii()).collect();
+    __console_style(cleaned)
+}
 
 use crate::v3::{
     ConfigManager, ConfigResult, ConfigError,
@@ -393,7 +400,7 @@ impl CliManager {
         let config_manager = match init_config(&self.config_dir).await {
             Ok(cm) => Arc::new(cm),
             Err(e) => {
-                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
+                println!("{} Failed to initialize config manager: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
@@ -402,7 +409,7 @@ impl CliManager {
         let app_config = match config_manager.get_app_config() {
             Ok(config) => config,
             Err(e) => {
-                println!("{} Failed to get app config: {}", style("✗").red(), e);
+                println!("{} Failed to get app config: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
@@ -411,7 +418,7 @@ impl CliManager {
         let e621_config = match config_manager.get_e621_config() {
             Ok(config) => config,
             Err(e) => {
-                println!("{} Failed to get E621 config: {}", style("✗").red(), e);
+                println!("{} Failed to get E621 config: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
@@ -422,49 +429,49 @@ impl CliManager {
         if !download_dir.exists() {
             println!("{} Download directory does not exist: {}", 
                 style("!").yellow(), download_dir.display());
-            println!("{} Creating download directory...", style("▶").blue());
+            println!("{} Creating download directory...", style("").blue());
             
             if let Err(e) = std::fs::create_dir_all(&download_dir) {
-                println!("{} Failed to create download directory: {}", style("✗").red(), e);
+                println!("{} Failed to create download directory: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
             println!("{} Created download directory: {}", 
-                style("✓").green(), download_dir.display());
+                style("").green(), download_dir.display());
         } else {
             println!("{} Download directory verified: {}", 
-                style("✓").green(), download_dir.display());
+                style("").green(), download_dir.display());
         }
         
         // Check and create temp directory
         let temp_dir = Path::new(&app_config.paths.temp_directory);
         if !temp_dir.exists() {
-            println!("{} Creating temp directory...", style("▶").blue());
+            println!("{} Creating temp directory...", style("").blue());
             if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-                println!("{} Failed to create temp directory: {}", style("✗").red(), e);
+                println!("{} Failed to create temp directory: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
             println!("{} Created temp directory: {}", 
-                style("✓").green(), temp_dir.display());
+                style("").green(), temp_dir.display());
         }
         
         // Report blacklist status (now using E621 API)
         println!("{} Blacklist will be fetched from E621 API using your account settings", 
-            style("ℹ").blue());
+            style("").blue());
         
         // Check credentials
         if e621_config.auth.username == "your_username" || 
            e621_config.auth.api_key == "your_api_key_here" ||
            e621_config.auth.username.is_empty() ||
            e621_config.auth.api_key.is_empty() {
-            println!("{} No valid E621 credentials configured", style("⚠").yellow());
+            println!("{} No valid E621 credentials configured", style("").yellow());
             println!("   Downloads will be attempted without authentication");
             println!("   Some content may be inaccessible");
             println!("   To configure credentials, edit e621.toml");
         } else {
             println!("{} E621 authentication configured for user: {}", 
-                style("✓").green(), e621_config.auth.username);
+                style("").green(), e621_config.auth.username);
         }
         
         // Initialize the orchestrator
@@ -481,17 +488,17 @@ impl CliManager {
         
         match init_orchestrator(config_manager.clone()).await {
             Ok(orchestrator) => {
-                println!("{}", style("✓ Orchestrator initialized").green());
+                println!("{}", style(" Orchestrator initialized").green());
                 
                 // Initialize hash manager
                 println!("{}", style("Initializing hash manager...").cyan());
                 let hash_manager = match init_hash_manager(config_manager.clone()).await {
                     Ok(hm) => {
-                        println!("{}", style("✓ Hash manager initialized").green());
+                        println!("{}", style(" Hash manager initialized").green());
                         hm
                     }
                     Err(e) => {
-                        println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                        println!("{} Failed to initialize hash manager: {}", style("").red(), e);
                         self.press_enter_to_continue()?;
                         return Ok(());
                     }
@@ -501,7 +508,7 @@ impl CliManager {
                 println!("{}", style("Initializing query planner...").cyan());
                 match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
                     Ok(query_planner) => {
-                        println!("{}", style("✓ Query planner initialized").green());
+                        println!("{}", style(" Query planner initialized").green());
                         
                         // Parse input from configuration
                         println!("{}", style("Parsing queries from configuration...").cyan());
@@ -513,13 +520,13 @@ impl CliManager {
                                     return Ok(());
                                 }
                                 
-                                println!("{} Found {} queries", style("✓").green(), queries.len());
+                                println!("{} Found {} queries", style("").green(), queries.len());
                                 
                                 // Initialize download engine
                                 println!("{}", style("Initializing download engine...").cyan());
                                 match init_download_engine(config_manager.clone()).await {
                                     Ok(download_engine) => {
-                                        println!("{}", style("✓ Download engine initialized").green());
+                                        println!("{}", style(" Download engine initialized").green());
                                         
                                         let mut total_jobs = 0;
                                         let mut total_bytes = 0u64;
@@ -527,13 +534,13 @@ impl CliManager {
                         // Process each query
                         for (i, query) in queries.iter().enumerate() {
                             println!("{} Processing query {}/{}: {:?}", 
-                                style("▶").blue(), i + 1, queries.len(), query.tags);
+                                style("").blue(), i + 1, queries.len(), query.tags);
                             
                             match query_planner.create_query_plan(query).await {
                                 Ok(plan) => {
                                     let skipped_count = plan.estimated_post_count - plan.jobs.len() as u32;
                                     
-                                    println!("{} Query plan created:", style("✓").green());
+                                    println!("{} Query plan created:", style("").green());
                                     println!("   Posts found: {}", plan.estimated_post_count);
                                     println!("   New downloads: {}", plan.jobs.len());
                                     if skipped_count > 0 {
@@ -558,40 +565,40 @@ impl CliManager {
                                                            !e621_config.auth.api_key.is_empty() {
                                                             
                                                             println!("{} Executing {} downloads...", 
-                                                                style("▶").blue(), plan.jobs.len());
+                                                                style("").blue(), plan.jobs.len());
                                                             
                                                             // Execute downloads
                                                             for job in &plan.jobs {
                                                                 match download_engine.queue_job(job.clone()).await {
                                                                     Ok(()) => {
                                                                         println!("{} Queued download: {} ({})", 
-                                                                            style("✓").green(), job.post_id, job.md5);
+                                                                            style("").green(), job.post_id, job.md5);
                                                                     }
                                                                     Err(e) => {
                                                                         println!("{} Failed to queue download {}: {}", 
-                                                                            style("✗").red(), job.post_id, e);
+                                                                            style("").red(), job.post_id, e);
                                                                     }
                                                                 }
                                                             }
                                                         } else {
-                                                            println!("{}", style("⚠ Skipping downloads: No valid E621 credentials configured").yellow());
+                                                            println!("{}", style(" Skipping downloads: No valid E621 credentials configured").yellow());
                                                             println!("   Please edit e621.toml and set your username and API key");
                                                         }
                                                     }
                                                     
                                                     // Queue the jobs in orchestrator for tracking
                                                     if let Err(e) = query_planner.queue_jobs(&plan).await {
-                                                        println!("{} Failed to queue jobs: {}", style("✗").red(), e);
+                                                        println!("{} Failed to queue jobs: {}", style("").red(), e);
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    println!("{} Failed to create query plan: {}", style("✗").red(), e);
+                                                    println!("{} Failed to create query plan: {}", style("").red(), e);
                                                 }
                                             }
                                         }
                                         
                                         if total_jobs > 0 {
-                                            println!("{} Download execution completed!", style("✓").green());
+                                            println!("{} Download execution completed!", style("").green());
                                             println!("Total jobs processed: {}", total_jobs);
                                             println!("Total estimated size: {:.1} MB", total_bytes as f64 / 1_048_576.0);
                                         } else {
@@ -599,7 +606,7 @@ impl CliManager {
                                         }
                                     }
                                     Err(e) => {
-                                        println!("{} Failed to initialize download engine: {}", style("✗").red(), e);
+                                        println!("{} Failed to initialize download engine: {}", style("").red(), e);
                                         println!("{}", style("Download planning completed!").green());
                                         println!("{}", style("Note: Download engine initialization failed - only query planning was completed.").yellow());
                                     }
@@ -611,12 +618,12 @@ impl CliManager {
                         }
                     }
                     Err(e) => {
-                        println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
+                        println!("{} Failed to initialize query planner: {}", style("").red(), e);
                     }
                 }
             }
             Err(e) => {
-                println!("{} Failed to initialize orchestrator: {}", style("✗").red(), e);
+                println!("{} Failed to initialize orchestrator: {}", style("").red(), e);
             }
         }
         
@@ -682,7 +689,7 @@ impl CliManager {
         }
         
         // Display incomplete sessions
-        println!("\n{} Found {} incomplete sessions:", style("ℹ").blue(), incomplete_sessions.len());
+                println!("\n{} Found {} incomplete sessions:", style("").blue(), incomplete_sessions.len());
         
         let mut session_display = Vec::new();
         for (i, session) in incomplete_sessions.iter().enumerate() {
@@ -723,7 +730,7 @@ impl CliManager {
         let incomplete_jobs = match session_recovery.get_incomplete_jobs(selected_session.id).await {
             Ok(jobs) => jobs,
             Err(e) => {
-                println!("{} Failed to get incomplete jobs: {}", style("✗").red(), e);
+                println!("{} Failed to get incomplete jobs: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
@@ -733,13 +740,13 @@ impl CliManager {
             println!("{}", style("No incomplete jobs found in this session.").yellow());
             // Mark session as complete if all jobs are done
             if let Err(e) = session_recovery.complete_session(selected_session.id).await {
-                println!("{} Failed to mark session as complete: {}", style("⚠").yellow(), e);
+                println!("{} Failed to mark session as complete: {}", style("").yellow(), e);
             }
             self.press_enter_to_continue()?;
             return Ok(());
         }
         
-        println!("\n{} Found {} incomplete downloads to resume", style("✓").green(), incomplete_jobs.len());
+        println!("\n{} Found {} incomplete downloads to resume", style("").green(), incomplete_jobs.len());
         
         // Ask for confirmation
         if !Confirm::with_theme(&self.theme)
@@ -753,7 +760,7 @@ impl CliManager {
         let _orchestrator = match init_orchestrator(config_manager.clone()).await {
             Ok(o) => o,
             Err(e) => {
-                println!("{} Failed to initialize orchestrator: {}", style("✗").red(), e);
+                println!("{} Failed to initialize orchestrator: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
@@ -779,7 +786,7 @@ impl CliManager {
                 crate::v3::JobStatus::Pending, 
                 None
             ).await {
-                println!("{} Failed to update job status: {}", style("⚠").yellow(), e);
+                println!("{} Failed to update job status: {}", style("").yellow(), e);
             }
             
             // Queue job in download engine
@@ -787,11 +794,11 @@ impl CliManager {
                 Ok(()) => {
                     successful_queues += 1;
                     println!("{} Queued: Post {} ({})", 
-                        style("✓").green(), job.post_id, job.md5);
+                        style("").green(), job.post_id, job.md5);
                 }
                 Err(e) => {
                     println!("{} Failed to queue job {}: {}", 
-                        style("✗").red(), job.post_id, e);
+                        style("").red(), job.post_id, e);
                     
                     // Update job as failed in recovery system
                     if let Err(e) = session_recovery.update_job_status(
@@ -799,7 +806,7 @@ impl CliManager {
                         crate::v3::JobStatus::Failed(e.to_string()), 
                         Some(e.to_string())
                     ).await {
-                        println!("{} Failed to update job status: {}", style("⚠").yellow(), e);
+                        println!("{} Failed to update job status: {}", style("").yellow(), e);
                     }
                 }
             }
@@ -807,11 +814,11 @@ impl CliManager {
         
         if successful_queues > 0 {
             println!("\n{} {} downloads resumed successfully!", 
-                style("✓").green(), successful_queues);
+                style("").green(), successful_queues);
             
             if successful_queues < incomplete_jobs.len() {
                 println!("{} {} downloads failed to queue", 
-                    style("⚠").yellow(), incomplete_jobs.len() - successful_queues);
+                    style("").yellow(), incomplete_jobs.len() - successful_queues);
             }
         } else {
             println!("{}", style("No downloads were successfully queued.").red());
@@ -851,10 +858,11 @@ impl CliManager {
             println!("5. Show duplicate detection stats");
             println!("6. Show database file info");
             println!("7. Clean up database (remove orphaned entries)");
+            println!("8. Reset database (delete all records)");
             println!("0. Back to main menu");
             
             let choice: String = Input::with_theme(&self.theme)
-                .with_prompt("Select option (0-7)")
+                .with_prompt("Select option (0-8)")
                 .interact_text()?;
             
             match choice.trim() {
@@ -866,7 +874,8 @@ impl CliManager {
                 "5" => self.show_duplicate_detection_stats(&db_path).await?,
                 "6" => self.show_database_file_info(&db_path).await?,
                 "7" => self.cleanup_database(&db_path).await?,
-                _ => println!("{}", style("Invalid choice. Please select 0-7.").red()),
+                "8" => self.reset_database(&db_path).await?,
+                _ => println!("{}", style("Invalid choice. Please select 0-8.").red()),
             }
         }
         
@@ -882,7 +891,7 @@ impl CliManager {
         let conn = match Connection::open(db_path) {
             Ok(conn) => conn,
             Err(e) => {
-                println!("{} Failed to open database: {}", style("✗").red(), e);
+                println!("{} Failed to open database: {}", style("").red(), e);
                 return Ok(());
             }
         };
@@ -892,7 +901,7 @@ impl CliManager {
             "SELECT COUNT(*) FROM downloads", [], |row| row.get(0)
         ).unwrap_or(0);
         
-        println!("{} Total downloads recorded: {}", style("📊").blue(), total_downloads);
+        println!("{} Total downloads recorded: {}", style("").blue(), total_downloads);
         
         if total_downloads > 0 {
             // Get earliest and latest downloads
@@ -904,8 +913,8 @@ impl CliManager {
                 "SELECT MAX(downloaded_at) FROM downloads", [], |row| row.get(0)
             ).unwrap_or_else(|_| "Unknown".to_string());
             
-            println!("{} First download: {}", style("📅").blue(), earliest);
-            println!("{} Latest download: {}", style("📅").blue(), latest);
+            println!("{} First download: {}", style("").blue(), earliest);
+            println!("{} Latest download: {}", style("").blue(), latest);
             
             // Get file type distribution
             println!("\n{}", style("File Type Distribution:").cyan());
@@ -928,7 +937,7 @@ impl CliManager {
                         }
                     }
                     Err(e) => {
-                        println!("{} Query failed: {}", style("✗").red(), e);
+                        println!("{} Query failed: {}", style("").red(), e);
                     }
                 }
             }
@@ -947,7 +956,7 @@ impl CliManager {
         let conn = match Connection::open(db_path) {
             Ok(conn) => conn,
             Err(e) => {
-                println!("{} Failed to open database: {}", style("✗").red(), e);
+                println!("{} Failed to open database: {}", style("").red(), e);
                 return Ok(());
             }
         };
@@ -957,7 +966,7 @@ impl CliManager {
         ) {
             Ok(stmt) => stmt,
             Err(e) => {
-                println!("{} Failed to prepare query: {}", style("✗").red(), e);
+                println!("{} Failed to prepare query: {}", style("").red(), e);
                 return Ok(());
             }
         };
@@ -981,7 +990,7 @@ impl CliManager {
                 }
             }
             Err(e) => {
-                println!("{} Query failed: {}", style("✗").red(), e);
+                println!("{} Query failed: {}", style("").red(), e);
             }
         }
         
@@ -1041,7 +1050,7 @@ impl CliManager {
                 }
             }
             Err(e) => {
-                println!("{} Search failed: {}", style("✗").red(), e);
+                println!("{} Search failed: {}", style("").red(), e);
             }
         }
         
@@ -1069,7 +1078,7 @@ impl CliManager {
         let hash_manager = match init_hash_manager(config_manager.clone()).await {
             Ok(hm) => hm,
             Err(e) => {
-                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                println!("{} Failed to initialize hash manager: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
@@ -1101,7 +1110,7 @@ impl CliManager {
                 }
             }
             Err(e) => {
-                println!("{} Search failed: {}", style("✗").red(), e);
+                println!("{} Search failed: {}", style("").red(), e);
             }
         }
         
@@ -1118,7 +1127,7 @@ impl CliManager {
         let conn = match Connection::open(db_path) {
             Ok(conn) => conn,
             Err(e) => {
-                println!("{} Failed to open database: {}", style("✗").red(), e);
+                println!("{} Failed to open database: {}", style("").red(), e);
                 return Ok(());
             }
         };
@@ -1132,12 +1141,12 @@ impl CliManager {
             "SELECT COUNT(*) FROM downloads", [], |row| row.get(0)
         ).unwrap_or(0);
         
-        println!("{} Unique files (MD5): {}", style("🔒").blue(), unique_hashes);
-        println!("{} Total database entries: {}", style("📝").blue(), total_entries);
+        println!("{} Unique files (MD5): {}", style("").blue(), unique_hashes);
+        println!("{} Total database entries: {}", style("").blue(), total_entries);
         
         if total_entries > unique_hashes {
             let duplicates = total_entries - unique_hashes;
-            println!("{} Duplicate entries detected: {}", style("⚠").yellow(), duplicates);
+            println!("{} Duplicate entries detected: {}", style("").yellow(), duplicates);
             
             // Show some duplicate examples
             let mut stmt = conn.prepare(
@@ -1162,7 +1171,7 @@ impl CliManager {
                 }
             }
         } else {
-            println!("{}", style("✓ No duplicate entries found").green());
+            println!("{}", style(" No duplicate entries found").green());
         }
         
         self.press_enter_to_continue()?;
@@ -1176,18 +1185,18 @@ impl CliManager {
         // File size and path
         if let Ok(metadata) = std::fs::metadata(db_path) {
             let size_mb = metadata.len() as f64 / 1_048_576.0;
-            println!("{} Database path: {}", style("📁").blue(), db_path.display());
-            println!("{} Database size: {:.2} MB", style("💾").blue(), size_mb);
+            println!("{} Database path: {}", style("").blue(), db_path.display());
+            println!("{} Database size: {:.2} MB", style("").blue(), size_mb);
             
             if let Ok(modified) = metadata.modified() {
                 if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
                     let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
                         .unwrap_or_else(|| chrono::Utc::now());
-                    println!("{} Last modified: {}", style("📅").blue(), datetime.format("%Y-%m-%d %H:%M:%S UTC"));
+                    println!("{} Last modified: {}", style("").blue(), datetime.format("%Y-%m-%d %H:%M:%S UTC"));
                 }
             }
         } else {
-            println!("{} Could not read database file metadata", style("✗").red());
+            println!("{} Could not read database file metadata", style("").red());
         }
         
         // Database schema info
@@ -1203,7 +1212,7 @@ impl CliManager {
                 if let Ok(rows) = rows {
                     for row in rows {
                         if let Ok(table_name) = row {
-                            println!("  • {}", table_name);
+                            println!("  - {}", table_name);
                         }
                     }
                 }
@@ -1229,7 +1238,7 @@ impl CliManager {
         let conn = match Connection::open(db_path) {
             Ok(conn) => conn,
             Err(e) => {
-                println!("{} Failed to open database: {}", style("✗").red(), e);
+                println!("{} Failed to open database: {}", style("").red(), e);
                 return Ok(());
             }
         };
@@ -1240,15 +1249,65 @@ impl CliManager {
         ).unwrap_or(0);
         
         if removed > 0 {
-            println!("{} Removed {} invalid entries", style("✓").green(), removed);
+            println!("{} Removed {} invalid entries", style("").green(), removed);
         } else {
-            println!("{} No invalid entries found", style("✓").green());
+            println!("{} No invalid entries found", style("").green());
         }
         
         // Vacuum the database to reclaim space
         if conn.execute("VACUUM", []).is_ok() {
-            println!("{} Database optimized", style("✓").green());
+            println!("{} Database optimized", style("").green());
         }
+        
+        self.press_enter_to_continue()?;
+        Ok(())
+    }
+    
+    /// Reset database by deleting all records from core tables
+    async fn reset_database(&self, db_path: &std::path::Path) -> CliResult<()> {
+        println!("\n{}", style("Reset Database").cyan().bold());
+        println!("This will delete ALL records from the database tables (downloads, download_tags, download_artists, file_integrity).\n");
+        
+        if !Confirm::with_theme(&self.theme)
+            .with_prompt("Are you sure you want to permanently reset the database? This cannot be undone.")
+            .default(false)
+            .interact()? {
+            return Ok(());
+        }
+        
+        use rusqlite::Connection;
+        let mut conn = match Connection::open(db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                println!("{} Failed to open database: {}", style("").red(), e);
+                return Ok(());
+            }
+        };
+        
+        // Use a transaction to clear tables atomically
+        {
+            match conn.transaction() {
+                Ok(tx) => {
+                    let _ = tx.execute("DELETE FROM download_tags", []);
+                    let _ = tx.execute("DELETE FROM download_artists", []);
+                    let _ = tx.execute("DELETE FROM file_integrity", []);
+                    let _ = tx.execute("DELETE FROM downloads", []);
+                    if tx.commit().is_ok() {
+                        println!("{} Database tables cleared", style("").green());
+                    } else {
+                        println!("{} Failed to commit database reset", style("").red());
+                    }
+                }
+                Err(_) => println!("{} Failed to start database transaction", style("").red()),
+            }
+        }
+        
+        // VACUUM to reclaim space (outside of transaction scope)
+        let _ = conn.execute("VACUUM", []);
+        println!("{} Database optimized", style("").green());
+        
+        // Suggest restarting caches by informing user
+        println!("Note: In-memory caches will rebuild on next run.");
         
         self.press_enter_to_continue()?;
         Ok(())
@@ -1265,7 +1324,7 @@ impl CliManager {
         let config_manager = match init_config(&self.config_dir).await {
             Ok(cm) => Arc::new(cm),
             Err(e) => {
-                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
+                println!("{} Failed to initialize config manager: {}", style("").red(), e);
                 self.press_enter_to_continue()?;
                 return Ok(());
             }
@@ -1295,7 +1354,7 @@ impl CliManager {
         // Display current system status
         println!("\n{}", style("Current System Status").cyan());
         println!("{} System under load: {}", 
-            if is_under_load { style("⚠").yellow() } else { style("✓").green() },
+            if is_under_load { style("").yellow() } else { style("").green() },
             if is_under_load { style("Yes").red() } else { style("No").green() }
         );
         
@@ -1303,21 +1362,21 @@ impl CliManager {
         println!("\n{}", style("Concurrency Limits & Usage").cyan());
         
         println!("{} Download Concurrency: {}/{} ({:.1}% used)", 
-            if download_usage > 75.0 { style("⚠").yellow() } else { style("ℹ").blue() },
+            if download_usage > 75.0 { style("").yellow() } else { style("").blue() },
             download_limit - download_available, 
             download_limit, 
             download_usage
         );
         
         println!("{} API Concurrency: {}/{} ({:.1}% used)", 
-            if api_usage > 75.0 { style("⚠").yellow() } else { style("ℹ").blue() },
+            if api_usage > 75.0 { style("").yellow() } else { style("").blue() },
             api_limit - api_available, 
             api_limit, 
             api_usage
         );
         
         println!("{} Hash Concurrency: {}/{} ({:.1}% used)", 
-            if hash_usage > 75.0 { style("⚠").yellow() } else { style("ℹ").blue() },
+            if hash_usage > 75.0 { style("").yellow() } else { style("").blue() },
             hash_limit - hash_available, 
             hash_limit, 
             hash_usage
@@ -1327,22 +1386,22 @@ impl CliManager {
         println!("\n{}", style("Performance Metrics").cyan());
         
         println!("{} Average Response Time: {:?}", 
-            if metrics.avg_response_time.as_secs() > 3 { style("⚠").yellow() } else { style("ℹ").blue() },
+            if metrics.avg_response_time.as_secs() > 3 { style("").yellow() } else { style("").blue() },
             metrics.avg_response_time
         );
         
         println!("{} Success Rate: {:.1}%", 
-            if metrics.success_rate < 0.9 { style("⚠").yellow() } else { style("✓").green() },
+            if metrics.success_rate < 0.9 { style("").yellow() } else { style("").green() },
             metrics.success_rate * 100.0
         );
         
         println!("{} Error Rate: {:.1}%", 
-            if metrics.error_rate > 0.1 { style("⚠").yellow() } else { style("✓").green() },
+            if metrics.error_rate > 0.1 { style("").yellow() } else { style("").green() },
             metrics.error_rate * 100.0
         );
         
         println!("{} Throughput: {:.2} requests/sec", 
-            style("ℹ").blue(),
+            style("").blue(),
             metrics.throughput
         );
         
@@ -1350,13 +1409,13 @@ impl CliManager {
         println!("\n{}", style("Recommendations").cyan());
         
         if metrics.error_rate > 0.2 {
-            println!("{} High error rate detected - consider reducing concurrency limits", style("⚠").yellow());
+            println!("{} High error rate detected - consider reducing concurrency limits", style("").yellow());
         } else if metrics.avg_response_time.as_secs() > 5 {
-            println!("{} Slow response times - consider reducing API concurrency", style("⚠").yellow());
+            println!("{} Slow response times - consider reducing API concurrency", style("").yellow());
         } else if !is_under_load && metrics.success_rate > 0.95 {
-            println!("{} System performing well - current limits are optimal", style("✓").green());
+            println!("{} System performing well - current limits are optimal", style("").green());
         } else if is_under_load {
-            println!("{} System under heavy load - downloads are progressing normally", style("ℹ").blue());
+            println!("{} System under heavy load - downloads are progressing normally", style("").blue());
         }
         
         // Show config edit option
@@ -1369,7 +1428,7 @@ impl CliManager {
             
             match concurrency_manager.optimize_concurrency().await {
                 Ok(()) => {
-                    println!("{} Concurrency optimization completed", style("✓").green());
+                    println!("{} Concurrency optimization completed", style("").green());
                     
                     // Show new limits
                     let (new_download, new_api, new_hash) = concurrency_manager.get_current_limits();
@@ -1380,7 +1439,7 @@ impl CliManager {
                     }
                 }
                 Err(e) => {
-                    println!("{} Optimization failed: {}", style("✗").red(), e);
+                    println!("{} Optimization failed: {}", style("").red(), e);
                 }
             }
         }
@@ -1464,7 +1523,7 @@ impl CliManager {
                             println!("{}", style("Configuration saved successfully!").green());
                         }
                         Err(e) => {
-                            println!("{} Failed to save configuration: {}", style("✗").red(), e);
+                            println!("{} Failed to save configuration: {}", style("").red(), e);
                         }
                     }
                     break;
@@ -1925,10 +1984,10 @@ impl CliManager {
         println!("  2. Go to Account → Settings → Blacklisted Tags");
         println!("  3. Configure your blacklist there");
         println!("\n{}", style("Benefits of using E621 API blacklist:").green());
-        println!("  ✓ Synchronized across all your devices");
-        println!("  ✓ Always up-to-date with the latest tag changes");
-        println!("  ✓ Consistent with what you see on the website");
-        println!("  ✓ No need to manually maintain local rules");
+        println!("  Synchronized across all your devices");
+        println!("  Always up-to-date with the latest tag changes");
+        println!("  Consistent with what you see on the website");
+        println!("  No need to manually maintain local rules");
         
         self.press_enter_to_continue()?;
         Ok(())
@@ -1953,27 +2012,27 @@ impl CliManager {
         println!("\n{}", style("Validation results:").cyan());
         
         match app_config_result {
-            Ok(_) => println!("{}", style("✓ Application config is valid").green()),
-            Err(e) => println!("{} {}", style("✗ Application config error:").red(), e),
+            Ok(_) => println!("{}", style(" Application config is valid").green()),
+            Err(e) => println!("{} {}", style(" Application config error:").red(), e),
         }
         
         match e621_config_result {
             Ok(config) => {
-                println!("{}", style("✓ E621 config is valid").green());
+                println!("{}", style(" E621 config is valid").green());
                 
                 // Additional validation for e621 config
                 if config.auth.username == "your_username" || config.auth.api_key == "your_api_key_here" {
-                    println!("{}", style("  ⚠ Warning: Default credentials detected").yellow());
+                    println!("{}", style("  Warning: Default credentials detected").yellow());
                 }
                 
                 if config.query.tags.is_empty() {
-                    println!("{}", style("  ⚠ Warning: No tags defined").yellow());
+                    println!("{}", style("  Warning: No tags defined").yellow());
                 }
             },
-            Err(e) => println!("{} {}", style("✗ E621 config error:").red(), e),
+            Err(e) => println!("{} {}", style(" E621 config error:").red(), e),
         }
         
-        println!("{}", style("ℹ Rules config is deprecated - using E621 API blacklist").blue());
+        println!("{}", style(" Rules config is deprecated - using E621 API blacklist").blue());
         
         self.press_enter_to_continue()?;
         Ok(())
@@ -1995,7 +2054,7 @@ impl CliManager {
         let download_dir = Path::new(&app_config.paths.download_directory);
         if !download_dir.exists() {
             println!("{} Download directory does not exist: {}", 
-                style("✗").red(), download_dir.display());
+                style("").red(), download_dir.display());
             self.press_enter_to_continue()?;
             return Ok(());
         }
@@ -2015,12 +2074,12 @@ impl CliManager {
             Ok(()) => {
                 // Display results
                 println!("\n{}", style("Verification Results").cyan().bold());
-                println!("{} Total files scanned: {}", style("📁").cyan(), total_files);
-                println!("{} Verified files: {}", style("✓").green(), verified_files);
-                println!("{} Total archive size: {:.2} MB", style("💾").blue(), total_size as f64 / 1_048_576.0);
+                println!("{} Total files scanned: {}", style("").cyan(), total_files);
+                println!("{} Verified files: {}", style("").green(), verified_files);
+                println!("{} Total archive size: {:.2} MB", style("").blue(), total_size as f64 / 1_048_576.0);
                 
                 if !corrupted_files.is_empty() {
-                    println!("\n{} {} corrupted files found:", style("⚠").yellow(), corrupted_files.len());
+                    println!("\n{} {} corrupted files found:", style("").yellow(), corrupted_files.len());
                     for (i, file) in corrupted_files.iter().enumerate().take(10) {
                         println!("  {}: {}", i + 1, file);
                     }
@@ -2030,7 +2089,7 @@ impl CliManager {
                 }
                 
                 if !missing_files.is_empty() {
-                    println!("\n{} {} missing files detected:", style("✗").red(), missing_files.len());
+                    println!("\n{} {} missing files detected:", style("").red(), missing_files.len());
                     for (i, file) in missing_files.iter().enumerate().take(10) {
                         println!("  {}: {}", i + 1, file);
                     }
@@ -2046,25 +2105,25 @@ impl CliManager {
                 };
                 
                 println!("\n{} Archive integrity: {:.1}%", 
-                    if integrity_pct >= 95.0 { style("✓").green() } 
-                    else if integrity_pct >= 80.0 { style("⚠").yellow() }
-                    else { style("✗").red() },
+                    if integrity_pct >= 95.0 { style("").green() } 
+                    else if integrity_pct >= 80.0 { style("").yellow() }
+                    else { style("").red() },
                     integrity_pct
                 );
                 
                 if integrity_pct < 100.0 {
                     println!("\n{}", style("Recommendations:").yellow());
                     if !corrupted_files.is_empty() {
-                        println!("• Re-download corrupted files");
+                        println!("Re-download corrupted files");
                     }
                     if !missing_files.is_empty() {
-                        println!("• Check for incomplete downloads");
+                        println!("Check for incomplete downloads");
                     }
-                    println!("• Run verification again after cleanup");
+                    println!("Run verification again after cleanup");
                 }
             }
             Err(e) => {
-                println!("{} Verification failed: {}", style("✗").red(), e);
+                println!("{} Verification failed: {}", style("").red(), e);
             }
         }
         
@@ -2078,7 +2137,7 @@ impl CliManager {
         
         // First, make sure all config files exist
         if let Err(e) = self.config_manager.create_default_configs() {
-            println!("{} Failed to create config files: {}", style("✗").red(), e);
+            println!("{} Failed to create config files: {}", style("").red(), e);
             return Err(e);
         }
         
@@ -2090,17 +2149,17 @@ impl CliManager {
                     println!("{}", style("Validating E621 credentials...").cyan());
                     match test_config_credentials(&config).await {
                         Ok(message) => {
-                            println!("{} {}", style("✓").green(), message);
+                            println!("{} {}", style("").green(), message);
                             return Ok(());
                         }
                         Err(e) => {
-                            println!("{} Credential validation failed: {}", style("⚠").yellow(), e);
+                            println!("{} Credential validation failed: {}", style("").yellow(), e);
                             println!("{}", style("You'll need to update your credentials.").yellow());
                         }
                     }
                 }
                 Err(e) => {
-                    println!("{} Failed to load E621 config: {}", style("✗").red(), e);
+                    println!("{} Failed to load E621 config: {}", style("").red(), e);
                 }
             }
         }
@@ -2151,7 +2210,7 @@ impl CliManager {
             println!("{}", style("Validating credentials...").cyan());
             match validate_e621_credentials(&username, &api_key).await {
                 Ok(message) => {
-                    println!("{} {}", style("✓").green(), message);
+                    println!("{} {}", style("").green(), message);
                     
                     // Save the credentials
                     match self.save_credentials(&username, &api_key).await {
@@ -2160,13 +2219,13 @@ impl CliManager {
                             return Ok(());
                         }
                         Err(e) => {
-                            println!("{} Failed to save credentials: {}", style("✗").red(), e);
+                            println!("{} Failed to save credentials: {}", style("").red(), e);
                             return Err(e);
                         }
                     }
                 }
                 Err(e) => {
-                    println!("{} {}", style("✗").red(), e);
+                    println!("{} {}", style("").red(), e);
                     
                     if !Confirm::with_theme(&self.theme)
                         .with_prompt("Would you like to try again?")
@@ -2234,7 +2293,7 @@ impl CliManager {
                     format!("{} ({}|{})", tag, category_name, info.post_count)
                 }).collect();
                 
-                println!("\n{} Found {} matching tags", style("✓").green(), tag_results.len());
+                println!("\n{} Found {} matching tags", style("").green(), tag_results.len());
                 
                 // Let user select which tags to add
                 let selections = MultiSelect::with_theme(&self.theme)
@@ -2257,7 +2316,7 @@ impl CliManager {
                         if let Err(e) = self.config_manager.save_e621_config(&e621_config) {
                             println!("{}: {}", style("Error saving config").red().bold(), e);
                         } else {
-                            println!("{} {} tags added successfully!", style("✓").green(), added_count);
+                            println!("{} {} tags added successfully!", style("").green(), added_count);
                         }
                     } else {
                         println!("{}", style("No new tags were added (already in saved tags).").yellow());
@@ -2310,7 +2369,7 @@ impl CliManager {
                     format!("{} ({}|{})", artist, status, other_names)
                 }).collect();
                 
-                println!("\n{} Found {} matching artists", style("✓").green(), artist_results.len());
+                println!("\n{} Found {} matching artists", style("").green(), artist_results.len());
                 
                 // Let user select which artists to add
                 let selections = MultiSelect::with_theme(&self.theme)
@@ -2333,7 +2392,7 @@ impl CliManager {
                         if let Err(e) = self.config_manager.save_e621_config(&e621_config) {
                             println!("{}: {}", style("Error saving config").red().bold(), e);
                         } else {
-                            println!("{} {} artists added successfully!", style("✓").green(), added_count);
+                            println!("{} {} artists added successfully!", style("").green(), added_count);
                         }
                     } else {
                         println!("{}", style("No new artists were added (already in saved artists).").yellow());
@@ -2380,7 +2439,7 @@ impl CliManager {
                     }
                 }
                 Err(_) => {
-                    println!("{} Invalid pool ID: {}", style("⚠").yellow(), pool_str);
+                    println!("{} Invalid pool ID: {}", style("").yellow(), pool_str);
                 }
             }
         }
@@ -2432,7 +2491,7 @@ impl CliManager {
                     }
                 }
                 Err(_) => {
-                    println!("{} Invalid collection ID: {}", style("⚠").yellow(), collection_str);
+                    println!("{} Invalid collection ID: {}", style("").yellow(), collection_str);
                 }
             }
         }
@@ -2484,7 +2543,7 @@ impl CliManager {
                     }
                 }
                 Err(_) => {
-                    println!("{} Invalid post ID: {}", style("⚠").yellow(), post_str);
+                    println!("{} Invalid post ID: {}", style("").yellow(), post_str);
                 }
             }
         }
@@ -2529,7 +2588,7 @@ impl CliManager {
         };
         
         println!("{} Download favorites is currently: {}", 
-            style("ℹ").blue(), 
+            style("").blue(), 
             if e621_config.options.download_favorites {
                 style(status_text).green()
             } else {
@@ -2545,7 +2604,7 @@ impl CliManager {
         
         if !has_valid_creds {
             println!("{} Note: You need valid E621 credentials to download favorites", 
-                style("⚠").yellow());
+                style("").yellow());
             println!("   Configure credentials first in the main menu or edit e621.toml");
         }
         
@@ -2564,7 +2623,7 @@ impl CliManager {
                 Ok(()) => {
                     let new_status = if new_value { "enabled" } else { "disabled" };
                     println!("{} Download favorites {}", 
-                        style("✓").green(), 
+                        style("").green(), 
                         if new_value {
                             style(new_status).green()
                         } else {
@@ -2579,7 +2638,7 @@ impl CliManager {
                     }
                 }
                 Err(e) => {
-                    println!("{} Failed to save config: {}", style("✗").red(), e);
+                    println!("{} Failed to save config: {}", style("").red(), e);
                 }
             }
         } else {
@@ -2597,7 +2656,7 @@ impl CliManager {
         let config_manager = match init_config(&self.config_dir).await {
             Ok(cm) => Arc::new(cm),
             Err(e) => {
-                println!("{} Failed to initialize config manager: {}", style("✗").red(), e);
+                println!("{} Failed to initialize config manager: {}", style("").red(), e);
                 return Ok(Vec::new());
             }
         };
@@ -2605,7 +2664,7 @@ impl CliManager {
         let orchestrator = match init_orchestrator(config_manager.clone()).await {
             Ok(o) => o,
             Err(e) => {
-                println!("{} Failed to initialize orchestrator: {}", style("✗").red(), e);
+                println!("{} Failed to initialize orchestrator: {}", style("").red(), e);
                 return Ok(Vec::new());
             }
         };
@@ -2613,7 +2672,7 @@ impl CliManager {
         let hash_manager = match init_hash_manager(config_manager.clone()).await {
             Ok(hm) => hm,
             Err(e) => {
-                println!("{} Failed to initialize hash manager: {}", style("✗").red(), e);
+                println!("{} Failed to initialize hash manager: {}", style("").red(), e);
                 return Ok(Vec::new());
             }
         };
@@ -2621,7 +2680,7 @@ impl CliManager {
         let query_planner = match init_query_planner(config_manager.clone(), orchestrator.get_job_queue().clone(), hash_manager).await {
             Ok(qp) => qp,
             Err(e) => {
-                println!("{} Failed to initialize query planner: {}", style("✗").red(), e);
+                println!("{} Failed to initialize query planner: {}", style("").red(), e);
                 return Ok(Vec::new());
             }
         };
@@ -2635,7 +2694,7 @@ impl CliManager {
                 Ok(results)
             },
             Err(e) => {
-                println!("{} Tag search failed: {}", style("✗").red(), e);
+                println!("{} Tag search failed: {}", style("").red(), e);
                 Ok(Vec::new())
             }
         }
@@ -2686,7 +2745,7 @@ impl CliManager {
                 Ok(results)
             },
             Err(e) => {
-                println!("{} Artist search failed: {}", style("✗").red(), e);
+                println!("{} Artist search failed: {}", style("").red(), e);
                 Ok(Vec::new())
             }
         }

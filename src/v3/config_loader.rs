@@ -111,7 +111,8 @@ impl Default for AppConfig {
                 posts_per_page: 320,
                 max_page_number: 750,
                 file_size_cap: 20_971_520,
-                total_size_cap: 104_857_600,
+                // 0 means unlimited planning-size; jobs are capped only by explicit settings
+                total_size_cap: 0,
                 verify_sample_pct: 10,
             },
             pools: Pools {
@@ -137,7 +138,7 @@ impl Default for AppConfig {
                 check_orphans: true,
             },
             organization: Organization {
-                directory_strategy: "by_tag".to_string(),  // Default to tag-based organization
+                directory_strategy: "mixed".to_string(),  // Default to mixed organization (Artists and Tags)
             },
         }
     }

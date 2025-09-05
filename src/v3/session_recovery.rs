@@ -338,8 +338,9 @@ impl SessionRecovery {
                 md5: row.get(3)?,
                 file_ext: row.get(4)?,
                 file_size: row.get(5)?,
-                tags,
+                tags: tags.clone(),
                 artists: Vec::new(), // Artists not stored in session recovery yet
+                source_query: tags, // Best-effort: use stored tags as source query
                 priority: row.get(7)?,
                 is_blacklisted: row.get(8)?,
             })

@@ -175,8 +175,12 @@ pub struct DownloadJob {
     pub md5: String,
     pub file_ext: String,
     pub file_size: u32,
+    /// All tags collected from the API for this post (including artist:...)
     pub tags: Vec<String>,
+    /// Artist names reported by the API for this post
     pub artists: Vec<String>,
+    /// The original search query that produced this job (used for folder routing)
+    pub source_query: Vec<String>,
     pub priority: usize,
     pub is_blacklisted: bool,
 }
@@ -414,9 +418,13 @@ impl QueryPlanner {
         // Return a high estimate so the query gets processed
         Ok(1000)
     }
-
-    /// Fetch posts for a query with pagination
+    /// Fetch posts for a query with numeric page
     pub async fn fetch_posts(&self, query: &Query, page: u32, limit: u32) -> QueryPlannerResult<Vec<Post>> {
+        self.fetch_posts_with_page_param(query, Some(&page.to_string()), limit).await
+    }
+
+    /// Fetch posts for a query using an optional page parameter (supports cursor pagination like b<id>)
+    async fn fetch_posts_with_page_param(&self, query: &Query, page_param: Option<&str>, limit: u32) -> QueryPlannerResult<Vec<Post>> {
         // Get the e621 config
         let e621_config = self.config_manager.get_e621_config()
             .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
@@ -425,17 +433,20 @@ impl QueryPlanner {
         let app_config = self.config_manager.get_app_config()
             .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
 
-        // Build the tag string and URL encode it
+        // Build the tag string and URL encode it (do not inject order: to match v2 behavior exactly)
         let tag_string = query.tags.join(" ");
         let encoded_tags = urlencoding::encode(&tag_string);
 
-        // Build the URL
-        let url = format!(
-            "https://e621.net/posts.json?limit={}&page={}&tags={}",
-            limit, page, encoded_tags
+        // Build the URL (note: page can be numeric or cursor like b<id>)
+        let mut url = format!(
+            "https://e621.net/posts.json?limit={}&tags={}",
+            limit, encoded_tags
         );
+        if let Some(p) = page_param {
+            url.push_str(&format!("&page={}", p));
+        }
         
-        debug!("API request URL: {}", url);
+        info!("API request URL: {}", url);
 
         // Create a request builder
         let mut request_builder = self.client.get(&url)
@@ -464,7 +475,7 @@ impl QueryPlanner {
             // Wait and retry
             sleep(Duration::from_secs(app_config.rate.retry_backoff_secs as u64)).await;
             // Use Box::pin to avoid infinitely sized future
-            return Box::pin(self.fetch_posts(query, page, limit)).await;
+            return Box::pin(self.fetch_posts_with_page_param(query, page_param, limit)).await;
         }
 
         // Check for other errors
@@ -509,24 +520,26 @@ impl QueryPlanner {
         let mut total_size_bytes = 0u64;
         let mut actual_post_count = 0u32;
 
-        // Calculate pagination parameters
-        let limit = app_config.limits.posts_per_page as u32;
-        let max_pages = app_config.limits.max_page_number as u32;
+        // Pagination parameters
+        let limit = app_config.limits.posts_per_page.min(320) as u32;
+        let max_pages = app_config.limits.max_page_number as u32; // safety cap
+        let reqs_per_sec = app_config.rate.requests_per_second.max(1) as u64;
+        let sleep_ms = (1000 / reqs_per_sec).max(100);
 
         info!("Creating query plan for: {}", query.tags.join(" "));
 
-        // Fetch posts page by page until we run out or hit limits
-        for page in 1..=max_pages {
-            let posts = self.fetch_posts(query, page, limit).await?;
-            
-            // If no posts returned, we've reached the end
+        // Match v2 behavior: iterate by numeric pages (1..=max_pages)
+        // This avoids edge-cases where cursor pagination under-fetches for some queries.
+        for page_number in 1..=max_pages {
+            let posts = self.fetch_posts(query, page_number, limit).await?;
+
             if posts.is_empty() {
-                info!("No more posts found at page {}", page);
+                info!("No more posts found (page {} returned 0)", page_number);
                 break;
             }
 
-            info!("Processing page {} with {} posts", page, posts.len());
-            
+            info!("Processing numeric page {} with {} posts", page_number, posts.len());
+
             for post in posts {
                 actual_post_count += 1;
                 
@@ -542,11 +555,8 @@ impl QueryPlanner {
                     continue;
                 }
 
-                // Skip if the post is already downloaded (check both MD5 hash and post ID)
-                if self.hash_manager.contains_either(&post.file.md5, post.id) {
-                    debug!("Skipping post {} (already downloaded by hash or ID)", post.id);
-                    continue;
-                }
+                // Note: We've moved duplicate checking to post-processing phase to match v2 behavior
+                // This ensures we don't miss posts due to stale database records without corresponding files
 
                 // Check blacklist using API tags
                 let all_tags = self.collect_all_tags(&post);
@@ -569,6 +579,7 @@ impl QueryPlanner {
                     file_size: post.file.size,
                     tags: all_tags,
                     artists,
+                    source_query: query.tags.clone(),
                     priority: query.priority,
                     is_blacklisted: false,
                 };
@@ -579,25 +590,63 @@ impl QueryPlanner {
                 // Update the total size
                 total_size_bytes += post.file.size as u64;
 
-                // Check if we've exceeded the total size cap
-                if total_size_bytes > app_config.limits.total_size_cap as u64 {
-                    warn!("Size limit reached ({} bytes)", total_size_bytes);
-                    break;
-                }
+            // Check if we've exceeded the total size cap (0 => unlimited)
+            if app_config.limits.total_size_cap > 0 && total_size_bytes > app_config.limits.total_size_cap as u64 {
+                warn!("Size limit reached ({} bytes). To fetch all posts, increase total_size_cap in config.toml or set it to 0 for unlimited.", total_size_bytes);
+                break;
+            }
             }
 
-            // Continue to next page - only stop if posts are empty
-            // The check for empty posts is already handled above, so we continue pagination
-            // Let the max_pages limit control when we stop
+            // pacing between requests
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
 
-            // Check if we've exceeded the total size cap
-            if total_size_bytes > app_config.limits.total_size_cap as u64 {
+            // Size cap check (0 => unlimited)
+            if app_config.limits.total_size_cap > 0 && total_size_bytes > app_config.limits.total_size_cap as u64 {
                 break;
             }
         }
+        
+        // Post-processing phase: Filter out duplicates using verified file existence checking
+        // This matches v2's approach of checking duplicates after fetching all posts
+        info!("Post-processing: Filtering {} jobs for actual duplicates using file verification", jobs.len());
+        let mut filtered_jobs = VecDeque::new();
+        let mut verified_duplicates = 0;
+        let mut verification_failures = 0;
+        
+        for job in jobs {
+            // Use the new verified checking method that actually checks file existence
+            let is_actually_downloaded = match self.hash_manager.contains_either_verified(&job.md5, job.post_id).await {
+                true => {
+                    debug!("Post {} confirmed as already downloaded (verified file exists)", job.post_id);
+                    true
+                }
+                false => {
+                    debug!("Post {} confirmed as new (no existing file found)", job.post_id);
+                    false
+                }
+            };
+            
+            if is_actually_downloaded {
+                verified_duplicates += 1;
+            } else {
+                filtered_jobs.push_back(job);
+            }
+        }
+        
+        if verified_duplicates > 0 {
+            info!("Post-processing: Filtered out {} verified duplicates, {} new downloads remain", 
+                  verified_duplicates, filtered_jobs.len());
+        }
+        
+        // Update the jobs collection
+        let original_job_count = actual_post_count; // Use the total posts found instead
+        jobs = filtered_jobs;
+        
+        // Recalculate total size based on remaining jobs
+        total_size_bytes = jobs.iter().map(|job| job.file_size as u64).sum();
 
-        info!("Query plan created: {} posts found, {} jobs queued, {} bytes total", 
-            actual_post_count, jobs.len(), total_size_bytes);
+        info!("Query plan created: {} posts found, {} jobs queued ({} filtered as verified duplicates), {} bytes total", 
+            actual_post_count, jobs.len(), verified_duplicates, total_size_bytes);
 
         // Create the query plan
         let plan = QueryPlan {
@@ -608,6 +657,68 @@ impl QueryPlanner {
         };
 
         Ok(plan)
+    }
+
+    /// Query tag metadata to get API-reported post_count for a tag/artist
+    async fn fetch_tag_post_count(&self, name: &str) -> QueryPlannerResult<u32> {
+        // Get configs for UA and backoff
+        let e621_config = self.config_manager.get_e621_config()
+            .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
+        let app_config = self.config_manager.get_app_config()
+            .map_err(|e| QueryPlannerError::Config(e.to_string()))?;
+
+        // Build search URL (exact name match preferred). Use name_matches for robustness
+        let encoded = urlencoding::encode(name);
+        let url = format!(
+            "https://e621.net/tags.json?limit=20&search[name_matches]={}&search[order]=count",
+            encoded
+        );
+        debug!("Tag count URL: {}", url);
+
+        let mut request_builder = self.client.get(&url)
+            .header("User-Agent", format!("e621_downloader/{} (by {})",
+                env!("CARGO_PKG_VERSION"),
+                e621_config.auth.username));
+
+        if !e621_config.auth.username.is_empty() && !e621_config.auth.api_key.is_empty()
+            && e621_config.auth.username != "your_username" && e621_config.auth.api_key != "your_api_key_here" {
+            use base64::{Engine as _, engine::general_purpose};
+            let auth = format!("Basic {}", general_purpose::STANDARD.encode(format!("{}:{}",
+                e621_config.auth.username,
+                e621_config.auth.api_key)));
+            request_builder = request_builder.header("Authorization", auth);
+        }
+
+        let response = request_builder.send().await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            sleep(Duration::from_secs(app_config.rate.retry_backoff_secs as u64)).await;
+            return Box::pin(self.fetch_tag_post_count(name)).await;
+        }
+        if !response.status().is_success() {
+            return Err(QueryPlannerError::Api(format!(
+                "Tag count API error: {} - {}",
+                response.status(),
+                response.text().await?
+            )));
+        }
+
+        // Parse either direct array or { tags: [...] }
+        let text = response.text().await?;
+        if let Ok(array) = serde_json::from_str::<Vec<TagInfo>>(&text) {
+            // Find exact name match first; otherwise pick the first entry
+            if let Some(t) = array.iter().find(|t| t.name.eq_ignore_ascii_case(name)) {
+                return Ok(t.post_count);
+            }
+            return Ok(array.first().map(|t| t.post_count).unwrap_or(0));
+        }
+        if let Ok(obj) = serde_json::from_str::<TagsResponse>(&text) {
+            if let Some(t) = obj.tags.iter().find(|t| t.name.eq_ignore_ascii_case(name)) {
+                return Ok(t.post_count);
+            }
+            return Ok(obj.tags.first().map(|t| t.post_count).unwrap_or(0));
+        }
+        // Fallback: no parse
+        Ok(0)
     }
 
     /// Collect all tags from a post

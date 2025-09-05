@@ -136,7 +136,14 @@ impl DirectoryOrganizer {
         
         // Generate the final file path
         let filename = self.generate_filename(job);
-        Ok(base_path.join(filename))
+        let final_path = base_path.join(filename);
+        tracing::debug!(
+            source_query = ?job.source_query,
+            artists = ?job.artists,
+            decided_path = %final_path.display(),
+            "Directory routing decision: mixed strategy applied"
+        );
+        Ok(final_path)
     }
     
     /// Get organized path based on strategy
@@ -243,61 +250,36 @@ impl DirectoryOrganizer {
     
     /// Create mixed folder structure (both tags and artists)
     fn create_mixed_folders(&self, job: &DownloadJob) -> DirectoryOrganizerResult<PathBuf> {
-        // First priority: Check for any artist tags in the post
-        let artist_tags: Vec<String> = job.tags.iter()
-            .filter(|tag| tag.starts_with("artist:"))
-            .map(|tag| tag.strip_prefix("artist:").unwrap_or(tag).to_string())
-            .collect();
-        
-        if !artist_tags.is_empty() {
-            let artist_name = &artist_tags[0]; // Use the first artist
-            // Align with v2 folder casing: "Artists"
-            return Ok(self.base_download_dir.join("Artists").join(sanitize_filename(artist_name)));
+        // Prefer routing based on the original query to avoid misclassifying tag queries as artists
+        if job.source_query.len() == 1 {
+            let q = job.source_query[0].as_str();
+            // If the single query equals the post artist, go to Artists/<name>
+            if job.artists.iter().any(|a| a.eq_ignore_ascii_case(q)) {
+                return Ok(self.base_download_dir.join("Artists").join(sanitize_filename(q)));
+            }
+            // Otherwise, treat it as the tag folder name
+            return Ok(self.base_download_dir.join("Tags").join(sanitize_filename(q)));
         }
-        
-        // Second priority: Check for configured artist names 
-        let configured_artist = self.configured_tags.iter()
-            .find(|configured_tag| {
-                job.tags.iter().any(|post_tag| {
-                    post_tag == &format!("artist:{}", configured_tag) ||
-                    (post_tag.starts_with("artist:") && 
-                     post_tag.strip_prefix("artist:").unwrap_or("") == *configured_tag)
-                })
-            });
-            
-        if let Some(artist) = configured_artist {
-            // Align with v2 folder casing: "Artists"
-            return Ok(self.base_download_dir.join("Artists").join(sanitize_filename(artist)));
-        }
-        
-        // Third priority: Check for configured tags
-        let configured_tag = self.configured_tags.iter()
-            .find(|configured_tag| {
-                job.tags.iter().any(|post_tag| post_tag == *configured_tag)
-            });
-            
-        if let Some(tag) = configured_tag {
-            // Align with v2 folder casing: "Tags"
+
+        // If multiple terms or no clear source, fall back to heuristics favoring tags first
+        if let Some(tag) = job.tags.iter().find(|t| !is_meta_tag(t) && !t.starts_with("artist:") && t.len() > 2) {
             return Ok(self.base_download_dir.join("Tags").join(sanitize_filename(tag)));
         }
-        
-        // Fourth priority: Use common tags to create folders (skip meta tags)
-        let common_tag = job.tags.iter()
-            .find(|tag| !is_meta_tag(tag) && !tag.starts_with("artist:") && tag.len() > 2)
-            .cloned();
-            
-        if let Some(tag) = common_tag {
-            // Align with v2 folder casing: "Tags"
-            return Ok(self.base_download_dir.join("Tags").join(sanitize_filename(&tag)));
+
+        // If the only strong signal is an artist tag, use it
+        if let Some(artist_tag) = job.tags.iter().find(|t| t.starts_with("artist:")) {
+            let artist_name = artist_tag.trim_start_matches("artist:");
+            return Ok(self.base_download_dir.join("Artists").join(sanitize_filename(artist_name)));
         }
-        
-        // Final fallback: use favorites folder if it's from fav: search
-        if job.tags.iter().any(|tag| tag.starts_with("fav:")) {
-            // Align with v2 folder casing: "Favorites"
-            return Ok(self.base_download_dir.join("Favorites"));
+
+        // Fallbacks to configured tags
+        if let Some(tag) = self.configured_tags.iter().find(|configured_tag| {
+            job.tags.iter().any(|post_tag| post_tag == *configured_tag)
+        }) {
+            return Ok(self.base_download_dir.join("Tags").join(sanitize_filename(tag)));
         }
-        
-        // Final fallback: create an unsorted folder for posts that don't match any pattern
+
+        // Final fallback
         Ok(self.base_download_dir.join("unmatched"))
     }
     
@@ -344,40 +326,45 @@ impl DirectoryOrganizer {
     
     /// Determine content type from download job
     pub fn determine_content_type(&self, job: &DownloadJob, username: Option<&str>) -> ContentType {
-        // Check if it's blacklisted content
+        // 1) Explicit blacklisted
         if job.is_blacklisted {
             return ContentType::Blacklisted;
         }
-        
-        // Check if it's from favorites
+
+        // 2) Prefer the original source query to disambiguate
+        //    This lets us distinguish favorites, pools, collections, artist vs. tag queries.
         if let Some(user) = username {
-            if job.tags.iter().any(|tag| tag == &format!("fav:{}", user)) {
+            if job.source_query.iter().any(|q| q == &format!("fav:{}", user)) {
                 return ContentType::Favorites(user.to_string());
             }
         }
-        
-        // Check for pool content
-        for tag in &job.tags {
-            if let Some(pool_id) = tag.strip_prefix("pool:").and_then(|s| s.parse().ok()) {
+
+        // Pools/collections detected from the source query if present
+        for q in &job.source_query {
+            if let Some(pool_id) = q.strip_prefix("pool:").and_then(|s| s.parse().ok()) {
                 return ContentType::Pool(pool_id);
             }
-        }
-        
-        // Check for collection content  
-        for tag in &job.tags {
-            if let Some(collection_id) = tag.strip_prefix("set:").and_then(|s| s.parse().ok()) {
+            if let Some(collection_id) = q.strip_prefix("set:").and_then(|s| s.parse().ok()) {
                 return ContentType::Collection(collection_id);
             }
         }
-        
-        // Check for artist content
+
+        // If the source query is a single term that matches one of this post's artists, treat as artist
+        if job.source_query.len() == 1 {
+            let q = job.source_query[0].as_str();
+            if job.artists.iter().any(|a| a.eq_ignore_ascii_case(q)) {
+                return ContentType::Artist(q.to_string());
+            }
+        }
+
+        // 3) Fallback heuristics based on post tags (legacy behavior)
         for tag in &job.tags {
             if tag.starts_with("artist:") {
                 let artist = tag.strip_prefix("artist:").unwrap_or(tag);
                 return ContentType::Artist(artist.to_string());
             }
         }
-        
+
         // Default to tagged content
         ContentType::Tagged
     }
