@@ -570,7 +570,6 @@ impl QueryPlanner {
     }
 
     /// Process a query and create jobs
-    #[allow(dead_code)]
     pub async fn process_query(&self, query: &Query) -> QueryPlannerResult<QueryPlan> {
         // Create a query plan
         let plan = self.create_query_plan(query).await?;

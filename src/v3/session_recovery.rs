@@ -6,20 +6,19 @@
 //! 3. Resume incomplete downloads
 //! 4. Session state management
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 use chrono::{DateTime, Utc, serde::ts_seconds_option};
 use rusqlite::{Connection, Result as SqliteResult, params};
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, error};
 use uuid::Uuid;
 
-use crate::v3::{DownloadJob, QueryPlanner, DownloadEngine, ConfigManager};
+use crate::v3::{DownloadJob, ConfigManager};
 
 /// Error types for session recovery
 #[derive(Error, Debug)]

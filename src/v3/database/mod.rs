@@ -14,12 +14,12 @@ mod schema;
 mod tests;
 
 pub use connection_pool::{
-    DatabasePool, PoolConfig, PoolError, PoolResult, PoolStats, PooledConnectionGuard,
+    DatabasePool, PoolConfig, PoolError, PoolResult, PoolStats,
     init_database_pool,
 };
 
 pub use write_buffer::{
-    DatabaseWriteBuffer, WriteBufferConfig, WriteBufferError, WriteBufferResult,
+    DatabaseWriteBuffer, WriteBufferConfig, WriteBufferError,
     WriteOperation, WritePriority, WriteBufferStats, init_database_write_buffer,
 };
 
@@ -28,9 +28,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use rusqlite::params;
-use tokio::sync::oneshot;
 use thiserror::Error;
-use tracing::{debug, info, error, warn};
+use tracing::{info, error};
 
 use crate::v3::{DownloadJob, HashManagerError};
 
@@ -62,7 +61,6 @@ pub enum DatabaseError {
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
 
 /// Download record from the database
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DownloadRecord {
     pub post_id: u32,
@@ -76,7 +74,6 @@ pub struct DownloadRecord {
 }
 
 /// Download statistics
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct DownloadStatistics {
     pub total_downloads: u64,

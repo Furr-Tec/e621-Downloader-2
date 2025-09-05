@@ -461,7 +461,6 @@ impl ConfigManager {
     }
     
     // Get a subscription to config reload events
-    #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<ConfigReloadEvent> {
         self.reload_tx.subscribe()
     }
@@ -595,7 +594,6 @@ impl ConfigManager {
     }
     
     // Create e621.toml file if it doesn't exist (deprecated - use create_default_configs instead)
-    #[allow(dead_code)]
     pub fn create_default_e621_config(&self) -> ConfigResult<()> {
         let config_path = self.config_dir.join("e621.toml");
         

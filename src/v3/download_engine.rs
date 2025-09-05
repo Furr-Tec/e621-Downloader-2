@@ -62,7 +62,6 @@ pub enum DownloadError {
 pub type DownloadResult<T> = Result<T, DownloadError>;
 
 /// Status of a download
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadStatus {
     Pending,
@@ -73,7 +72,6 @@ pub enum DownloadStatus {
 }
 
 /// Download task
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DownloadTask {
     pub job: DownloadJob,
@@ -132,7 +130,6 @@ impl Default for ConnectionPoolConfig {
 }
 
 /// Connection pool metrics
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionPoolMetrics {
     /// Total connections created
@@ -491,7 +488,6 @@ impl DownloadEngine {
     }
 
     /// Queue multiple download jobs
-    #[allow(dead_code)]
     pub async fn queue_jobs(&self, jobs: Vec<DownloadJob>) -> DownloadResult<()> {
         for job in jobs {
             self.queue_job(job).await?;
@@ -506,13 +502,11 @@ impl DownloadEngine {
     }
 
     /// Get the current concurrency setting
-    #[allow(dead_code)]
     pub async fn get_concurrency(&self) -> usize {
         *self.current_concurrency.lock().await
     }
 
     /// Get the original concurrency setting
-    #[allow(dead_code)]
     pub async fn get_original_concurrency(&self) -> usize {
         *self.original_concurrency.lock().await
     }
@@ -753,7 +747,7 @@ impl DownloadEngine {
 
         // Stream the response body to the file
         let mut stream = response.bytes_stream();
-        let mut bytes_downloaded = 0;
+        let bytes_downloaded = 0;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| DownloadError::Download(format!("Failed to get chunk: {}", e)))?;

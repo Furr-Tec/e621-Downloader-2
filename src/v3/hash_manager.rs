@@ -50,7 +50,6 @@ pub struct DownloadRecord {
 }
 
 /// Hash verification result
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HashVerification {
     pub exists: bool,
@@ -282,13 +281,11 @@ impl HashManager {
     }
 
     /// Check if a post is already downloaded by MD5 hash
-    #[allow(dead_code)]
     pub fn contains_md5(&self, md5: &str) -> bool {
         self.md5_cache.read().contains(md5)
     }
 
     /// Check if a post is already downloaded by post ID
-    #[allow(dead_code)]
     pub fn contains_post_id(&self, post_id: u32) -> bool {
         self.post_id_cache.read().contains(&post_id)
     }
@@ -301,7 +298,6 @@ impl HashManager {
     }
 
     /// Get verification information for a hash
-    #[allow(dead_code)]
     pub async fn verify_hash(&self, md5: &str) -> HashManagerResult<HashVerification> {
         let conn = self.db_connection.lock().await;
         
@@ -345,7 +341,6 @@ impl HashManager {
     }
 
     /// Record a successful download
-    #[allow(dead_code)]
     pub async fn record_download(&self, job: &DownloadJob, file_path: &Path) -> HashManagerResult<()> {
         debug!("Recording download for post_id={}, md5={}, path={}", job.post_id, job.md5, file_path.display());
         
@@ -744,7 +739,6 @@ impl HashManager {
 }
 
 /// Statistics about downloads
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DownloadStatistics {
     pub total_downloads: u64,

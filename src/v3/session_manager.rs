@@ -9,22 +9,21 @@
 //! 6. Validating disk size before scheduling
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::broadcast;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, warn};
 
 use crate::v3::{
     ConfigManager,
-    Orchestrator, OrchestratorResult,
-    MetadataStore, MetadataStoreResult, PostMetadata,
-    QueryQueue, Query, QueryStatus, QueryTask,
+    Orchestrator,
+    MetadataStore,
+    QueryQueue, Query, QueryStatus,
 };
 
 /// Error types for session management
@@ -381,11 +380,9 @@ fn get_available_space(path: &Path) -> SessionManagerResult<u64> {
     #[cfg(target_os = "windows")]
     {
         use winapi::um::fileapi::{GetDiskFreeSpaceExW};
-        use winapi::shared::minwindef::{DWORD, BOOL};
         use winapi::um::winnt::ULARGE_INTEGER;
         use std::os::windows::ffi::OsStrExt;
         use std::ffi::OsStr;
-        use std::ptr;
         
         // Convert path to wide string for Windows API
         let path_str = path.to_str().ok_or_else(|| 

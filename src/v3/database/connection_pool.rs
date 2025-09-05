@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use rusqlite::{Connection, Result as SqliteResult, Error as SqliteError};
+use rusqlite::{Connection, Error as SqliteError};
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex as TokioMutex, Semaphore};
-use tokio::time::{sleep, timeout};
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 /// Connection pool errors

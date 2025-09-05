@@ -28,8 +28,8 @@ use walkdir::WalkDir;
 
 use crate::v3::{
     ConfigManager,
-    FileHash, FileProcessor, FileProcessorResult,
-    MetadataStore, MetadataStoreError, MetadataStoreResult, PostMetadata,
+    FileHash, FileProcessor,
+    MetadataStore, MetadataStoreError, PostMetadata,
 };
 
 /// Error types for disk verification

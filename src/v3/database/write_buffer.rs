@@ -13,7 +13,7 @@ use rusqlite::{params, Connection};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use tokio::time::{interval, sleep, MissedTickBehavior};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::v3::{DownloadJob, HashManagerError};
 use super::connection_pool::{DatabasePool, PoolError};

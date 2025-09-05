@@ -4,7 +4,7 @@
 //! with proper versioning and safety checks.
 
 use std::sync::Arc;
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::Connection;
 use tracing::{debug, info, warn, error};
 
 use super::{DatabasePool, PoolError, PoolResult};

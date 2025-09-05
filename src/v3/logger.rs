@@ -6,15 +6,14 @@
 //! 3. Writing logs to a rotating file in JSON or line format
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, error, info, instrument, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_appender;
 use tracing_subscriber::{
     fmt::{self, format::FmtSpan},
